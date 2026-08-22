@@ -272,6 +272,12 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   #                                 PIECEWISE 7.83 tok/step 132 tok/s   (3.5x)
   #   short prompts, de/en/code     FULL 78/125/202 tok/s
   #                                 PIECEWISE 74/102/176 tok/s          (-13..18%)
+  # Treat that -13..18% as an UPPER bound. @mjungnickel18 measures 0.2-2.3% for the
+  # same comparison on bare metal when only runs with identical STEP COUNTS are
+  # compared, and he is right that greedy runs which take a different number of steps
+  # are not comparable -- mine did not control for that. Unresolved: I have not
+  # re-measured with his method. The number that is not in dispute is the long-context
+  # one above, where the gap is 3.5x and no amount of step-count matching closes it.
   # Read that -13..18% as SHORT PROMPTS ONLY. Past 8k the two modes are within
   # noise on bare metal (8k/16k/32k/50k: 112/78/69/58 FULL vs 109/86/73/56
   # PIECEWISE), so PIECEWISE is close to free at the lengths this mode is for.
@@ -299,17 +305,23 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   #   PIECEWISE 93.5 / 83.8 / 70.3 / 59.6 tok/s
   # so PIECEWISE now covers the whole of CTX=huge, not just dflash2. The old
   # claim here that forcing it "would cost decode for nothing" was wrong twice.
-  # Post-fix the capture default splits by speculator, on measurement rather than on
-  # the theory that used to live here. Both are CORRECT under FULL now (5 residues each,
-  # cold and self-hit, byte-identical), so this is purely quality and speed:
-  #   SPEC=dflash2 k=7   FULL 96.5% GSM8K   PIECEWISE 95.0%   -> FULL, and it is worth
-  #                      2-3x under GPU passthrough (PR #13), where the uncaptured
-  #                      verify is launch-bound rather than bandwidth-bound
-  #   SPEC=mtp           FULL 93.5% GSM8K   PIECEWISE 96.0%   -> PIECEWISE, since FULL
-  #                      is worse on quality and no faster (87.8/86.1/70.4/63.5 against
-  #                      93.5/83.8/70.3/59.6 over 8k/16k/32k/50k)
-  # n=200 each, so the quality gaps are about one standard error; the asymmetry in the
-  # decision comes from the SPEED evidence, which only exists for dflash2.
+  # SPEC=mtp keeps PIECEWISE for CORRECTNESS, not preference. Do not "optimise" this
+  # away: under FULL, mtp at CTX=huge still returns an EMPTY answer at one prompt
+  # length in 128 -- templated length == L (mod 128), L = k+1 = 4 -- with a prefix
+  # cache hit. Measured on current main, fresh server, residues 3/4/5:
+  #   residue 3   794/794    residue 4   0 chars, finish_reason=stop    residue 5   794/794
+  # @mjungnickel18 found it by sweeping all 128 residues (127 clean, one broken, and it
+  # is 4); an earlier version of this comment claimed mtp was "correct under FULL" on
+  # five sampled residues that did not include 4 -- five samples miss a single broken
+  # residue 82% of the time. a75ee4b fixed the same shape for dflash2 but does not
+  # cover this path.
+  #
+  # dflash2 does get FULL, and to the same evidence standard: ALL 128 residues swept
+  # under FULL, self-hit measured, 0 broken -- so this is not the five-sample luck the
+  # mtp claim was. On top of that FULL is 96.5% GSM8K against PIECEWISE's 95.0%, and
+  # worth 2-3x under GPU passthrough (PR #13), where the uncaptured verify is
+  # launch-bound rather than bandwidth-bound. THAT one is a preference and may be
+  # revisited; the mtp line above may not, until the empty answer at residue 4 is gone.
   [ "$CTX" = "huge" ] && [ "$SPEC" != "dflash2" ] &&
     CG_MODE=",\"cudagraph_mode\":\"${CUDAGRAPH_MODE:-PIECEWISE}\""
 fi

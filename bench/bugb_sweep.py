@@ -64,7 +64,10 @@ for ctx in [int(a) for a in sys.argv[1:]]:
         headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}),
         timeout=1200).read().decode())
     d1 = metrics()
-    ans = r["choices"][0]["message"]["content"]
+    # `or ""`: a collapse-to-stop returns content=null, and indexing that raised a
+    # TypeError that ended the sweep silently -- which is how the mtp failure stayed
+    # invisible through several full runs (issue #25, mjungnickel18).
+    ans = r["choices"][0]["message"].get("content") or ""
     dn = d1[0] - d0[0]
     tps = (d1[1] - d0[1]) / dn + 1 if dn else float("nan")
     # longest prefix of the answer that appears verbatim in the source document
@@ -77,8 +80,15 @@ for ctx in [int(a) for a in sys.argv[1:]]:
     # broken. A working verbatim task reproduces the whole answer; a broken one
     # returns a few characters, a degenerate repeat, or nothing at all.
     # n is a LONGEST-PREFIX match, so one wrong character at offset 38 pins it at 38
-    # however perfect the next 750 are. Judge with `repeats` alongside: a real collapse
-    # repeats a block many times, a single divergent token does not.
-    flag = "ok" if len(ans) > 40 and n >= len(ans) - 2 else ("BROKEN" if rep > 3 else "DIVERGED")
+    # however perfect the next 750 are -- `repeats` is what separates a real collapse
+    # from a single divergent token. But do NOT require repetition to call it BROKEN:
+    # a collapse-to-stop returns one or two characters and repeats nothing, and filing
+    # that as DIVERGED is what hid the mtp failure at residue 4.
+    if len(ans) > 40 and n >= len(ans) - 2:
+        flag = "ok"
+    elif len(ans) < 40 or rep > 3:
+        flag = "BROKEN"          # truncated to nothing, or degenerate repetition
+    else:
+        flag = "DIVERGED"        # full-length answer that stops matching the source
     print(f"{ctx:>7} {ptok:>11} {ptok % 128:>7} {tps:>9.2f} "
           f"{str(n) + '/' + str(len(ans)):>12} {rep:>8}  {flag}")

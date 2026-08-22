@@ -95,8 +95,13 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);
 # the attention kernels JIT fine. Remove this if you have a recent CUDA toolkit.
 export VLLM_USE_FLASHINFER_SAMPLER=0
-export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+# "Off" for these is UNSET, not empty. vllm/envs.py registers VLLM_MARLIN_INPUT_DTYPE
+# through env_with_choices(..., None, ["int8", "fp8"]), which rejects "" outright --
+# `ValueError: Invalid value '' ... Valid options: ['int8', 'fp8']` -- so exporting the
+# empty string killed the engine at startup instead of turning the feature off. That is
+# the documented way to disable it (issue #20), so export only when non-empty.
+[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
+[ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
 
 # API key: put it in api_key.txt in the repo root, or export VLLM_API_KEY.
 if [ -z "$VLLM_API_KEY" ] && [ -f "$REPO/api_key.txt" ]; then

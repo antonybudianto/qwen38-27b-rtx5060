@@ -201,6 +201,24 @@ against 93.5/83.8/70.3/59.6 piecewise over 8k-50k). Gotcha 37 in
 [docs/gotchas.md](docs/gotchas.md) has the residue table and `bench/bugb_sweep.py`
 reproduces it; the hunt for the boundary case is in the PR thread.
 
+### More than one GPU
+
+Everything here is written for one 24 GB card, and that is the only configuration
+measured in this README. It is not the only one that works: `--tensor-parallel-size`
+goes through untouched, via `EXTRA_ARGS`.
+
+```bash
+EXTRA_ARGS="--tensor-parallel-size 2" bash single-user/start_qwen.sh
+```
+
+Reported working on **2x RTX 5060 Ti 16 GB** by
+[@antonybudianto](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22) — two cards
+that could not hold this model individually. I have one 3090, so every multi-GPU
+number in the issues is a user report rather than something I have reproduced, and
+the tuning here (the pinned `KV_MEM`, the graph budget, `MAX_SEQS`) is sized for a
+single card and is probably not right for yours. If you run it on two, numbers in
+[#7](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/7) are welcome.
+
 ## Benchmarks
 
 Full tables per mode in [batch/README.md](batch/README.md) and
