@@ -42,7 +42,7 @@ x-serve: &serve
       reservations:
         devices:
           - driver: nvidia
-            count: 1
+            count: 2
             capabilities: [gpu]
   restart: unless-stopped
   stop_grace_period: 30s

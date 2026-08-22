@@ -1,4 +1,4 @@
-# Qwen3.8-27B on one RTX 3090
+# Qwen3.8-27B on two RTX 5060 Ti 16GB
 
 ![Stock vLLM against this repo, same card, same prompts](docs/media/demo.gif)
 
