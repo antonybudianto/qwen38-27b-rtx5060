@@ -135,6 +135,37 @@ if [ "$SPEC" = "dflash2" ]; then
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.
   export VLLM_SPEC_DECODE_ATTN_QMAX=${VLLM_SPEC_DECODE_ATTN_QMAX:-$((DRAFT_TOKENS + 1))}
+  # The ADAPTIVE verify length corrupts a prefix-cache hit under KVarN. When the block
+  # alternates 8<->16 step to step and the request resumed from a cache hit, turn 2 over
+  # the same document tracks the source for ~38 characters and then diverges -- turn 1 is
+  # correct. Deterministic, at five of six prompt residues tested.
+  #
+  # It is the length CHANGING, not the lookup content, and not the KVarN kernels. Fresh
+  # server per row, three requests each (one to arm the cache, two measured), sha-compared:
+  #   baseline, adaptive 8<->16          self-hit 38/793 WRONG   12.71 tok/step
+  #   VLLM_DFLASH2_LOOKUP_ADAPTIVE=0     self-hit 794/794 clean  14.71 tok/step
+  #   PREFIX_CACHE=0, adaptive on        self-hit 794/794 clean  14.33
+  #   KVARN_FUSED_VERIFY=0, adaptive on  self-hit 38/793 WRONG   12.71
+  # and the constant-length setting is clean at every residue that broke (16/64/96/124),
+  # cold and warm, byte-identical.
+  #
+  # Note what the earlier controls actually varied: DFLASH_TOKENS=7, LOOKUP=0 and SPEC=mtp
+  # all make the block a CONSTANT length, so "clean" there was never evidence about the
+  # block being short or the lookup being off. And a wrong draft cannot corrupt greedy
+  # output at all -- rejection_sampler.py emits target_argmax whether it accepts or not --
+  # so the draft content was never a candidate. The damage is on the target's forward.
+  #
+  # Pinning the length is not a sacrifice here: 14.71 tok/step is the FASTEST number in the
+  # series, above the adaptive path's own 14.29 cold. Root cause still open; this is a
+  # correct and fast setting, not a workaround with a cost.
+  if [ -z "${LOOKUP_ADAPTIVE:-}" ] && [ "$VLLM_DFLASH2_LOOKUP" = "1" ] && [ "$DRAFT_TOKENS" -gt 7 ] \
+     && [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
+    echo "DFLASH_TOKENS>7 + CTX=huge + PREFIX_CACHE=1: pinning the verify block to" >&2
+    echo "$((DRAFT_TOKENS + 1)) tokens (VLLM_DFLASH2_LOOKUP_ADAPTIVE=0). The adaptive length" >&2
+    echo "corrupts the second turn over a shared prefix on the KVarN cache; pinned is both" >&2
+    echo "correct and faster. LOOKUP_ADAPTIVE=1 asks for the adaptive path anyway." >&2
+    export VLLM_DFLASH2_LOOKUP_ADAPTIVE=0
+  fi
   if [ "$VLLM_DFLASH2_LOOKUP" = "1" ] && [ "$DRAFT_TOKENS" -gt 7 ]; then
     # Adaptive block length means the worker tells the scheduler how many draft tokens to
     # put up for verification next step, and vLLM only feeds that back on the synchronous
@@ -160,9 +191,30 @@ if [ "$SPEC" = "dflash2" ]; then
     # KV at 245760 max-model-len with 2 slots (single-user long-context; the
     # graphs stay at the k=7 size).
     MAX_SEQS=${MAX_SEQS:-2}
-    MAX_LEN=${DFLASH_MAX_LEN:-245760}
+    # 221184 rather than 245760 above 7 drafts, the same trade CTX=fast makes at
+    # DFLASH_TOKENS>7. The pinned pool is 4.90 GiB; one request at max_model_len needs
+    # 5.16 GiB at k=15, so the server refuses to start at 245760 -- "5.16 GiB KV cache is
+    # needed, which is larger than the available KV cache", which is the boot failure an
+    # independent 3090 Ti reported (PR #13). Raising the cudagraph reservation does NOT
+    # fix this and I checked: KV_MEM is pinned, so the pool does not grow when graph
+    # memory is accounted differently. 221184 = 1728 x 128 leaves ~2.6% margin (229376 was still 1% short).
+    if [ "$DRAFT_TOKENS" -gt 7 ]; then
+      MAX_LEN=${DFLASH_MAX_LEN:-221184}
+    else
+      MAX_LEN=${DFLASH_MAX_LEN:-245760}
+    fi
     KV_MEM=${KV_MEM-5261334938}
-    export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
+    # Above 7 drafts the decode graphs are captured for BOTH block lengths, which is
+    # ~1.8 GiB rather than ~1.45 -- the same arithmetic CTX=long and CTX=fast already
+    # branch on. This branch did not, and said so in a comment ("the graphs stay at the
+    # k=7 size") that stops being true the moment anyone sets DFLASH_TOKENS. The pool is
+    # then sized as if that memory were free and the server does not come up at 240k on
+    # 24 GB, which is what an independent 3090 Ti report hit (PR #13).
+    if [ "$DRAFT_TOKENS" -gt 7 ]; then
+      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
+    else
+      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
+    fi
   elif [ "$CTX" = "long" ]; then
     # int8 KV: measured 136,429 tokens of pool at DFLASH_TOKENS=7 with prefix caching on
     # (138,696 without), against bf16's 69,758 in the same pinned 5.2 GiB. DFLASH_TOKENS>7
@@ -247,7 +299,18 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   #   PIECEWISE 93.5 / 83.8 / 70.3 / 59.6 tok/s
   # so PIECEWISE now covers the whole of CTX=huge, not just dflash2. The old
   # claim here that forcing it "would cost decode for nothing" was wrong twice.
-  [ "$CTX" = "huge" ] &&
+  # Post-fix the capture default splits by speculator, on measurement rather than on
+  # the theory that used to live here. Both are CORRECT under FULL now (5 residues each,
+  # cold and self-hit, byte-identical), so this is purely quality and speed:
+  #   SPEC=dflash2 k=7   FULL 96.5% GSM8K   PIECEWISE 95.0%   -> FULL, and it is worth
+  #                      2-3x under GPU passthrough (PR #13), where the uncaptured
+  #                      verify is launch-bound rather than bandwidth-bound
+  #   SPEC=mtp           FULL 93.5% GSM8K   PIECEWISE 96.0%   -> PIECEWISE, since FULL
+  #                      is worse on quality and no faster (87.8/86.1/70.4/63.5 against
+  #                      93.5/83.8/70.3/59.6 over 8k/16k/32k/50k)
+  # n=200 each, so the quality gaps are about one standard error; the asymmetry in the
+  # decision comes from the SPEED evidence, which only exists for dflash2.
+  [ "$CTX" = "huge" ] && [ "$SPEC" != "dflash2" ] &&
     CG_MODE=",\"cudagraph_mode\":\"${CUDAGRAPH_MODE:-PIECEWISE}\""
 fi
 
