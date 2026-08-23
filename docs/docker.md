@@ -90,15 +90,25 @@ signatures and earlier five-profile matrix are in [issue #1](https://github.com/
 | `batch`, `KV=int4pth` | 437,414 tokens | 1,043.84 / 1,044.06 tok/s, C64 |
 | `batch`, `KV=kvarn` | 334,183 cold / 350,192 warm | 843.72 / 852.42 tok/s, C64 |
 
-Three WSL-specific memory behaviors are worth accounting for:
+Five WSL-specific behaviors are worth accounting for, and the first is a
+hard abort rather than a tuning question:
 
-1. **The ordinary batch default may fail vLLM's startup free-memory gate.**
+1. **`SPEC=dflash2` needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` in `.env`, on every
+   `CTX` profile.** The DFlash2 drafter forces vLLM's V2 model runner, which
+   allocates UVA buffers before the weights load; vLLM leaves pinned memory off by
+   default under WSL2, so the container dies at `RuntimeError: UVA is not
+   available` before anything model-shaped appears in the log. The buffers work
+   fine on the paravirt driver. Check the spelling — `VLLM_WSL_PIN_MEMORY` is not
+   a vLLM variable and reads as a silent no-op; a venv that survived an upgrade on
+   hand-applied patches can hide this until it is rebuilt from a stock wheel
+   ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25)).
+2. **The ordinary batch default may fail vLLM's startup free-memory gate.**
    On an otherwise clean card, WSL reported 22.75/24.0 GiB free, less than
    the 23.33 GiB requested by `GPU_UTIL=0.972`. Launching with
    `GPU_UTIL=0.93 bash batch/start_qwen.sh` retained a 201,832-token FP8
    pool, preserving the 150k context contract and expected C64 throughput.
    Keep 0.972 as the tuned native-Linux default; 0.93 is a WSL fallback.
-2. **Cold and cached starts can profile different activation peaks.** A warm
+3. **Cold and cached starts can profile different activation peaks.** A warm
    start may turn the difference into extra KV pages and leave less transient
    headroom than the cold start. For a deterministic service, compile once
    from a cold cache, record vLLM's conservative
@@ -108,12 +118,45 @@ Three WSL-specific memory behaviors are worth accounting for:
    `EXTRA_ARGS` on later starts. Stress concurrent prefill or
    `prompt_logprobs` before promoting it. Do not copy a byte value from a
    different card or profile.
-3. **`expandable_segments` can crash Marlin repack on some driver/dxgkrnl
-   combinations.** Both start scripts default to
-   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; its CUDA VMM calls
-   crashed the engine with `RuntimeError: CUDA driver error: device not
-   ready` inside `gptq_marlin_repack` on Windows driver 610.74 (WSL 2.1.5
-   and 2.7.12 alike — the `e81fa39` reproduction on driver 591.86 did not
-   hit this). The scripts respect a pre-set value, so put
-   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` in `.env` (Docker)
-   or the environment (venv) if you see that signature.
+4. **`expandable_segments` crashes Marlin repack under the paravirt driver, and
+   the start scripts now turn it off for you on WSL.** They detect WSL from
+   `/proc/sys/kernel/osrelease` (or `WSL_DISTRO_NAME`) and default to
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`, printing a line saying so;
+   native Linux keeps `:True`, where gotcha 3 applies. Set the variable explicitly
+   in `.env` (Docker) or the environment (venv) to override either way.
+
+   This is the most reported failure on Windows
+   ([#2](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/2),
+   [#26](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/26)), and it is worth
+   knowing all of its faces, because none of them says "allocator". Same CUDA VMM
+   rejection inside `process_weights_after_loading` / `gptq_marlin_repack`, four
+   different messages:
+
+   | signature | reported on |
+   |---|---|
+   | `RuntimeError: CUDA driver error: device not ready` | driver 610.74, 610.62, 610.57 (WSL 2.1.5, 2.7.11, 2.7.12) |
+   | `RuntimeError: CUDA driver error: out of memory` | driver 591.86 — **not** a real OOM: same failure at `GPU_UTIL` 0.75 and 0.90 with 23 GiB free for a 16 GiB model, and `:False` fixes it at 0.93 |
+   | `torch_call_dispatcher("aten::empty", ...) API call failed`, `ops.h:631` | driver 610.62 |
+   | `dxgkio_make_resident: Ioctl failed: -12` in `dmesg` | alongside all of the above |
+
+   Driver 591.86 does reproduce it, contrary to what this note said before —
+   thanks to @willy92wins for the counter-example. It is not driver-version-gated,
+   so the default is now WSL-gated instead.
+
+5. **Two more things the venv path needs on WSL2 that the container does not.**
+   Both from @willy92wins in
+   [#2](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/2):
+
+   - **`nvcc` is not on `PATH`, and the error blames permissions.** Inductor
+     shells out to a bare `nvcc` and dies with
+     `PermissionError: [Errno 13] Permission denied: 'nvcc'`. It is not a
+     permissions problem: `nvcc` is not on `PATH` at all, but WSL inherits the
+     Windows `PATH`, which contains ACL-restricted directories, and `execvp`
+     reports EACCES rather than ENOENT when the search hits one. The venv already
+     ships one — prepend
+     `venv/lib/python3.12/site-packages/nvidia/cu13/bin` to `PATH`. The image
+     installs `cuda-nvcc` system-wide, which is why Docker never sees this.
+   - **The default fp8 KV cache makes FlashInfer JIT-compile its e4m3 prefill
+     kernel**, and that ninja build can fail here. `EXTRA_ARGS="--kv-cache-dtype
+     auto"` sidesteps it — `EXTRA_ARGS` is last on the command line, so it wins
+     over `KV_ARGS`.

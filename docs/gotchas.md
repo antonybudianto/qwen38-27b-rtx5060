@@ -42,7 +42,19 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
 8. **Benchmark twice.** The first run after any restart includes JIT warmup
    and reads 30-50% low.
 9. **`--language-model-only` drops the vision tower cleanly** (no weights
-   loaded). If you don't need images, that's 2.7 GB.
+   loaded), and it is the default in both start scripts. `VISION=1` keeps the
+   tower for a client that sends images. The tower is **0.858 GiB**, not the
+   2.7 GB this entry used to give: `model.visual.*` sums to 0.858 GiB of BF16 in both
+   `Qwen3.8-27B-W4A16-AutoRound` and the `-fast` variant, and a runtime A/B
+   agrees — model loading reads 15.13 GiB against 14.26 with
+   `--language-model-only`, same server, same config, with non-weight overhead
+   0.42 against 0.41 GiB either way. Quantization is not the explanation: the
+   tower is BF16 in both dirs. Where 2.7 GB came from I could not work out.
+   The KV pool came out within 0.4% across that pair (183,673 against 184,438
+   tokens at 150k/fp8) — but the profiled activation peak differed by 0.87 GiB
+   between those two starts, which is the same run-to-run swing the V2 runner
+   shows, so read the pool difference as noise rather than as a measurement of
+   what the tower costs.
 10. **`prompt_logprobs` on long prompts OOMs the engine at 0.972 utilization**
     (a 300-token prompt needs ~300 MB of fp32 logits and there is no headroom).
     Run quality checks at 0.93.
@@ -227,6 +239,19 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `MAX_SEQS` 1 against 8 moves it by about **8 MiB in total**. So dropping to one slot for a
     genuinely single-user server buys no context at all, and `MAX_SEQS=4` at a long block is
     about CUDA graph memory, not state pages.
+
+    That is about the SIZE of the pool. It says nothing about how much of the pool a
+    *running* request takes, and there the per-request model is right — it is the same
+    page, and the two arrive at it independently (0.88 GiB fitted here, ~0.82 GiB from
+    the live occupancy below). Measured live at `CTX=fast` (`bench/conc_ladder.py`, and the ramp in the
+    issue-25 notes): one resident `dflash2` request with an empty context occupies
+    **15.8%** of the 69,758-token pool, so six or seven fit and the next one is
+    **preempted**; with 4k-token prompts it is 19.8% and five fit, with 16k-token
+    prompts two. One MTP request takes 8.2% of its
+    86,727, so eight fit. Both numbers are the k+1 recurrent-state slots, which is why
+    they are in the ratio 8:5. The two facts together are the whole of the concurrency
+    story for this mode: extra seats do not cost you pool, and they do not buy you
+    residents either.
 34. **Asking for an impossible `max_model_len` is the cheapest way to read the memory model.**
     vLLM prints "X GiB KV cache is needed ... available Y GiB ... estimated maximum model
     length is Z" and dies in ~90 s, before torch.compile finishes and long before graph
@@ -278,7 +303,18 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     collapses: `SPEC=dflash2 DFLASH_TOKENS=7` gives 1.97 tok/step and degenerate
     repetition (`4/3595` characters verbatim, one 40-char block ×79), `SPEC=mtp`
     stops dead and returns `""` or `"#"` with `finish_reason=stop`. Every other
-    residue is 794/794 verbatim. Deterministic — repeats are bit-identical.
+    residue is 794/794 verbatim.
+
+    **The location is deterministic; the damage is not.** Repeats are bit-identical
+    on one server, but the same `mtp` residue has now produced three different
+    outputs on three geometries: an empty answer, a one-character answer, and — on a
+    box running `MAX_LEN=240000` with a tool parser attached — 400 tokens of fluent
+    Danish that open with a malformed `<think>` under `enable_thinking=false` and
+    invent a translation task, `2/1146` verbatim at 3.38 tok/step
+    ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25), mjungnickel18).
+    So do not test for a symptom. The only property all three share is that the copy
+    did not come back, which is what `bench/verbatim.py` scores and what both sweeps
+    now judge on.
 
     Two conditions, and it took two people to see both. The **hit** is necessary:
     a fresh server, one request, no warm-up, never collapses at any length
@@ -315,12 +351,18 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     not implicated and the shared multi-query verify against a partially-hit
     prefix is.
 
-    Mitigation: `CTX=huge` forces `cudagraph_mode=PIECEWISE` for **every**
-    speculator, which is clean at every residue. It costs nothing measurable —
+    Mitigation, as it stands at HEAD: `CTX=huge` forces `cudagraph_mode=PIECEWISE`
+    for `SPEC=mtp`, which is clean at every residue and costs nothing measurable —
     `SPEC=mtp` over 8k/16k/32k/50k is 87.8/86.1/70.4/63.5 tok/s captured against
     93.5/83.8/70.3/59.6 piecewise. This repo previously scoped that workaround to
     `dflash2` on the theory that MTP's short verify step captures correctly; it
     does not, and `SPEC=mtp CTX=huge` shipped with the bug.
+
+    `dflash2` has since got FULL capture back (`a75ee4b` fixed its residue, and
+    `b356e31` swept **all 128** residues under FULL with 0 broken), so the two
+    speculators are no longer on the same default. `mtp` keeps PIECEWISE as a
+    correctness constraint until residue 4 comes back verbatim under a full sweep,
+    not until a particular symptom stops appearing.
 
     A third trap, learned the hard way on `DFLASH_TOKENS=15`: `bench/bugb_sweep.py`
     used to report the RAW prompt length, not the chat-templated one the engine
@@ -328,10 +370,19 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     first read as `R = 117 + k` and then as a mysterious constant 12; both were the
     same relation seen through a harness bug. It also made a k=15 sweep look
     structureless until the offset was applied, at which point the lowest-acceptance
-    row sat exactly on `== L`. The script now templates before counting. And read
-    `repeats` next to `verbatim`: the verbatim column is a longest-prefix match, so a
-    single wrong character at offset 38 reports `38/791` no matter how good the rest
-    is -- only `repeats` tells you whether it actually collapsed.
+    row sat exactly on `== L`. The script now templates before counting.
+
+    Do not judge a row by its failure signature, and that includes `repeats`. An
+    earlier version of this entry said "only `repeats` tells you whether it actually
+    collapsed"; two of the three shapes above repeat nothing, and a rule that
+    demanded repetition is what filed the `mtp` break as "diverged, probably fine"
+    through several full sweeps. Both sweeps now score **coverage** — the fraction of
+    the answer's 40-character windows that occur in the source — against the median
+    of the other lengths in the same run (`bench/verbatim.py`, which self-tests
+    against all three shapes: `venv/bin/python bench/verbatim.py`). Coverage rather
+    than the old longest-prefix column because a prefix match reports `38/791` for a
+    single wrong character at offset 38 no matter how good the rest is; the prefix
+    and repeat counts are still printed, but nothing is decided on them.
 
     Two traps for anyone measuring this. Sweep prompt length in steps of **1
     token** — at a coarse grid one broken sample below and one above reads as a
@@ -340,3 +391,22 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     instead of length; `bench/labd_bench.py` sends two warm-ups on `doc[:4000]`,
     which arms the trigger for everything after it. `bench/bugb_sweep.py` prints
     the `mod 128` column for this.
+
+    And do not sample residues. With one broken length in 128, five distinct samples
+    miss it `C(127,5)/C(128,5)` = 123/128 = **96%** of the time — this repo once
+    wrote 82% there, which is the figure for six broken residues, and hung a
+    "5 of 5 clean" claim on it. `bench/residue_sweep.py` walks all 128 by stepping
+    the pad one token at a time, which covers each residue exactly once.
+38. **The decode-graph budget is sized for 64 query tokens, and `MAX_SEQS` multiplies
+    into it.** `CG = MAX_SEQS x (k+1)` is what the V2 runner captures, and
+    `VLLM_V2_CUDAGRAPH_MEM_MIB` is reserved for what the shipped defaults produce —
+    8x8 at `DFLASH_TOKENS=7`, 4x16 at 15, i.e. 64 either way. Ask for
+    `DFLASH_TOKENS=15 MAX_SEQS=8` and it becomes 128: the server boots, captures its
+    graphs, answers `/health`, and then dies on the first concurrent batch with
+    `torch.OutOfMemoryError` inside the engine — `EngineDeadError`, every request 500,
+    `/health` still 200. Same shape as gotcha 18 and as
+    [#18](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/18): a memory bill that
+    the startup profile does not see. `single-user/start_qwen.sh` now caps the derived
+    `CG` at 64, which leaves every shipped default untouched and makes the oversized
+    batches run piecewise instead of not at all. Set `CG` explicitly to override, and
+    raise `VLLM_V2_CUDAGRAPH_MEM_MIB` with it.

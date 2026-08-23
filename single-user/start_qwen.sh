@@ -187,7 +187,7 @@ if [ "$SPEC" = "dflash2" ]; then
   # count: 1 slot and 8 slots differ by about 8 MiB in total, so cutting MAX_SEQS buys no
   # context. Single-user mode keeps 4 slots when the block is long for the graphs.
   if [ "$CTX" = "huge" ]; then
-    # KVarN pool: ~20 KB/token effective. 5.26 GiB pinned -> 268,169 tokens of
+    # KVarN pool: ~20 KB/token effective. 4.90 GiB pinned -> 268,169 tokens of
     # KV at 245760 max-model-len with 2 slots (single-user long-context; the
     # graphs stay at the k=7 size).
     MAX_SEQS=${MAX_SEQS:-2}
@@ -246,8 +246,31 @@ if [ "$SPEC" = "dflash2" ]; then
     export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
   fi
   MAX_SEQS=${MAX_SEQS:-8}
-  # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS requests.
-  CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1)))}
+  # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS
+  # requests, but never ask for more than 64 query tokens' worth. Every default in this
+  # script lands on 64 or below (8x8 at k=7, 4x16 at k=15), and VLLM_V2_CUDAGRAPH_MEM_MIB
+  # above is sized for that. `DFLASH_TOKENS=15 MAX_SEQS=8` asks for 128, which boots and
+  # then dies on the first concurrent batch -- torch.OutOfMemoryError inside the engine,
+  # EngineDeadError, every request 500 while /health still answers. Past the cap the
+  # bigger batches run piecewise instead of captured: slower, alive. Set CG explicitly to
+  # override, and raise VLLM_V2_CUDAGRAPH_MEM_MIB with it.
+  CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1)))}
+  # Seats are admissions, not residency. Every RESIDENT request needs 1+k recurrent-state
+  # slots out of the same pool before it stores one token of context: 0.88 GiB at
+  # DFLASH_TOKENS=7 and 1.66 GiB at 15 (gotcha 33), i.e. ~0.098 GiB per (k+2), which the
+  # ramp in bench/conc_ladder.py confirms live (15.8% of the CTX=fast pool per request,
+  # six resident, the seventh preempted). Print what the pool can actually hold so nobody
+  # reads MAX_SEQS as a concurrency setting -- raising it past this queues, and once the
+  # pool is full it preempts and recomputes.
+  if [ -n "$KV_MEM" ]; then
+    RESIDENT=$(( KV_MEM / ((DRAFT_TOKENS + 2) * 104988089) ))
+    [ "$RESIDENT" -lt 1 ] && RESIDENT=1
+    if [ "$MAX_SEQS" -gt "$RESIDENT" ]; then
+      echo "[start_qwen] note: the pinned pool holds about $RESIDENT resident requests at" \
+           "DFLASH_TOKENS=$DRAFT_TOKENS (state pages), fewer with long prompts;" \
+           "MAX_SEQS=$MAX_SEQS admits more than that and the rest queue."
+    fi
+  fi
   [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 else
   MAX_SEQS=${MAX_SEQS:-8}
@@ -268,10 +291,16 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # that path. It is the capture, not the drafter: eager is clean, and so is
   # PIECEWISE, which keeps the compiled graphs and leaves only the multi-query
   # verify uncaptured.
-  #   long context, labd copy@20k   FULL 1.97 tok/step 38 tok/s
-  #                                 PIECEWISE 7.83 tok/step 132 tok/s   (3.5x)
   #   short prompts, de/en/code     FULL 78/125/202 tok/s
   #                                 PIECEWISE 74/102/176 tok/s          (-13..18%)
+  # The long-context row that used to sit above this one -- FULL 1.97 tok/step / 38 tok/s
+  # against PIECEWISE's 7.83 / 132, "3.5x" -- was measuring the residue bug, not the
+  # capture mode, and a75ee4b fixed it. Re-measured at HEAD with only the capture
+  # toggled (labd_bench --ctx 20000, dflash2 CTX=huge PREFIX_CACHE=1, decode tok/s):
+  #   copy/code/edit/quote/summary/qa  FULL      167/111/85/55/48/43   all six 65.7
+  #                                    PIECEWISE 166/111/83/62/49/43   all six 67.6
+  # i.e. the same, with `quote` diverging the way greedy does. At this context length
+  # the capture mode is not a speed decision in either direction.
   # Treat that -13..18% as an UPPER bound. @mjungnickel18 measures 0.2-2.3% for the
   # same comparison on bare metal when only runs with identical STEP COUNTS are
   # compared, and he is right that greedy runs which take a different number of steps
@@ -306,14 +335,20 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # so PIECEWISE now covers the whole of CTX=huge, not just dflash2. The old
   # claim here that forcing it "would cost decode for nothing" was wrong twice.
   # SPEC=mtp keeps PIECEWISE for CORRECTNESS, not preference. Do not "optimise" this
-  # away: under FULL, mtp at CTX=huge still returns an EMPTY answer at one prompt
-  # length in 128 -- templated length == L (mod 128), L = k+1 = 4 -- with a prefix
-  # cache hit. Measured on current main, fresh server, residues 3/4/5:
+  # away: under FULL, mtp at CTX=huge still breaks at one prompt length in 128 --
+  # templated length == L (mod 128), L = k+1 = 4 -- with a prefix cache hit. Measured on
+  # current main, fresh server, residues 3/4/5:
   #   residue 3   794/794    residue 4   0 chars, finish_reason=stop    residue 5   794/794
+  # The LOCATION is deterministic; the DAMAGE is not. The same residue has returned an
+  # empty answer here, a one-character answer, and -- on a third geometry (MAX_LEN=240000,
+  # tool parser attached) -- 400 tokens of fluent Danish inventing a translation task,
+  # 2 of 1146 characters matching the document. So do not test for a symptom; test
+  # whether the copy came back (bench/verbatim.py).
   # @mjungnickel18 found it by sweeping all 128 residues (127 clean, one broken, and it
   # is 4); an earlier version of this comment claimed mtp was "correct under FULL" on
-  # five sampled residues that did not include 4 -- five samples miss a single broken
-  # residue 82% of the time. a75ee4b fixed the same shape for dflash2 but does not
+  # five sampled residues that did not include 4 -- five distinct samples miss a single
+  # broken residue C(127,5)/C(128,5) = 123/128 = 96% of the time, not the 82% this
+  # comment used to say. a75ee4b fixed the same shape for dflash2 but does not
   # cover this path.
   #
   # dflash2 does get FULL, and to the same evidence standard: ALL 128 residues swept
@@ -321,9 +356,17 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # mtp claim was. On top of that FULL is 96.5% GSM8K against PIECEWISE's 95.0%, and
   # worth 2-3x under GPU passthrough (PR #13), where the uncaptured verify is
   # launch-bound rather than bandwidth-bound. THAT one is a preference and may be
-  # revisited; the mtp line above may not, until the empty answer at residue 4 is gone.
-  [ "$CTX" = "huge" ] && [ "$SPEC" != "dflash2" ] &&
+  # revisited; the mtp line above may not, until residue 4 comes back verbatim.
+  if [ "$CTX" = "huge" ] && [ "$SPEC" != "dflash2" ]; then
     CG_MODE=",\"cudagraph_mode\":\"${CUDAGRAPH_MODE:-PIECEWISE}\""
+  fi
+fi
+# An explicit CUDAGRAPH_MODE is honoured on every path, including dflash2, which
+# otherwise takes vLLM's default. Without this branch there was no way to ask a
+# dflash2 server for PIECEWISE, so the FULL-against-PIECEWISE comparison this repo
+# quotes could not be re-measured after a75ee4b changed what FULL does.
+if [ -n "${CUDAGRAPH_MODE:-}" ] && [ -z "${CG_MODE:-}" ]; then
+  CG_MODE=",\"cudagraph_mode\":\"$CUDAGRAPH_MODE\""
 fi
 
 # ASYNC_SCHED=0 (set above for a long DFlash2 verify block) runs the scheduler
@@ -350,11 +393,64 @@ ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
 
+# Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
+# 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
+# the tower, for a client that sends images: screenshots into a coding assistant,
+# captioning, document photos.
+#
+# Only --language-model-only needs a knob. It is hardcoded in the exec line below, so
+# the alternative is countering it with --no-language-model-only from EXTRA_ARGS and
+# depending on which flag argparse saw last -- which regresses silently: images are
+# still accepted and still counted as prompt tokens, and the model answers from
+# placeholder embeddings. The two flags VISION=1 adds have no such conflict and can
+# be overridden from EXTRA_ARGS, which is expanded after them. The pixel cap is
+# shipped rather than left to the processor default because vLLM profiles the encoder
+# at the largest image it will accept, and that peak comes out of the KV pool:
+# 2097152 px = 2048 image tokens.
+if [ "${VISION:-0}" = 1 ]; then
+  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+else
+  VISION_ARGS="--language-model-only"
+fi
+
+# fp16 activations do not work with the speculative path, and every way of finding
+# that out is late and cryptic (#27): the split-KV verify kernel hardcodes
+# tl.bfloat16 for the query cast and the dot accumulate
+# (patches/spec-decode-attn.patch), so it fails to *compile* at first attention with
+# "Both operands must be same dtype. Got bf16 and fp16"; disable it with SPEC_ATTN=0
+# and you get as far as the first sample, where the rejection sampler dies on a
+# device-side assert. Neither message names the dtype you set. Say so here instead.
+# This is a limitation of this repo's kernels, not of the checkpoint -- an fp16
+# target is fine with SPEC=none.
+case " ${EXTRA_ARGS:-} " in
+  *" --dtype float16 "*|*" --dtype=float16 "*|*" --dtype fp16 "*|*" --dtype=fp16 "*|*" --dtype half "*|*" --dtype=half "*)
+    if [ "${SPEC:-mtp}" != "none" ]; then
+      echo "--dtype float16 needs SPEC=none: this repo's speculative kernels are bf16-only." >&2
+      echo "  the split-KV verify attention casts to tl.bfloat16 (patches/spec-decode-attn.patch)," >&2
+      echo "  and the rejection sampler asserts device-side under fp16. See issue #27." >&2
+      exit 1
+    fi ;;
+esac
+
 export PATH="$REPO/venv/bin:$PATH"
-# Overridable: expandable_segments needs CUDA VMM, which WSL2's paravirt
-# driver rejects ("CUDA driver error: device not ready" during Marlin repack)
-# — set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False in .env on WSL2.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# expandable_segments needs CUDA VMM, which WSL2's paravirt driver rejects during
+# Marlin repack. It is the single most reported failure on Windows (#2, #26) and it
+# does not announce itself as an allocator problem -- the same VMM rejection surfaces
+# as "CUDA driver error: device not ready", "CUDA driver error: out of memory" (on a
+# card with 23 GiB free for a 16 GiB model) or a torch stable-ABI error out of
+# aten::empty, with dmesg carrying "dxgkio_make_resident: Ioctl failed: -12". So
+# detect WSL and default it off there rather than documenting a workaround: three
+# separate reporters found the note in docs/docker.md only after losing a day.
+# Still overridable both ways, and untouched on native Linux, where gotcha 3 applies
+# and turning it off costs you the top of the GPU_UTIL range.
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+  ALLOC_DEFAULT=expandable_segments:False
+  [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
+    "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
+else
+  ALLOC_DEFAULT=expandable_segments:True
+fi
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 if [ -z "$VLLM_API_KEY" ] && [ -f "$REPO/api_key.txt" ]; then
@@ -369,7 +465,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
-  --language-model-only \
+  ${VISION_ARGS} \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \

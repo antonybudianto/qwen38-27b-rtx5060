@@ -254,11 +254,22 @@ single biggest thing in this repo for you. (The other three changes on this page
 lookup drafting, the KV-group fix and the V2 graph accounting — only fire on the DFlash2
 path and are inert in batch mode.)
 
-Its limits are memory- and window-shaped, not speed-shaped: each request holds
-1+7 recurrent-state slots (0.7 GB), so from 8 concurrent long generations MTP's
-e2e is higher again (309 vs 235 tok/s); and the drafter's 2,048-token attention
-window loses acceptance on long-context tasks (2.3-2.6 vs 2.6-3.0 tokens per
-step at 12-36k, where MTP is 5-10% ahead e2e). `CTX=long`/`huge` stay MTP. For
-one to four people chatting with normal context — what single-user mode is for
-— it is the fastest config in this repo. Full table in
+Its limits are memory- and window-shaped: each *resident* request holds 1+7
+recurrent-state slots — 0.88 GiB, 15.8% of the `CTX=fast` pool, before it stores any
+context — so six requests are resident and the seventh is preempted, against eight for
+MTP's 0.44 GiB; from 8 concurrent long generations MTP's e2e is higher again (309 vs
+235 tok/s). The drafter's 2,048-token attention window separately loses acceptance on
+long-context tasks (2.3-2.6 vs 2.6-3.0 tokens per step at 12-36k, where MTP is 5-10%
+ahead e2e). `CTX=long`/`huge` stay MTP.
+
+It is not only memory-shaped, though, and that sentence used to say it was. Per-stream
+decode falls hard with concurrency — 137 / 97 / 46 tok/s at 1 / 2 / 4 distinct
+4k-token streams — because every resident request adds ~7 ms to the forward pass
+(25.9 → 49.1 ms). Aggregate throughput still rises (137 → 309 tok/s) and nothing is
+preempted, so the verify step is batching; it is latency per user that goes. MTP does
+the same thing (126 / 103 / 46 per stream, ~5 ms per resident), so this is the hybrid
+model plus speculation on one 3090, not something DFlash2 does wrong — what is
+DFlash2's own is running out of state pages at five residents where MTP holds eight
+and reaches 383 tok/s aggregate at C8. For **one person** with normal context — what single-user mode is
+for — it is the fastest config in this repo. Full table in
 [single-user/README.md](../single-user/README.md).

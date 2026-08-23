@@ -8,3 +8,11 @@ compressed-tensors==0.17.0
 huggingface_hub==1.27.0
 hf_transfer==0.1.9
 ninja==1.13.0
+# bench/run_benchmarks.sh calls `vllm bench serve`, whose dataset loader imports
+# pandas through a PlaceholderModule -- so without this every cohort dies on
+# "Please install vllm[bench] for bench support" and the fix is not obvious from
+# the message (#22). Installing the vllm[bench] extra instead would reinstall
+# vLLM and revert the whole patch stack. Only pandas is needed: the extra's other
+# members are for HF-hosted --dataset-name values and the plotting subcommands,
+# and this repo's scripts use only `random` and `custom`.
+pandas==3.0.5

@@ -7,13 +7,17 @@
 #   docker compose run --rm single verify     # verify.sh inside the container
 #
 # Knobs go in a .env file next to this file (never committed): VLLM_API_KEY=...,
-# and any of the start-script variables (CTX, KV, MAX_LEN, MAX_SEQS, GPU_UTIL,
+# and any of the start-script variables (CTX, KV, MAX_LEN, MAX_SEQS, GPU_UTIL, VISION,
 # SPEC_ATTN, DRAFT_TOKENS, EXTRA_ARGS, ...) — .env is passed straight into the
 # container. Fastest single-user decode, if the card is yours alone (README,
 # "If you are the only user"; the drafter it needs is already downloaded by
 # prepare):
 #
 #   printf 'SPEC=dflash2\nDFLASH_TOKENS=15\nPREFIX_CACHE=1\n' >> .env
+#
+# On WSL2 add VLLM_WSL2_ENABLE_PIN_MEMORY=1 to that .env: SPEC=dflash2 forces vLLM's
+# V2 model runner, whose UVA buffers are refused there by default, and the container
+# aborts at "RuntimeError: UVA is not available" before loading weights (docs/docker.md).
 # PORT and MODELS_DIR are read here: models live in ./models by default
 # (the same layout as the venv install, so both can share one download).
 # One GPU: run either "single" or "batch", not both.
