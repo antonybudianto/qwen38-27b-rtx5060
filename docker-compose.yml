@@ -100,13 +100,8 @@ services:
       - ./bench:/app/bench           # results land on the host, edits need no rebuild
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 2
-              capabilities: [gpu]
+    # No GPU reservation on purpose: this container is an HTTP client, so it runs
+    # even while single/batch hold both cards.
 
 volumes:
   qwen-cache:
