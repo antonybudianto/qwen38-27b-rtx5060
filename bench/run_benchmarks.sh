@@ -8,6 +8,8 @@
 #   bash bench/run_benchmarks.sh batch --prefill  # + the prefill matrix (1k..100k)
 #   bash bench/run_benchmarks.sh batch --long     # + 1x100k and 4x60k long-context requests (needs the context)
 #
+# In a container: docker compose --profile bench run --rm bench batch (docs/docker.md).
+#
 # Run it twice after a restart and keep the second numbers: the first run
 # after start includes JIT warmup and reads 30-50% low. Then run
 # bench/quality_battery.py — a fast server that emits garbage is worth nothing.
@@ -20,19 +22,31 @@ DO_PREFILL=0; DO_LONG=0
 for a in "$@"; do case $a in --prefill) DO_PREFILL=1;; --long) DO_LONG=1;; esac; done
 export PATH="$REPO/venv/bin:$PATH"
 export OPENAI_API_KEY=${VLLM_API_KEY:-$(cat "$REPO/api_key.txt" 2>/dev/null)}
-HOST=${HOST:-127.0.0.1}; PORT=${PORT:-18020}
+HOST=${HOST:-127.0.0.1}; PORT=${PORT:-8000}
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
-B="venv/bin/vllm bench serve --host $HOST --port $PORT --model $MODEL --served-model-name qwen3.8-27b"
+# repo venv by default; fall back to whatever vllm is on PATH, or VLLM=/path/to/vllm
+VLLM=${VLLM:-$REPO/venv/bin/vllm}
+[ -x "$VLLM" ] || VLLM=$(command -v vllm) || { echo "no vllm binary: create the venv (python3 -m venv venv && venv/bin/pip install vllm) or set VLLM=/path/to/vllm"; exit 1; }
+B="$VLLM bench serve --host $HOST --port $PORT --model $MODEL --served-model-name qwen3.8-27b"
 OUT=${OUT:-$HERE/results}; mkdir -p "$OUT"
 
-curl -sf -o /dev/null http://$HOST:$PORT/health || { echo "no server on $HOST:$PORT"; exit 1; }
+# WAIT=<seconds> polls /health instead of failing on the first miss — a server
+# started alongside this one spends 2-3 minutes compiling before it answers.
+W=${WAIT:-0}
+until curl -sf -o /dev/null http://$HOST:$PORT/health; do
+  [ "$W" -gt 0 ] || { echo "no server on $HOST:$PORT"; exit 1; }
+  echo "# waiting for $HOST:$PORT (${W}s left)"; sleep 10; W=$((W-10))
+done
 metrics() { curl -s http://$HOST:$PORT/metrics -H "Authorization: Bearer $OPENAI_API_KEY"; }
 spec() { metrics | grep -E "^vllm:spec_decode_num_(drafts|accepted_tokens)_total" | awk '{print $2}' | tr "\n" " "; }
 num() { awk "/$1/ {print \$$2}" "$3"; }
+div() { awk -v n="$1" -v d="$2" -v s="$3" 'BEGIN{if(d+0==0)print "-";else printf "%.*f\n",s,n/d}'; }
+fail() { echo "ROW $1 | FAILED, no metrics in $2: $(tail -n1 "$2")"; }
 row() { # label logfile conc
   local L=$1 F=$2 C=$3
   local E2E=$(num "Output token throughput" 5 $F) TPOT=$(num "Mean TPOT" 4 $F) MTPOT=$(num "Median TPOT" 4 $F) TTFT=$(num "Mean TTFT" 4 $F) DUR=$(num "Benchmark duration" 4 $F)
-  local DEC=$(python3 -c "print(f'{$C*1000/$MTPOT:.0f}')" 2>/dev/null)
+  [ -n "$E2E" ] || { fail "$L" "$F"; return; }
+  local DEC=$(div $((C*1000)) "$MTPOT" 0)
   echo "ROW $L | e2e=$E2E tok/s | decode(C/medTPOT)=$DEC | medTPOT=$MTPOT ms | meanTTFT=$TTFT ms | dur=${DUR}s"
 }
 tokstep() { python3 -c "
@@ -42,7 +56,8 @@ try:
 except Exception: print('-')"; }
 
 echo "# $(date) mode=$MODE server=$HOST:$PORT"
-$B --dataset-name random --random-input-len 256 --random-output-len 256 --num-prompts 16 --max-concurrency 8 > /dev/null 2>&1   # warmup
+$B --dataset-name random --random-input-len 256 --random-output-len 256 --num-prompts 16 --max-concurrency 8 > $OUT/warmup.log 2>&1 \
+  || { echo "warmup run failed, aborting:"; tail -n 20 $OUT/warmup.log; exit 1; }
 
 if [ "$MODE" = "batch" ]; then
   for W in "128 512" "256 256"; do set -- $W
@@ -59,14 +74,17 @@ for T in default 0; do
     $B --dataset-name custom --dataset-path $HERE/prompts_real.jsonl --custom-output-len 1024 --num-prompts 8 --max-concurrency $C $TARG > $OUT/cohort_T${T}_c$C.log 2>&1
     S1=$(spec)
     L="cohort C$C real prompts T=$T"; F=$OUT/cohort_T${T}_c$C.log
-    echo "ROW $L | e2e=$(num "Output token throughput" 5 $F) tok/s | decode(C/meanTPOT)=$(python3 -c "print(f'{$C*1000/$(num "Mean TPOT" 4 $F):.1f}')") | tok/step=$(tokstep "$S0" "$S1") | meanTTFT=$(num "Mean TTFT" 4 $F) ms"
+    E2E=$(num "Output token throughput" 5 $F)
+    [ -n "$E2E" ] || { fail "$L" "$F"; continue; }
+    echo "ROW $L | e2e=$E2E tok/s | decode(C/meanTPOT)=$(div $((C*1000)) "$(num "Mean TPOT" 4 $F)" 1) | tok/step=$(tokstep "$S0" "$S1") | meanTTFT=$(num "Mean TTFT" 4 $F) ms"
   done
 done
 if [ $DO_PREFILL = 1 ]; then
   pf() { LEN=$1; C=$2; N=$3
     $B --dataset-name random --random-output-len 1 --random-input-len $LEN --num-prompts $N --max-concurrency $C > $OUT/prefill_${LEN}_c$C.log 2>&1
     IN=$(num "Total input tokens" 4 $OUT/prefill_${LEN}_c$C.log); DUR=$(num "Benchmark duration" 4 $OUT/prefill_${LEN}_c$C.log)
-    echo "ROW prefill len=$LEN conc=$C | $(python3 -c "print(f'{$IN/$DUR:.0f}')") tok/s | meanTTFT=$(num "Mean TTFT" 4 $OUT/prefill_${LEN}_c$C.log) ms"; }
+    [ -n "$IN" ] || { fail "prefill len=$LEN conc=$C" $OUT/prefill_${LEN}_c$C.log; return; }
+    echo "ROW prefill len=$LEN conc=$C | $(div "$IN" "$DUR" 0) tok/s | meanTTFT=$(num "Mean TTFT" 4 $OUT/prefill_${LEN}_c$C.log) ms"; }
   pf 1024 1 16; pf 1024 4 32; pf 1024 16 64
   pf 4096 1 8;  pf 4096 4 16;  pf 4096 16 32
   pf 16384 1 4; pf 16384 4 8;  pf 16384 8 16

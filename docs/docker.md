@@ -43,6 +43,26 @@ difference is gotcha 16 below.
 - `docker compose run --rm single verify` runs `verify.sh` inside the container
   (GPU, patches, model). The entrypoint runs `verify.sh --no-server` before every
   start and refuses to serve on a FAIL (`VERIFY=0` skips that).
+- `docker compose --profile bench run --rm bench` runs `bench/run_benchmarks.sh`
+  in a client-only container against the server that is already up, printing the
+  same ROW lines as the venv install:
+
+  ```bash
+  docker compose --profile batch up -d
+  docker compose --profile bench run --rm bench                    # the batch tables
+  docker compose --profile bench run --rm bench single --prefill   # mode + flags
+  ```
+
+  Arguments after the service name go straight to the script, since the service
+  overrides the entrypoint with the script itself; `BENCH_ARGS` in `.env` sets the
+  default (`batch`). `BENCH_TARGET` picks the service to drive (default `single`;
+  use `host.docker.internal` for a server running on the host rather than in
+  compose), and `PORT` is the one the server already reads from `.env`. `./bench`
+  is bind-mounted, so raw vllm logs land in `./bench/results` on the host and
+  editing the script needs no image rebuild. `BENCH_WAIT` (default 1800s) is how
+  long the client polls `/health` before giving up, which covers a first server
+  start's compile. Run it twice and keep the second numbers, exactly as on the
+  venv install.
 - Files that `prepare` writes to `./models` are root-owned: the container runs
   as root, like vLLM's own image.
 - The image carries an nvcc (CUDA "base" + `cuda-nvcc`, not the 8 GB "devel"

@@ -338,7 +338,7 @@ git clone https://github.com/syv-ai/qwen38-27b-rtx3090 ~/qwen-serving
 cd ~/qwen-serving
 
 python3 -m venv venv
-venv/bin/pip install vllm huggingface_hub hf_transfer ninja
+venv/bin/pip install vllm huggingface_hub hf_transfer ninja pandas   # pandas: bench/run_benchmarks.sh real-prompt cohorts
 
 # model, ~19.5 GB
 HF_HUB_ENABLE_HF_TRANSFER=1 venv/bin/hf download \

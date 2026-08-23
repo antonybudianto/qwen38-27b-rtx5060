@@ -22,6 +22,12 @@ WORKDIR /app
 RUN python3.12 -m venv venv && venv/bin/pip install --upgrade pip
 COPY docker/requirements.txt docker/requirements.txt
 RUN venv/bin/pip install -r docker/requirements.txt
+# The benchmark client only: vllm lazy-imports pandas for `--dataset-name custom`
+# (bench/run_benchmarks.sh's real-prompt cohorts), and without it every cohort row
+# dies with "Please install vllm[bench] for bench support". Kept out of
+# requirements.txt as its own layer so it does not invalidate the multi-GB vllm
+# install; the rest of the vllm[bench] extra is plotting libs nothing here uses.
+RUN venv/bin/pip install pandas==3.0.5
 
 COPY . .
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \

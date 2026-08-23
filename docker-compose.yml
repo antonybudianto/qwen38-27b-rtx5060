@@ -3,6 +3,7 @@
 #   docker compose --profile single up -d     # low latency: MTP speculative decoding
 #   docker compose --profile batch  up -d     # throughput
 #   docker compose run --rm prepare           # just download + requantize the model
+#   docker compose --profile bench run --rm bench   # bench/run_benchmarks.sh vs the running server
 #   docker compose run --rm single verify     # verify.sh inside the container
 #
 # Knobs go in a .env file next to this file (never committed): VLLM_API_KEY=...,
@@ -67,6 +68,41 @@ services:
     <<: *serve
     profiles: [batch]
     command: batch
+
+  # Benchmark client. Runs no server of its own: it drives whichever of
+  # single/batch is already up, over the compose network. BENCH_TARGET picks it
+  # (default "single"); set it to host.docker.internal for a server running on
+  # the host. Rows go to stdout, raw vllm logs to ./bench/results.
+  #
+  #   docker compose --profile bench run --rm bench                 # batch rows
+  #   docker compose --profile bench run --rm bench single --prefill
+  #
+  # The entrypoint is the bench script itself and ./bench is bind-mounted, so
+  # arguments after the service name go straight to run_benchmarks.sh and
+  # editing it needs no image rebuild. BENCH_ARGS sets the default from .env.
+  bench:
+    <<: *qwen
+    profiles: [bench]
+    entrypoint: ["bash", "bench/run_benchmarks.sh"]
+    command: ${BENCH_ARGS:-batch}
+    environment:
+      HOME: /cache
+      HOST: ${BENCH_TARGET:-single}
+      PORT: ${PORT:-18020}
+      WAIT: ${BENCH_WAIT:-1800}      # first server start compiles for 2-3 minutes
+    volumes:
+      - ${MODELS_DIR:-./models}:/app/models
+      - qwen-cache:/cache
+      - ./bench:/app/bench           # results land on the host, edits need no rebuild
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
 
 volumes:
   qwen-cache:

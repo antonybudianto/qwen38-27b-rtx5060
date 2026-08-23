@@ -3,6 +3,7 @@
 #   single   single-user/start_qwen.sh  (MTP speculative decoding, low latency)
 #   batch    batch/start_qwen.sh        (throughput)
 #   prepare  docker/prepare.sh          (download + requantize the model into /app/models)
+#   bench    bench/run_benchmarks.sh    (client only: benchmarks $HOST:$PORT, no GPU work)
 #   verify   verify.sh [args]
 #   <anything else> is exec'd as a command (e.g. bash)
 # Before serving, verify.sh --no-server runs and aborts on FAIL (model not
@@ -18,5 +19,6 @@ case "$cmd" in
     if [ "$cmd" = single ]; then exec bash single-user/start_qwen.sh "$@"; else exec bash batch/start_qwen.sh "$@"; fi ;;
   prepare) exec bash docker/prepare.sh "$@" ;;
   verify)  exec bash verify.sh "$@" ;;
+  bench)   exec bash bench/run_benchmarks.sh "$@" ;;
   *)       exec "$cmd" "$@" ;;
 esac
