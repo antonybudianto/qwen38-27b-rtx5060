@@ -35,7 +35,14 @@ print(f"  PASS  GPU: {p.name}, {p.total_memory/2**30:.1f} GiB, sm{p.major}{p.min
 EOF
 command -v nvidia-smi >/dev/null && { PL=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1); ok "power limit ${PL} W (README numbers are at 250 W)"; }
 fi
-for t in triton flashinfer compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
+for t in triton compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
+# a bare `import flashinfer` passes while vLLM still falls back to torch.topk:
+# has_flashinfer() additionally wants nvcc on PATH or the flashinfer-cubin
+# package (#35). Test what the server will actually use.
+export FLASHINFER_DISABLE_VERSION_CHECK=1  # cubin publishes 0.6.13 vs python 0.6.16.post3; the launchers export this too
+$PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
+  && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
+  || fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. pip install flashinfer-python flashinfer-cubin==0.6.13 (#35)" 
 
 echo "== vLLM patches (patches/*.patch)"
 # The reverse dry-run is exact, but two patches touching the same file (the DFlash2 pair)

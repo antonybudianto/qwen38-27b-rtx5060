@@ -396,6 +396,33 @@ batch mode are the only knobs that trade accuracy for speed, and they cost
 0.9-3.7% perplexity depending on how far you push them. Per-configuration
 tables: [docs/quality.md](docs/quality.md).
 
+### Results from other hardware
+
+Community reproductions of the single-user headline number, harness runs first.
+`bench/run_benchmarks.sh single`, greedy, second run (the first reads low):
+
+| card | power | C1 decode | notes | source |
+|---|---|---|---|---|
+| RTX 3090 (reference) | 250 W | 133 tok/s | pool 57,669 tok, ppl 8.09 | this README |
+| RTX 4090 | 450 W | **135.5 tok/s** | pool 57,669 and ppl 8.0921 reproduce exactly; no-spec control 60.3 (DFlash2 worth 2.31x); +1.9% from ~8% more bandwidth — batch-1 decode is bandwidth-bound, the extra compute has nothing to bite on | [#32](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/32) |
+
+Measured with their own clients rather than the harness — comparable to each
+other only loosely, and not rows for the table above:
+
+- **CMP 170HX 40 GB (GA100, sm80)**: 133.7 tok/s median (3x900 tok, greedy) on
+  the shipped fast target — the first sm80 datapoint, level with the 3090 —
+  and 97.8 tok/s on their own w8a16 int8 target after the sm80 repack
+  workaround in [#27](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/27)
+  (gotcha 41).
+- **RTX 5090 32 GB (sm120)**: ~410-449 tok/s on code and ~198 on prose at
+  `CTX=fast`, 500 W cap, roughly flat out to `CTX=huge` at 240k — different
+  prompts, output length and rate definition, so deliberately not in the table
+  (their own insistence, and correct). Setup gotchas and the full ladder:
+  [#35](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/35).
+- **Dual-GPU reports**: dual 3090 in
+  [#7](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/7), dual 5060 Ti in
+  [#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22).
+
 ### Why this isn't just `vllm serve`
 
 Nine things, from requantizing both embedding matrices to drafting straight out
@@ -464,7 +491,15 @@ git clone https://github.com/syv-ai/qwen38-27b-rtx3090 ~/qwen-serving
 cd ~/qwen-serving
 
 python3 -m venv venv
-venv/bin/pip install vllm huggingface_hub hf_transfer ninja pandas   # pandas: bench/run_benchmarks.sh real-prompt cohorts
+venv/bin/pip install vllm huggingface_hub hf_transfer ninja \
+  flashinfer-python flashinfer-cubin==0.6.13
+# flashinfer makes the DFlash2 selector ~2x faster than its torch.topk fallback,
+# and vLLM only *uses* it if nvcc is on PATH or flashinfer-cubin is installed --
+# a bare `pip install flashinfer-python` silently falls back with one INFO line
+# (#35). cubin publishes up to 0.6.13, so the version pair needs
+# FLASHINFER_DISABLE_VERSION_CHECK=1, which the launchers export. Do not fix the
+# mismatch by downgrading flashinfer-python: that drags torch back and breaks
+# vLLM's C extension.
 
 # model, ~19.5 GB
 HF_HUB_ENABLE_HF_TRANSFER=1 venv/bin/hf download \

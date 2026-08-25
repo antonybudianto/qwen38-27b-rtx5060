@@ -24,6 +24,23 @@
 #  - kv-cache-dtype fp8 roughly doubles the usable context/pool
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
+# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# A dead engine leaves its OffloadingConnector region behind as
+# /dev/shm/vllm_offload_*.mmap; the next boot then dies with OSError: Bad
+# address in shared_offload_region.py, and under restart policies that loops
+# (#33 found 70 ghosts after one host OOM). Unlink stale regions no live
+# process maps. VLLM_OFFLOAD_KEEP_SHM=1 skips this (several engines sharing
+# /dev/shm across namespaces, where the liveness scan cannot see the owner).
+if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
+  for f in /dev/shm/vllm_offload_*.mmap; do
+    [ -e "$f" ] || continue
+    grep -lqs "$f" /proc/[0-9]*/maps 2>/dev/null || { echo "[start_qwen] removing stale offload region $f"; rm -f "$f"; }
+  done
+fi
 REPO="$(dirname "$DIR")"
 cd "$REPO"
 
@@ -106,6 +123,21 @@ TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-
 # 2097152 px = 2048 image tokens.
 if [ "${VISION:-0}" = 1 ]; then
   VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+  # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
+  # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
+  # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:
+  # the tower is 0.85 GiB of the ~1.1 GiB transient margin the KV_MEM comment sizes, and
+  # graph capture then dies allocating the split-KV verify buffer --
+  #   torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 787.50 MiB is free
+  #     (spec_decode_attn.py:184, self.part_o)
+  # measured here, VISION=1 VISION_OFFLOAD=0 SPEC=dflash2, RTX 3090 at 250 W. With the
+  # offload the same config comes up with the full 69,758-token pool and reads images.
+  #
+  # It is close to free: isolated-tower measurement at PCIe 4.0 x16, one 8192-patch image,
+  # median of 10 forwards, 891.3 -> 9.0 MiB of resident weights and 1160.5 -> 308.2 MiB of
+  # peak allocation for 296 -> 333 ms of encode, output bit-exact either way. Set
+  # VISION_OFFLOAD=0 only on a card with room to spare, where 36 ms per image buys nothing.
+  [ "${VISION_OFFLOAD:-1}" = 1 ] && export VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-1}
 else
   VISION_ARGS="--language-model-only"
 fi

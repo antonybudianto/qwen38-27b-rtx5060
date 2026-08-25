@@ -38,6 +38,23 @@
 # batch size 1 (memory-bound), so this mode stays W4A16.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
+# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# A dead engine leaves its OffloadingConnector region behind as
+# /dev/shm/vllm_offload_*.mmap; the next boot then dies with OSError: Bad
+# address in shared_offload_region.py, and under restart policies that loops
+# (#33 found 70 ghosts after one host OOM). Unlink stale regions no live
+# process maps. VLLM_OFFLOAD_KEEP_SHM=1 skips this (several engines sharing
+# /dev/shm across namespaces, where the liveness scan cannot see the owner).
+if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
+  for f in /dev/shm/vllm_offload_*.mmap; do
+    [ -e "$f" ] || continue
+    grep -lqs "$f" /proc/[0-9]*/maps 2>/dev/null || { echo "[start_qwen] removing stale offload region $f"; rm -f "$f"; }
+  done
+fi
 REPO="$(dirname "$DIR")"
 cd "$REPO"
 
@@ -271,6 +288,39 @@ if [ "$SPEC" = "dflash2" ]; then
            "MAX_SEQS=$MAX_SEQS admits more than that and the rest queue."
     fi
   fi
+  # Above ~12 seats at CTX=huge the seats stop being merely useless and become fatal, and
+  # not through the graph budget that gotcha 38 caps -- CG is already pinned at 64 in
+  # every one of these. The per-seat runner allocations eat the transient headroom the
+  # first prefill needs, so the engine boots, captures, answers /health 200, and then
+  # dies on the first real prompt with torch.OutOfMemoryError inside the caching
+  # allocator. Measured on one 24 GiB 3090, SPEC=dflash2 k=7, free VRAM after boot
+  # against a single ~3.7k-token prompt (gotcha 39):
+  #   MAX_SEQS=8   596 MiB  ok      MAX_SEQS=12  416 MiB  ok
+  #   MAX_SEQS=10  456 MiB  ok      MAX_SEQS=16  356 MiB  DEAD, twice, same byte counts
+  # The transient set is elastic -- it squeezes to full speed with 8 MiB free -- but the
+  # first real batch's per-seat allocations are not, so the floor is sharp: through the
+  # KV_MEM door at 8 seats it sits between 396 (dead) and 436 MiB (fine) of free VRAM,
+  # same allocator fingerprint as the seat door (gotcha 39, both tables). Warning rather
+  # than a clamp: the number is a VRAM budget, and a card larger than 24 GiB will have
+  # room where this one does not. Lower KV_MEM if you genuinely need the seats.
+  if [ "$CTX" = "huge" ] && [ "$MAX_SEQS" -gt 12 ]; then
+    echo "[start_qwen] WARNING: MAX_SEQS=$MAX_SEQS at CTX=huge killed the engine on the" \
+         "first prompt on a 24 GiB card (boots, serves /health, then OutOfMemoryError)." \
+         "12 is the highest verified here. Lower MAX_SEQS or lower KV_MEM." >&2
+  fi
+  # The same room through the other door: a KV_MEM pinned above the profile default
+  # spends the same headroom. On Linux the shortfall is a loud OutOfMemoryError on the
+  # first real batch; on WSL2 it is SILENT -- WDDM backs the failed mapping with host
+  # memory and prefill quietly runs 5-10x slower with nothing in the logs (issue #25).
+  KV_STOCK=5583457484; [ "$CTX" = "huge" ] && KV_STOCK=5261334938
+  if [ -n "$KV_MEM" ] && [ "$KV_MEM" -gt "$KV_STOCK" ]; then
+    echo "[start_qwen] WARNING: KV_MEM=$KV_MEM is above the profile default $KV_STOCK." \
+         "The extra pool is taken from the headroom prefill and the first concurrent" \
+         "batch allocate from, and the floor is close: +150 MiB ran, +200 MiB killed" \
+         "the engine at CTX=huge MAX_SEQS=8 (gotcha 39 has the ladder). On Linux the" \
+         "miss is a loud OutOfMemoryError; on WSL2 it is SILENT: no error, prefill" \
+         "5-10x slower. Ladder 4k/16k TTFT against known-good rates before trusting it." >&2
+  fi
   [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 else
   MAX_SEQS=${MAX_SEQS:-8}
@@ -409,25 +459,49 @@ TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-
 # 2097152 px = 2048 image tokens.
 if [ "${VISION:-0}" = 1 ]; then
   VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+  # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
+  # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
+  # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:
+  # the tower is 0.85 GiB of the ~1.1 GiB transient margin the KV_MEM comment sizes, and
+  # graph capture then dies allocating the split-KV verify buffer --
+  #   torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 787.50 MiB is free
+  #     (spec_decode_attn.py:184, self.part_o)
+  # measured here, VISION=1 VISION_OFFLOAD=0 SPEC=dflash2, RTX 3090 at 250 W. With the
+  # offload the same config comes up with the full 69,758-token pool and reads images.
+  #
+  # It is close to free: isolated-tower measurement at PCIe 4.0 x16, one 8192-patch image,
+  # median of 10 forwards, 891.3 -> 9.0 MiB of resident weights and 1160.5 -> 308.2 MiB of
+  # peak allocation for 296 -> 333 ms of encode, output bit-exact either way. Set
+  # VISION_OFFLOAD=0 only on a card with room to spare, where 36 ms per image buys nothing.
+  [ "${VISION_OFFLOAD:-1}" = 1 ] && export VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-1}
 else
   VISION_ARGS="--language-model-only"
 fi
 
-# fp16 activations do not work with the speculative path, and every way of finding
-# that out is late and cryptic (#27): the split-KV verify kernel hardcodes
-# tl.bfloat16 for the query cast and the dot accumulate
-# (patches/spec-decode-attn.patch), so it fails to *compile* at first attention with
-# "Both operands must be same dtype. Got bf16 and fp16"; disable it with SPEC_ATTN=0
-# and you get as far as the first sample, where the rejection sampler dies on a
-# device-side assert. Neither message names the dtype you set. Say so here instead.
-# This is a limitation of this repo's kernels, not of the checkpoint -- an fp16
-# target is fine with SPEC=none.
+# fp16 activations do not work with the speculative path, and the way you find that out
+# is late and cryptic (#27): the split-KV verify kernel hardcodes tl.bfloat16 for the
+# query cast and the dot accumulate (patches/spec-decode-attn.patch:217,236), so it
+# fails to *compile* at first attention with "Both operands must be same dtype. Got bf16
+# and fp16" -- a triton CompilationError that never names the dtype you set.
+#
+# Scope, stated honestly because an earlier version of this comment overreached: the
+# BLOCKER I can point at is that kernel. @ahnguyen17 also hit a device-side assert in
+# rejection_sample() with SPEC_ATTN=0, and I first wrote that up as a second bf16
+# assumption -- it is not. rejection_sampler_utils.py contains zero bf16/fp16 literals;
+# it promotes to tl.float32 on load and allocates its buffers float32/int64, so it is
+# dtype-agnostic. That assert has some other cause (it was seen on a w8a16 GPTQ target
+# whose GEMM path was already suspect, and a device-side assert reads like an
+# out-of-bounds index, not a dtype mismatch), and it is not established.
+#
+# So this refuses the combination rather than claiming to enumerate why it breaks:
+# fp16 + a speculator is untested here and its default path is bf16-only. SPEC=none is
+# the escape hatch -- a limitation of these kernels, not of any checkpoint.
 case " ${EXTRA_ARGS:-} " in
   *" --dtype float16 "*|*" --dtype=float16 "*|*" --dtype fp16 "*|*" --dtype=fp16 "*|*" --dtype half "*|*" --dtype=half "*)
     if [ "${SPEC:-mtp}" != "none" ]; then
-      echo "--dtype float16 needs SPEC=none: this repo's speculative kernels are bf16-only." >&2
+      echo "--dtype float16 needs SPEC=none: this repo's speculative path is bf16-only." >&2
       echo "  the split-KV verify attention casts to tl.bfloat16 (patches/spec-decode-attn.patch)," >&2
-      echo "  and the rejection sampler asserts device-side under fp16. See issue #27." >&2
+      echo "  so it fails to compile at the first attention. See issue #27." >&2
       exit 1
     fi ;;
 esac
