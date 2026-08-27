@@ -190,6 +190,38 @@ if [ "$SPEC" = "dflash2" ]; then
     # Measured cost of losing async scheduling at batch 1: under 1%.
     ASYNC_SCHED=${ASYNC_SCHED:-0}
   fi
+  # Tensor parallelism changes two calibrations below, both measured in #40
+  # (controlled 1-vs-2x3090 A/B on this harness):
+  #
+  # 1. The pinned KV_MEM is a 24-GiB-single-card constant and vLLM applies
+  #    --kv-cache-memory PER WORKER, so at TP=2 the pin strands ~8 GiB per card:
+  #    137,210 tokens of pool where GPU_UTIL sizing gets 302,223, with every
+  #    decode delta inside run-to-run spread. Under TP>1, unless the user pinned
+  #    one, size from GPU_UTIL instead. (The pin exists because the single-card
+  #    transient margin is sharp -- gotcha 39; TP halves the per-card footprint
+  #    and the same reporter's boxes boot clean unpinned.)
+  # 2. DFLASH_TOKENS>7 relies on the lookup lane filling the verify tail; at
+  #    TP=2 the one datapoint so far (#40) shows the tail accepting nothing and
+  #    the wider block costing -27% at C1. Until that is diagnosed, warn.
+  TP_SIZE=1
+  case " ${EXTRA_ARGS:-} " in *"-tensor-parallel-size"*|*" -tp "*)
+    TP_SIZE=$(printf %s " $EXTRA_ARGS" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
+    TP_SIZE=${TP_SIZE:-1}
+  ;; esac
+  if [ "$TP_SIZE" -gt 1 ]; then
+    if [ -z "${KV_MEM+x}" ]; then
+      echo "[start_qwen] tensor-parallel-size $TP_SIZE: skipping the single-card KV_MEM" \
+           "pin, sizing the KV pool from GPU_UTIL=$GPU_UTIL (issue #40; export KV_MEM" \
+           "to pin it, KV_MEM= for this behavior explicitly)."
+      KV_MEM=
+    fi
+    if [ "$DRAFT_TOKENS" -gt 7 ]; then
+      echo "[start_qwen] WARNING: DFLASH_TOKENS=$DRAFT_TOKENS at TP=$TP_SIZE lost 27% at" \
+           "C1 in the one A/B so far (#40): the lookup-filled verify tail accepted" \
+           "nothing there. Until diagnosed, DFLASH_TOKENS=7 is the measured setting" \
+           "for TP>1." >&2
+    fi
+  fi
   # Memory: patches/hybrid-kv-groups-v2-cudagraph.patch stops the drafter's 5
   # sliding-window layers from padding the target's attention/GDN layers (78 instead of
   # 105 KB of pool per token), which is what makes 64k reachable here. The V2 runner's

@@ -92,6 +92,15 @@ its attention KV and its recurrent state. One request at a time, greedy, RTX
 | reproducing a 25k-token document | n/a* | 260 | **382** |
 | request slots / context | 8 / 64k | 8 / 64k | 4 / 56k |
 
+`VLLM_DFLASH2_CHAIN=1` adds drafter-free n-gram chains on top
+([#38](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/38), ported from
+@Dmtrii-tesla's fork with permission): while a request keeps reproducing its
+context, whole verify blocks come from history alone and the drafter's forward
+and graph replay are skipped until the first rejected token — +7% on the copy
+cell here (256.9 → 276 tok/s at `DFLASH_TOKENS=7`), flat on prose, greedy
+requests only by default (`patches/dflash2-ngram-chains.patch` explains why
+sampling keeps the drafter). Off by default.
+
 <sub>\* drafting from the context only exists in `SPEC=dflash2`. The two right
 columns are one server session, where run-to-run greedy divergence is ±3-5%;
 reproduce them with `venv/bin/python bench/labd_bench.py <tag> --ctx 20000`.</sub>
@@ -327,23 +336,69 @@ answer, and 400 tokens of fluent Danish inventing a task the prompt never asked 
 sweeps all 128 residues and judges every answer on how much of the document came
 back, and `bench/verbatim.py` self-tests that rule against all three shapes.
 
-### More than one GPU
-
-Everything here is written for one 24 GB card, and that is the only configuration
-measured in this README. It is not the only one that works: `--tensor-parallel-size`
-goes through untouched, via `EXTRA_ARGS`.
+### 256k the stock way: int4 KV (`single-user/alternative.sh`, experimental)
 
 ```bash
-EXTRA_ARGS="--tensor-parallel-size 2" bash single-user/start_qwen.sh
+bash single-user/alternative.sh      # TRITON_ATTN + --kv-cache-dtype int4_per_token_head
 ```
 
-Reported working on **2x RTX 5060 Ti 16 GB** by
-[@antonybudianto](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22) — two cards
-that could not hold this model individually. I have one 3090, so every multi-GPU
-number in the issues is a user report rather than something I have reproduced, and
-the tuning here (the pinned `KV_MEM`, the graph budget, `MAX_SEQS`) is sized for a
-single card and is probably not right for yours. If you run it on two, numbers in
-[#7](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/7) are welcome.
+Where KVarN reaches 268k with its own kernels, vLLM's stock
+`int4_per_token_head` cache now combines with the DFlash2 drafter too:
+**314,915 tokens of pool at 256000 max-model-len** (1.23× concurrency) on one
+24 GB card, no `kvarn/install.sh`. Three boot blockers stood in the way — a
+padded-page view error under the hybrid block-promotion geometry, and a
+causal-only assert plus missing per-seq-causal plumbing in the int4 Triton
+kernel, which the drafter's 8-row draft block needs
+(`patches/int4-kv-per-token-head.patch`, contributed in
+[#42](https://github.com/syv-ai/qwen38-27b-rtx3090/pull/42) by @lachhabw).
+
+The trade: the Triton attention backend plus the per-step int4 unpack cost
+about 20% of decode against the shipped config on short prompts (~86 vs ~104
+tok/s e2e on the same probe), and — unlike KVarN, which has GSM8K and
+100k-needle numbers above — **int4-KV quality at depth is unmeasured here**.
+Tool calling round-trips correctly and the lookup lane works; treat the rest
+as experimental until someone runs the quality harness on it, which is a
+contribution this README will gladly take.
+
+### More than one GPU
+
+Everything here is written for one 24 GB card; multi-GPU goes through untouched
+via `EXTRA_ARGS`:
+
+```bash
+SPEC=dflash2 PREFIX_CACHE=1 EXTRA_ARGS="--tensor-parallel-size 2" bash single-user/start_qwen.sh
+```
+
+What the second card is worth is now measured, not assumed —
+[#40](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/40) ran a controlled
+1-vs-2×3090 A/B on this harness (same box, same install, PCIe 4.0 x8, **no
+NVLink**, 275 W):
+
+- **+16–35% decode across C1–C8** (DFlash2 greedy: 127.4 → 161.6 at C1). Worth
+  it at batch 1: decode is bandwidth-bound here, and TP=2 is a second memory
+  system, not idle compute.
+- **The DFlash2 residency ceiling is a 24 GB property, not a drafter
+  property.** On one card DFlash2 collapses at C8 (3.9 s TTFT — the
+  recurrent-state pool exhaustion documented above) and MTP wins; on two cards
+  DFlash2 wins at every concurrency measured. On 2×24 GB, point everyone at
+  DFlash2.
+- **The launcher no longer pins `KV_MEM` under TP>1** (their finding, this
+  fix): the pin is a single-card constant applied per worker, and it stranded
+  ~16 GiB across two cards — 137,210 tokens of pool where `GPU_UTIL` sizing
+  gets 302,223, at no measured decode cost. Export `KV_MEM` to pin anyway.
+- **Keep `DFLASH_TOKENS=7` at TP>1** for now: the one T=15 datapoint at TP=2
+  (same issue) lost 27% at C1 with the lookup-filled tail accepting nothing,
+  which is under diagnosis. The launcher warns.
+- NVLink appears to buy little:
+  [#7](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/7)'s NVLink box at
+  330 W and #40's PCIe-x8 box at 275 W land within a few percent of each other
+  at C1.
+
+Also reported working: **2× RTX 5060 Ti 16 GB**
+([#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22)) — the "would
+not fit on one card" case. The graph budget and `MAX_SEQS` defaults are still
+single-card calibrations; more A/Bs like #40's are the most useful numbers you
+can send.
 
 ## Benchmarks
 
@@ -366,8 +421,17 @@ code), 1,024-token answers, model-default sampling, thinking off:
 | C1 | 71.00 tok/s | 45.5 | 111.1 | **121.8** |
 | C2 | 90.66 tok/s | 86.3 | 191.8 | **195.5** |
 | C4 | 100.28 tok/s | 168.3 | 268.5 | **278.9** |
-| C8 | 165.33 tok/s | 324.9 | **407.3** | 389.9 |
+| C8 | 165.33 tok/s | 324.9 | **407.3** | 389.9† |
 | C64 (128 in / 512 out) | not supported | **~1,035** | — | — |
+
+† measured before `PREFIX_CACHE=1` became the single-user default. With
+prefix caching on, cached prefixes (and, under `--mamba-cache-mode align`,
+their recurrent-state pages) stay resident through the cohort ladder, so the
+DFlash2 residency ceiling bites earlier and this cell reads ~324 tok/s with a
+2-3 s TTFT on the current stack — independently measured at 321.8 in
+[#40](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/40), which is what
+prompted the re-measurement. C1–C4 read the same or slightly better than the
+table. One card, many concurrent users: `SPEC=mtp` remains the right mode.
 
 Decode rate, C × 1000 / mean TPOT. All four of our columns were re-measured together
 on the current stack with `bench/run_benchmarks.sh`, keeping the second run after each
@@ -419,9 +483,13 @@ other only loosely, and not rows for the table above:
   prompts, output length and rate definition, so deliberately not in the table
   (their own insistence, and correct). Setup gotchas and the full ladder:
   [#35](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/35).
-- **Dual-GPU reports**: dual 3090 in
+- **Dual-GPU reports**: the controlled 1-vs-2×3090 A/B in
+  [#40](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/40) (+16–35%,
+  161.6 C1 greedy at 275 W, PCIe x8 without NVLink; independently reproduced
+  in-thread at 153.6/250 W by a second dual-3090 box), the NVLink dual 3090 in
   [#7](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/7), dual 5060 Ti in
-  [#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22).
+  [#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22). See "More
+  than one GPU" above for what transfers.
 
 ### Why this isn't just `vllm serve`
 

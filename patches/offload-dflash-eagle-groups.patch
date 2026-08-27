@@ -1,0 +1,99 @@
+OffloadingConnector under dflash: stop eagle-flagging every KV group, and
+warn on the chunk-geometry that silently zeroes cross-request reuse (#33).
+
+Two findings from tracing the "KVarN stores 41 GB, loads exactly 0 bytes"
+report (issue #33) on this card, with the connector instrumented:
+
+1. Upstream only ever sets is_eagle_group for DeepSeek V4, and the
+   connector's fallback marks EVERY group as draft attention whenever
+   speculative_config.use_eagle() is true -- which includes method=dflash and
+   mtp. Every group then has its trailing chunk excluded from store while
+   decoding ("EAGLE/MTP draft attention groups [0..8] detected" at boot).
+   For dflash the draft model's KV is exactly its sliding-window layers, so
+   the fallback now flags SW-spec groups only; boot line reads "[8]". Under
+   other eagle-family methods the upstream fallback is unchanged.
+
+2. The actual zero-loads mechanism, reproduced and traced here (KVarN
+   CTX=huge + TieringOffloadingSpec, 4 GiB CPU tier): the CPU pool allocates
+   UNIFORM blocks sized for the largest group's chunk (2,176 tokens ->
+   ~14.6 MiB blocks, 293 of them in 4.28 GiB). Under KVarN the promoted
+   drafter SW group's chunks are 128 tokens -- each one still occupies a
+   full block, so a single 23k-token request consumes ~264 blocks (~184 of
+   them for tiny SW chunks) and EVICTS THE ENTIRE TIER. Store succeeds,
+   complete_store succeeds, and by the time the same document returns, its
+   blocks are gone: every lookup MISS, 0 bytes ever loaded, exactly the
+   report. On bf16 the SW group shares the large block size (the same
+   4096-B/token coincidence hybrid-sw-block-promote.patch documents), so
+   the geometry never explodes and offloading uplifts -- which is why the
+   reporter saw the split along KV dtype.
+
+   The real fix (per-group block sizing, or excluding never-hittable SW
+   groups from both store and lookup) is upstream-shaped; until then the
+   config builder computes the waste factor and WARNS at boot with the
+   arithmetic (group, chunk tokens, blocks-per-chunk ratio, and the
+   cpu_bytes_to_use multiplier that would compensate), so the next person
+   gets the diagnosis in their log instead of a day of silence.
+
+Verified on this card: boot line shows eagle groups [8]; the warning fires
+for group 8 (128 vs 2,176 tokens, 17x) on KVarN + connector and stays
+silent on configs with uniform chunk sizes.
+
+--- generated hunks below ---
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -216,6 +216,18 @@
+             and vllm_config.speculative_config.use_eagle()
+         )
+         if use_eagle and not eagle_groups:
++            # (syv) #33: is_eagle_group is only ever set upstream for DeepSeek
++            # V4, so this fallback marked EVERY group as draft-attention under
++            # method=dflash/mtp -- excluding each group's trailing chunk from
++            # store while decoding for no reason. For dflash the draft model's
++            # KV is exactly its sliding-window layers; flag those groups only.
++            if vllm_config.speculative_config.use_dflash():
++                eagle_groups = {
++                    idx
++                    for idx, g in enumerate(kv_cache_config.kv_cache_groups)
++                    if isinstance(g.kv_cache_spec, SlidingWindowSpec)
++                }
++        if use_eagle and not eagle_groups:
+             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+ 
+         if eagle_groups:
+@@ -226,6 +238,36 @@
+                 sorted(eagle_groups),
+             )
+ 
++        # (syv) #33: the CPU offload pool allocates UNIFORM blocks sized for
++        # the largest group's chunk. A group with far smaller chunks (KVarN's
++        # promoted drafter SW group: 128-token chunks against 2176) burns a
++        # full block per tiny chunk, so a single long request can evict the
++        # entire CPU tier and cross-request reuse never hits. Warn with the
++        # arithmetic so nobody spends a day on silent zero-uplift.
++        _chunk_tokens = [
++            tokens_per_block * spec.blocks_per_chunk
++            for tokens_per_block in spec.tokens_per_block
++        ]
++        _max_chunk = max(_chunk_tokens) if _chunk_tokens else 0
++        for _idx, _tok in enumerate(_chunk_tokens):
++            if _tok * 4 <= _max_chunk:
++                logger.warning(
++                    "KV offloading: group %d has %d-token chunks against a "
++                    "%d-token maximum, and offload blocks are uniformly sized "
++                    "for the maximum. Every %d-token chunk of this group "
++                    "occupies a full block, so one long request can consume "
++                    "the whole CPU tier and evict all previously stored "
++                    "blocks -- cross-request reuse will likely never hit "
++                    "(issue #33). Until blocks are sized per group or this "
++                    "group is excluded, expect ~%dx more cpu_bytes_to_use "
++                    "than the KV bytes suggest.",
++                    _idx,
++                    _tok,
++                    _max_chunk,
++                    _tok,
++                    max(1, _max_chunk // max(1, _tok)),
++                )
++
+         return cls(
+             num_workers=vllm_config.parallel_config.world_size,
+             kv_group_configs=tuple(

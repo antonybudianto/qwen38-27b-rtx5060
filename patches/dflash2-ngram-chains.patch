@@ -1,0 +1,431 @@
+Drafter-free n-gram chains for DFlash2 (VLLM_DFLASH2_CHAIN=1, default off).
+
+While a request keeps reproducing its own context, whole verify blocks are
+proposed from its history alone — context-KV insert + suffix lookup +
+point-mass rewrite, a handful of small eager kernels — and the draft model's
+forward AND its CUDA-graph replay are skipped entirely, until the first
+rejected token ends the chain. The proposal stays lossless: every position's
+draft distribution is a point mass on the proposed token, a legal q for
+vLLM's rejection sampler; positions past the match's continuation hold token
+0 and get rejected, which is exactly the exit signal.
+
+Ported from Dmtrii-tesla/dflash2-ngram-vllm (Apache-2.0), offered for
+cherry-pick in issue #38 by its author, who independently rebuilt this
+repo's lookup lane and added this layer on top. Their three load-bearing
+design calls are preserved:
+
+  - the entry/exit state machine lives in propose(), on the host, once per
+    step -- under FULL cudagraphs any Python inside _generate_draft runs at
+    capture time only (their v1 died exactly there);
+  - the one value crossing GPU->host is a captured D2H memcpy of a
+    per-request flag into pinned memory, replayed by the graph every step,
+    read one step stale -- the same pattern the sticky/adaptive controllers
+    already use;
+  - entry evidence is the lookup's match_len (reaches nmax), not its valid
+    count (clamped to k; keying on it can never fire).
+
+Adaptations to this tree: propose() composes the chain decision ahead of
+the existing wrapper (which carries the dormant dflash3 extension
+machinery) instead of replacing the method, and _chain_generate mirrors
+this tree's current prepare_dflash_inputs signature. Constraints: single
+request in the batch, dp_size == 1, no mm inputs -- one shared decision
+per batch, like the sticky long block. While a chain is active,
+next_num_draft_tokens pins the full verify block so the tail is not
+thrown away.
+
+Envs: VLLM_DFLASH2_CHAIN (off), VLLM_DFLASH2_CHAIN_MINMATCH (8, tokens of
+longest context match required to enter), VLLM_DFLASH2_CHAIN_LOG_SEC (30,
+period of the "chain: N/M steps engaged" line; 0 silences). Requires
+VLLM_DFLASH2_LOOKUP=1; warns and disables itself otherwise. No compiled or
+captured shape depends on any of them (chain steps run eagerly), so they
+stay out of the compile-cache key by construction.
+
+Measured on this card (1x 3090 @ 250 W, CTX=fast, DFLASH_TOKENS=7,
+bench/labd_bench.py --ctx 20000 + run_benchmarks single, chain on vs off):
+
+  copy (25k ctx, greedy)   256.9 -> 274.8 tok/s (+7.0%), reproduced twice
+  six-task labd total      99.9 -> 99.2-101.4 (flat)
+  C1 chat greedy           137.6/137.9 -> 135.3 (within spread)
+  C1 chat T=default        129.7/126.6 -> 117.6 UNGATED (-8%); with the
+                           greedy-only gate chains never engage there and
+                           the cell reads 123.5, inside the sampling band
+  engage rate              ~6% of steps on the mixed suite
+  correctness              bench/verbatim.py all shapes; tool-calling round
+                           trip; scheduler sees a legal q every step
+
+Why the temperature gate: a point-mass q accepts with probability p(token),
+so under sampling the chain's context copy displaces the drafter's
+distribution-aware proposals on exactly the steps it wins under greedy.
+Greedy requests keep the whole win; sampled requests keep the drafter.
+
+Off-state: pool byte-identical (68,605 tokens), bench within run-to-run
+spread of the pre-port baseline.
+
+--- generated hunks below ---
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
++import time
+ from typing import Any
+ 
+ import torch
+@@ -11,7 +12,10 @@
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.triton_utils import tl, tldevice, triton
+ from vllm.v1.worker.gpu.sample.gumbel import tl_rand32, tl_rand64
+-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
++    DFlashSpeculator,
++    prepare_dflash_inputs,
++)
+ 
+ logger = init_logger(__name__)
+ from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
+@@ -277,6 +281,54 @@
+         self._lookup_sticky = int(os.environ.get("VLLM_DFLASH2_LOOKUP_STICKY", "3"))
+         self._sticky = 0
+ 
++        # --- drafter-free chains (VLLM_DFLASH2_CHAIN=1), ported from
++        # Dmtrii-tesla/dflash2-ngram-vllm (#38) -------------------------------
++        # While a request keeps reproducing its own context, whole verify
++        # blocks are proposed from its history alone and the draft model's
++        # forward (and its graph replay) skipped entirely, until the FIRST
++        # rejected token. The state machine lives in propose() (host, once per
++        # step) because under FULL cudagraphs any Python inside _generate_draft
++        # runs at capture time only; the one thing crossing GPU->host is a
++        # captured D2H memcpy of a per-request flag into pinned memory,
++        # replayed by the graph every step exactly like the kernels around it.
++        self._chain = os.environ.get("VLLM_DFLASH2_CHAIN", "0") == "1"
++        if self._chain and not self._lookup:
++            logger.warning("VLLM_DFLASH2_CHAIN=1 needs VLLM_DFLASH2_LOOKUP=1; disabling")
++            self._chain = False
++        if self._chain:
++            # Entry evidence is the previous normal step's longest context
++            # match (match_len, which reaches nmax) -- NOT the lookup's valid
++            # count, which the kernel clamps to k. Keying on valid never fires.
++            self._chain_minmatch = int(
++                os.environ.get("VLLM_DFLASH2_CHAIN_MINMATCH", "8")
++            )
++            self._chain_log_sec = float(
++                os.environ.get("VLLM_DFLASH2_CHAIN_LOG_SEC", "30")
++            )
++            # Point-mass q under sampling accepts with probability p(token):
++            # at temperature the chain blocks displace strictly better drafter
++            # proposals (measured -8% C1 at T=default on chat). Greedy-only by
++            # default; VLLM_DFLASH2_CHAIN_GREEDY_ONLY=0 lifts the gate.
++            self._chain_greedy_only = (
++                os.environ.get("VLLM_DFLASH2_CHAIN_GREEDY_ONLY", "1") == "1"
++            )
++            self._req_temp_np = None
++            self._chain_ev_gpu = torch.zeros(
++                self.max_num_reqs, dtype=torch.int32, device=device
++            )
++            self._chain_ev_cpu = torch.zeros(
++                self.max_num_reqs, dtype=torch.int32, device="cpu"
++            ).pin_memory()
++            self._chain_rej_cpu = torch.zeros(
++                self.max_num_reqs, dtype=torch.int32, device="cpu"
++            ).pin_memory()
++            self._chain_active = False
++            self._chain_prev_chain = False
++            self._chain_steps_total = 0
++            self._chain_steps_engaged = 0
++            self._chain_last_log = time.monotonic()
++            logger.info("DFlash2 chains on (minmatch=%d)", self._chain_minmatch)
++
+         if self._lookup:
+             logger.info(
+                 "DFlash2 lookup-augmented drafting on (k=%d nmin=%d nmax=%d nstrong=%d "
+@@ -299,6 +351,11 @@
+         unanimity across the batch. Below CHEAP_CTX tokens of context an extra verify
+         position is nearly free (+6% per step at 1.5k against +27% at 25k), so there the
+         flag alone is enough."""
++        if self._chain and self._chain_active:
++            # This step proposes purely from context; the scheduler must verify
++            # the whole block or the chain's tail is thrown away.
++            self._last_asked = self.num_speculative_steps
++            return self.num_speculative_steps
+         if not self._adaptive:
+             return None
+         emitted = getattr(self, "last_num_emitted", None)
+@@ -336,6 +393,249 @@
+         self._prev_want = want
+         return self.num_speculative_steps if long_block else self.draft_block
+ 
++    def propose(
++        self,
++        input_batch,
++        attn_metadata,
++        slot_mappings,
++        last_hidden_states,
++        aux_hidden_states,
++        num_sampled,
++        num_rejected,
++        last_sampled,
++        next_prefill_tokens,
++        temperature,
++        seeds,
++        num_tokens_across_dp=None,
++        dummy_run=False,
++        skip_attn_for_dummy_run=False,
++        mm_inputs=None,
++        is_profile=False,
++    ):
++        # Chain eligibility is decided HERE, on the host, once per step --
++        # propose() is never captured, so this state machine survives FULL
++        # cudagraph replays. Single-request only, like the sticky long block:
++        # one shared decision for the whole batch.
++        if (
++            self._chain
++            and not dummy_run
++            and not is_profile
++            and self.dp_size == 1
++            and input_batch.num_reqs == 1
++            and mm_inputs is None
++            and self._req_states is not None
++            and (
++                not self._chain_greedy_only
++                or (
++                    self._req_temp_np is not None
++                    and float(
++                        self._req_temp_np[int(input_batch.idx_mapping_np[0])]
++                    )
++                    == 0.0
++                )
++            )
++        ):
++            self._chain_steps_total += 1
++            prev_missed = bool(self._chain_rej_cpu[0])
++            self._chain_rej_cpu[:1].copy_(
++                num_rejected[:1].to(torch.int32), non_blocking=True
++            )
++            engage = self._chain_should_engage(prev_missed)
++            now = time.monotonic()
++            if (
++                self._chain_log_sec > 0
++                and now - self._chain_last_log >= self._chain_log_sec
++            ):
++                logger.info(
++                    "DFlash2 chain: %d/%d steps engaged (active=%s)",
++                    self._chain_steps_engaged,
++                    self._chain_steps_total,
++                    self._chain_active,
++                )
++                self._chain_last_log = now
++            if engage:
++                self._chain_steps_engaged += 1
++                return self._chain_generate(
++                    input_batch,
++                    last_hidden_states,
++                    aux_hidden_states,
++                    num_sampled,
++                    num_rejected,
++                    last_sampled,
++                    next_prefill_tokens,
++                    temperature,
++                    seeds,
++                )
++        elif self._chain and self._chain_active:
++            # Batch grew / profiling / capture: leave the chain, no
++            # half-states.
++            self._chain_active = False
++            self._chain_prev_chain = False
++        return super().propose(
++            input_batch,
++            attn_metadata,
++            slot_mappings,
++            last_hidden_states,
++            aux_hidden_states,
++            num_sampled,
++            num_rejected,
++            last_sampled,
++            next_prefill_tokens,
++            temperature,
++            seeds,
++            num_tokens_across_dp=num_tokens_across_dp,
++            dummy_run=dummy_run,
++            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
++            mm_inputs=mm_inputs,
++            is_profile=is_profile,
++        )
++
++    def _chain_should_engage(self, prev_missed: bool) -> bool:
++        """Host-side chain state machine. Entry: the last NORMAL step's longest
++        match reached minmatch (read from pinned memory; one step stale like
++        every other host decision here). Exit: any rejected token in the
++        previous verdict. Re-entry waits for one intervening normal step,
++        because after a chain ends the evidence buffer still holds the stale
++        pre-chain match."""
++        if self._chain_active:
++            if prev_missed:
++                # First miss ends the chain; this step goes back to the drafter.
++                self._chain_active = False
++                self._chain_prev_chain = True
++                return False
++            self._chain_prev_chain = True
++            return True
++        # Entry needs fresh evidence, produced by a normal step's (replayed)
++        # lookup: while chaining, nothing refreshes it, so a chain step can
++        # never be the step right before a new entry.
++        entry_ok = (not self._chain_prev_chain) and bool(self._chain_ev_cpu[0])
++        if entry_ok:
++            self._chain_active = True
++            self._chain_prev_chain = True
++            return True
++        self._chain_prev_chain = False
++        return False
++
++    def _chain_generate(
++        self,
++        input_batch,
++        last_hidden_states,
++        aux_hidden_states,
++        num_sampled,
++        num_rejected,
++        last_sampled,
++        next_prefill_tokens,
++        temperature,
++        seeds,
++    ):
++        """A drafter-free decode step: context KV insert + suffix lookup fill
++        the whole verify block, nothing runs the draft model. Runs eagerly
++        (never captured): a handful of small kernels instead of the query
++        forward. Mirrors the input-prep half of DFlashSpeculator.propose()."""
++        num_reqs = input_batch.num_reqs
++        num_target_tokens = input_batch.num_tokens
++        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
++        self.draft_max_seq_len = min(
++            max_seq_len + self.num_query_per_req, self.max_model_len
++        )
++        self.last_num_emitted = (
++            (num_sampled - num_rejected) if num_sampled is not None else None
++        )
++
++        if aux_hidden_states:
++            hidden_states = self.model.combine_hidden_states(
++                torch.cat(aux_hidden_states, dim=-1)
++            )
++        else:
++            hidden_states = last_hidden_states
++        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
++
++        # Same input preparation as the base path: the verify side needs slot
++        # mappings / context positions, and suffix_lookup needs
++        # sample_idx_mapping to find the request's row.
++        assert self.draft_kv_cache_group_id >= 0
++        for i, gid in enumerate(self.draft_kv_cache_group_ids):
++            prepare_dflash_inputs(
++                self.input_buffers,
++                self.block_tables.slot_mappings[gid],
++                self.context_positions,
++                self._context_slot_mappings[i],
++                self.sample_indices,
++                self.sample_pos,
++                self.sample_idx_mapping,
++                self.temperature,
++                self.seeds,
++                input_batch,
++                num_sampled,
++                num_rejected,
++                last_sampled,
++                next_prefill_tokens,
++                temperature,
++                seeds,
++                self.block_tables.input_block_tables[gid],
++                self.block_tables.kernel_block_sizes[gid],
++                self.parallel_drafting_token_id,
++                self.num_query_per_req,
++                self.draft_block,
++                self.max_num_reqs,
++                self.max_num_tokens,
++                self.max_model_len,
++                self.sample_from_anchor,
++            )
++        if self._layer_group_idx is not None:
++            context_slots = [
++                self._context_slot_mappings[gidx][:num_target_tokens]
++                for gidx in self._layer_group_idx
++            ]
++        else:
++            context_slots = self._context_slot_mappings[0][:num_target_tokens]
++        self.model.precompute_and_store_context_kv(
++            self.hidden_states[:num_target_tokens],
++            self.context_positions[:num_target_tokens],
++            context_slots,
++        )
++
++        k = self.num_speculative_steps
++        tokens, _, _ = suffix_lookup(
++            self._req_states.all_token_ids.gpu,
++            self._req_states.total_len.gpu,
++            self.sample_idx_mapping,
++            num_reqs,
++            k,
++            idx_mapping_stride=self.draft_block,
++            nmax=self._lookup_nmax,
++            nmin=self._lookup_nmin,
++            search_max=self._lookup_search,
++            out_tokens=self._lookup_tokens[:num_reqs],
++            out_len=self._lookup_len[:num_reqs],
++            out_valid=self._lookup_valid[:num_reqs],
++        )
++        # Every position is supplied by the lookup, so the draft distribution
++        # is a point mass everywhere (rejection sampling stays exact).
++        # Positions past the match's continuation hold token 0 and get
++        # rejected -- that miss is what ends the chain.
++        self._lookup_use[:num_reqs].fill_(1)
++        self.draft_tokens[:num_reqs].copy_(tokens)
++        draft_logits = self.draft_logits
++        assert draft_logits is not None
++        block_k = triton.next_power_of_2(self.selector_top_k)
++        _point_mass_draft_logits_kernel[(num_reqs * k,)](
++            draft_logits,
++            self._cached_candidate_ids,
++            self.draft_tokens,
++            self.draft_tokens.stride(0),
++            self._lookup_use,
++            self.sample_idx_mapping,
++            self.draft_block,
++            draft_logits.stride(0),
++            draft_logits.stride(1),
++            num_steps=k,
++            top_k=self.selector_top_k,
++            BLOCK_K=block_k,
++            num_warps=1,
++        )
++        return self.draft_tokens[:num_reqs]
++
+     def set_req_states(self, req_states) -> None:
+         """The token history the lookup matches against (set by the model runner)."""
+         self._req_states = req_states
+@@ -343,6 +643,10 @@
+     def set_sampling_states(self, sampling_states) -> None:
+         self._req_top_p = sampling_states.top_p.gpu
+         self._req_top_k = sampling_states.top_k.gpu
++        temp = getattr(sampling_states, "temperature", None)
++        if getattr(self, "_chain", False) and temp is not None:
++            # UVA-backed: .np is the host view of the same memory, no sync.
++            self._req_temp_np = getattr(temp, "np", None)
+ 
+     def _sample_path(
+         self,
+@@ -490,3 +794,16 @@
+             BLOCK_K=block_k,
+             num_warps=1,
+         )
++        if self._chain:
++            # Chain entry evidence: this step's longest context match. Both ops
++            # are captured with the query graph under FULL cudagraphs, so the
++            # D2H copy into pinned memory replays every step and lands without
++            # any host-side sync (the host reads it one step later in
++            # propose()).
++            ev = (self._lookup_len[:num_reqs] >= self._chain_minmatch).to(
++                torch.int32
++            )
++            self._chain_ev_gpu[:num_reqs].copy_(ev)
++            self._chain_ev_cpu[:num_reqs].copy_(
++                self._chain_ev_gpu[:num_reqs], non_blocking=True
++            )

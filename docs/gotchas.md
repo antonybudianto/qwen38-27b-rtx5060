@@ -569,3 +569,33 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     independent Xid-31 trigger. Not shipped here (no sm80 to regression-test
     against); recorded so the next GA100/A100 report starts from the answer
     instead of from five reboots.
+
+
+42. **The OffloadingConnector's CPU tier can be silently useless: uniform
+    blocks meet asymmetric chunk sizes, and one request evicts everything
+    (issue #33).** The tier allocates equal-size blocks sized for the LARGEST
+    group's offload chunk. Under KVarN the drafter's sliding-window group
+    carries 128-token chunks against the 2,176-token maximum, so every SW
+    crumb occupies a full ~14.6 MiB block — a single 23k-token request eats
+    ~264 of a 4 GiB tier's 293 blocks and LRU-evicts every previous
+    document. Stores succeed, `complete_store` succeeds, and every
+    cross-request lookup is a MISS: 41 GB written, 0 bytes ever read back,
+    with nothing in the logs. On bf16 KV the SW group happens to share the
+    large per-token size (gotcha 25's 4096-B coincidence), the geometry
+    stays uniform, and the same connector uplifts at PCIe speed — the KV
+    dtype was never the mechanism, the chunk geometry it induces was. Since
+    `offload-dflash-eagle-groups.patch` the config builder warns at boot
+    with the waste factor and the `cpu_bytes_to_use` multiplier that would
+    compensate (~17x under KVarN). Same patch fixes an adjacent quiet bug:
+    upstream only ever sets `is_eagle_group` for DeepSeek V4, so the
+    connector's fallback marked EVERY group as draft attention under
+    `method=dflash`/`mtp` and silently excluded each group's trailing chunk
+    from store while decoding; with dflash the flag now lands on the
+    drafter's sliding-window group alone. Also: on bare-metal Linux the
+    connector refuses this stack's default allocator
+    (`expandable_segments:True`) at config validation — run it with
+    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` (or the cumem
+    allocator), which the WSL2 branch of the launchers already defaults to.
+    And when eviction probing, keep the resend prompt BYTE-identical: a
+    two-token label difference shifts every block hash and manufactures a
+    convincing, fake "per-request hash instability" (ask how we know).

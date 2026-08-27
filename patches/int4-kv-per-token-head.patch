@@ -1,0 +1,164 @@
+int4 per-token-head KV cache with the DFlash2 drafter: three boot blockers.
+
+`--attention-backend TRITON_ATTN --kv-cache-dtype int4_per_token_head` +
+`SPEC=dflash2` dies at engine start on stock-plus-this-stack. Fixed, it serves
+256k max-model-len on one 24 GB card with a 314,915-token pool (1.23x
+concurrency at 256k) — more than CTX=huge/KVarN's 268k, on stock vLLM
+machinery — at a decode cost from the Triton backend and the per-step int4
+unpack (~86 tok/s e2e on a short-prose probe vs ~104 for the shipped
+FLASH_ATTN bf16 config, same probe). `single-user/alternative.sh` is the
+launcher for this profile.
+
+The three mechanisms, in boot order:
+
+1. v1/worker/gpu/attn_utils.py — the padded-page view. With
+   hybrid-sw-block-promote.patch in place, the drafter's sliding-window layer
+   is promoted and every other layer's page is *padded* up to the promoted
+   maximum, so the raw KV tensor holds more bytes per block than the logical
+   shape needs. The flat `.view(dtype).view(shape)` cannot express that:
+
+     RuntimeError: shape '[380, 848, 8, 136]' is invalid for input of size
+     680570880
+
+   (680,570,880 allocated, 350,597,120 needed — the padding lives at the tail
+   of every block, not the tail of the tensor). Reproduced on this card at
+   engine init with the alternative.sh config. The fix views (num_blocks,
+   raw_per_block), narrows each block to the bytes the logical shape wants,
+   and reshapes. Gated on per-token-head quant modes plus exact divisibility;
+   bf16/int8/fp8 caches take the old single-view path byte-identically.
+
+2. v1/attention/ops/triton_unified_attention.py — the INT4_PER_TOKEN_HEAD
+   branch asserted causal-only attention. The DFlash2 drafter's
+   sliding-window layers run the 8-row draft block as per-seq-causal query
+   attention, so SPEC=dflash2 tripped the assert before the first token.
+   Dropped; use_causal / per_seq_causal_ptr are forwarded instead.
+
+3. v1/attention/ops/int4_per_token_head.py — the packed kernel now takes
+   USE_CAUSAL / USE_PER_SEQ_CAUSAL constexprs and the per-seq pointer,
+   plumbed through _attn_packed and both launchers. Defaults reproduce the
+   old causal-only behavior exactly.
+
+Verified here (RTX 3090, 250 W): unpatched boot reproduces the RuntimeError
+above; patched boot serves — coherent prose, tool-calling round trip with
+well-formed arguments (composes with xgrammar-spec-terminated.patch), lookup
+lane active on verbatim reproduction. Shipped-config inertness: production
+FLASH_ATTN + bf16 boot pool is byte-identical (57,669 tokens) and none of the
+modified branches are reachable under it. Quality at depth (needle, GSM8K)
+has not been measured on int4 KV — treat the profile as experimental.
+
+Provenance: PR #42 by Walid Lachhab (@lachhabw), rebased onto this patch
+stack. Their submission was cut against stock 0.27.1 and therefore re-shipped
+the kv_cache_utils.py block-promotion/grouping functions this repo already
+carries in hybrid-sw-block-promote.patch (dropped here), plus a mamba
+GCD-hash change whose branch is unreachable under the launchers'
+`--mamba-cache-mode align` (dropped; details in the PR thread).
+
+--- generated hunks below ---
+--- a/v1/worker/gpu/attn_utils.py
++++ b/v1/worker/gpu/attn_utils.py
+@@ -259,7 +259,24 @@
+         )
+     else:
+         # No padding — safe to use a contiguous view.
+-        kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
++        needed = prod(permuted_kv_cache_shape)
++        if (
++            kv_cache_spec.kv_quant_mode.is_per_token_head
++            and kv_raw_tensor.numel() > needed
++            and kv_raw_tensor.numel() % permuted_kv_cache_shape[0] == 0
++            and needed % permuted_kv_cache_shape[0] == 0
++        ):
++            nb = permuted_kv_cache_shape[0]
++            raw_per_blk = kv_raw_tensor.numel() // nb
++            want_per_blk = needed // nb
++            kv_cache = (
++                kv_raw_tensor.view(nb, raw_per_blk)
++                .narrow(1, 0, want_per_blk)
++                .reshape(permuted_kv_cache_shape)
++                .view(dtype)
++            )
++        else:
++            kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
+ 
+     return kv_cache.permute(*inv_order)
+ 
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -856,9 +856,6 @@
+     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
+     # sub-byte unpack); everything else goes through the core kernel below.
+     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+-        assert use_causal and not use_per_seq_causal, (
+-            "INT4_PER_TOKEN_HEAD only supports causal attention"
+-        )
+         from vllm.v1.attention.ops.int4_per_token_head import (
+             unified_attention_int4,
+         )
+@@ -891,6 +888,8 @@
+             softmax_segm_output=softmax_segm_output,
+             softmax_segm_max=softmax_segm_max,
+             softmax_segm_expsum=softmax_segm_expsum,
++            use_causal=use_causal,
++            per_seq_causal_ptr=per_seq_causal_ptr,
+         )
+         return
+ 
+--- a/v1/attention/ops/int4_per_token_head.py
++++ b/v1/attention/ops/int4_per_token_head.py
+@@ -385,6 +385,9 @@
+     PACKING_FACTOR: tl.constexpr,
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
++    USE_CAUSAL: tl.constexpr = True,
++    USE_PER_SEQ_CAUSAL: tl.constexpr = False,
++    per_seq_causal_ptr=None,
+ ):
+     # Shared prologue: sequence lookup, q-block bounds, early returns.
+     q_block_global_idx = tl.program_id(0)
+@@ -562,6 +565,9 @@
+             SLIDING_WINDOW,
+             USE_MM_PREFIX,
+             MAX_MM_RANGES,
++            USE_CAUSAL,
++            USE_PER_SEQ_CAUSAL,
++            per_seq_causal_ptr,
+         )
+ 
+         # Score: split-dot across the 2 INT4 streams; fused
+@@ -692,6 +698,8 @@
+     softmax_segm_max,
+     softmax_segm_expsum,
+     packing_factor: int,
++    use_causal: bool = True,
++    per_seq_causal_ptr: torch.Tensor | None = None,
+ ):
+     """Launch ``_attn_packed`` for one of the sub-byte modes.
+ 
+@@ -822,6 +830,9 @@
+         USE_FP8=output_scale is not None,
+         IS_3D=use_3d,
+         PACKING_FACTOR=packing_factor,
++        USE_CAUSAL=use_causal,
++        USE_PER_SEQ_CAUSAL=(per_seq_causal_ptr is not None),
++        per_seq_causal_ptr=per_seq_causal_ptr,
+     )
+ 
+     if use_3d:
+@@ -905,6 +916,8 @@
+     softmax_segm_output: torch.Tensor | None = None,
+     softmax_segm_max: torch.Tensor | None = None,
+     softmax_segm_expsum: torch.Tensor | None = None,
++    use_causal: bool = True,
++    per_seq_causal_ptr: torch.Tensor | None = None,
+ ) -> None:
+     """Paged attention over the INT4 packed cache, writing into *out*.
+ 
+@@ -943,6 +956,8 @@
+         softmax_segm_max=softmax_segm_max,
+         softmax_segm_expsum=softmax_segm_expsum,
+         packing_factor=_INT4_PACKING_FACTOR,
++        use_causal=use_causal,
++        per_seq_causal_ptr=per_seq_causal_ptr,
+     )
+ 
+     out_f = single_rht(out.float(), inverse=True) / head_size
