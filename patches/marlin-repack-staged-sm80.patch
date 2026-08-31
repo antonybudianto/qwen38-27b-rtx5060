@@ -1,15 +1,26 @@
 sm80 Marlin repack: stage the per-layer transients through one grow-only
-buffer, so VMM mapping churn cannot wedge the card (#27, candidate).
+buffer (#27; allocation hygiene — the wedge theory below was DISPROVEN).
 
-The Xid-31 class ahnguyen17 root-caused on a CMP 170HX (GA100): during
-weight loading, every Marlin layer's transform allocates and frees transient
-GPU tensors around gptq_marlin_repack (the .contiguous() copy and the pad),
-interleaved with the model's own weight allocations. On sm80 that VMM
-map/unmap churn corrupts mappings until an unrelated elementwise kernel
-write-faults asynchronously — the faulting frame drifts between runs, the
-card wedges until reboot. Their proof: the same math staged through CPU is
-bit-exact and Xid-free, convicting the allocation pattern, not the
-arithmetic (issue #27; gotcha 41).
+History, kept honest: this patch was written against the theory that VMM
+map/unmap churn during Marlin repack wedged ahnguyen17's CMP 170HX (Xid 31,
+drifting faulting frames, wedge-until-reboot). The real root cause was
+found by ahnguyen17 afterwards and is not vLLM's at all: their CMP unlock
+driver registered the top reserved framebuffer region — which backs
+WPR2/GSP firmware — into the page allocator; it sorts last, so it is handed
+out only near full occupancy, which produced exactly the occupancy
+dependence and frame drift this header once attributed to churn. With the
+unlocker fixed, the stock un-staged repack path boots and serves clean on
+the same card (issue #27, final comments). Do NOT cite this patch as
+evidence of an sm80 Marlin bug; stock-map sm80 (A100s) never had this
+failure mode.
+
+What survives, and why the patch stays: staging is measurably better
+allocation behavior during load. On the 170HX A/B (w8a16 target, full
+serving session, 8 streams): repack window 44.9 s against the CPU
+fallback's 403.7 s, engine ready ~90 s against ~540 s, decode identical to
+three decimals, outputs bit-exact end to end, buffer cost inside noise
+(≤0.15 GiB there). ahnguyen17 promoted it to their production after the
+driver fix on those grounds.
 
 This is the GPU-resident version of that workaround: pad+contiguous land in
 ONE persistent, grow-only staging buffer per device, and the source tensor
@@ -26,14 +37,13 @@ reuse and regrowth): kernel inputs and outputs torch.equal in all cases.
 Costs and gating: the buffer stays resident after load — up to ~1.2 GiB on
 this stack, because the quantized embedding/lm_head whales set its size.
 That is why it defaults ON only for compute capability 8.0 exactly (the
-card class where the alternative is a wedge-until-reboot and which ships
-40-64 GiB), and OFF everywhere else. Override with
-VLLM_MARLIN_REPACK_STAGED=0/1. ahnguyen17's CPU-fallback patch remains the
-zero-VRAM alternative at ~3 min extra boot; this one keeps boot speed and
-should also help A100s if the churn class reproduces there.
+card class that ships 40-64 GiB, where 1.2 GiB is cheap and load time is
+9x), and OFF everywhere else. Override with VLLM_MARLIN_REPACK_STAGED=0/1.
+ahnguyen17's CPU-fallback patch remains the zero-VRAM alternative.
 
-Status: candidate — bit-exact and inert-off-sm80 verified here; whether it
-actually prevents the Xid-31 on sm80 needs the 170HX test (#27).
+Status: validated on the 170HX (4 boot cycles + a full serving session,
+bit-exact, 0 Xid) and in production there — but as load-time hygiene, not
+as the wedge fix this header originally proposed; see the history above.
 
 --- generated hunks below ---
 --- a/model_executor/kernels/linear/mixed_precision/marlin.py

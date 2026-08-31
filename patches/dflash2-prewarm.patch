@@ -1,0 +1,130 @@
+DFlash2: pre-compile every _prepare_dflash_inputs_kernel variant at boot (#48).
+
+The kernel's Triton variant ladder is BLOCK_SIZE = min(256, next_pow2(
+max_target_query_len + num_query_per_req)). Decode steps only ever produce the
+small variants -- the capture-phase dummy runs are decode-shaped -- so the
+FIRST large chunked-prefill CONTINUATION after a fresh boot is the first time
+BLOCK_SIZE=256 exists, and it JIT-compiled mid-request: the jit_monitor
+warning issue #48 captured seconds before every wedge on that WSL2 box, and a
+multi-hundred-ms latency spike everywhere else.
+
+The wrapper now compiles every reachable variant the first time through
+(during the capture dummies, before serving): one grid row per missing
+BLOCK_SIZE against the same buffers as the real launch that follows, which
+then overwrites everything the warm rows wrote. Cost: ~4 extra compiles at
+boot, nothing at serving time. Keyed per (device, query layout), so the
+DFLASH_TOKENS=15 dual-length deployments warm both layouts as each appears.
+
+Verified on the reference 3090: fresh boot, SPEC=dflash2 CTX=huge, one ~30k
+first request -- _prepare_dflash_inputs_kernel no longer appears in
+jit_monitor at all (it did on every boot before).
+
+Apply with the patches/ set (alphabetical: after the dflash2 trio).
+
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -684,6 +684,9 @@
+                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+ 
+ 
++_PREWARMED: set = set()
++
++
+ def prepare_dflash_inputs(
+     input_buffers: InputBuffers,
+     query_slot_mapping: torch.Tensor,
+@@ -726,38 +729,59 @@
+     max_tokens_per_req = max_target_query_len + num_query_per_req
+     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+-    _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
+-        input_buffers.input_ids,
+-        input_buffers.positions,
+-        input_buffers.query_start_loc,
+-        input_buffers.seq_lens,
+-        query_slot_mapping,
+-        context_positions,
+-        context_slot_mapping,
+-        sample_indices,
+-        sample_pos,
+-        sample_idx_mapping,
+-        temperature,
+-        seeds,
+-        input_batch.positions,
+-        input_batch.query_start_loc,
+-        input_batch.idx_mapping,
+-        last_sampled,
+-        next_prefill_tokens,
+-        num_sampled,
+-        num_rejected,
+-        input_temperature,
+-        input_seeds,
+-        block_table,
+-        block_table.stride(0),
+-        parallel_drafting_token_id,
+-        block_size,
+-        num_query_per_req,
+-        num_speculative_steps,
+-        max_num_reqs,
+-        max_num_tokens,
+-        max_model_len,
+-        SAMPLE_FROM_ANCHOR=sample_from_anchor,
+-        PAD_SLOT_ID=PAD_SLOT_ID,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-    )
++    # (#48) Compile every BLOCK_SIZE variant this deployment can reach, the
++    # first time through (the capture-phase dummy run lands here well before
++    # serving). Decode steps only ever produce the small variants; the first
++    # large chunked-prefill CONTINUATION after boot is what needs BLOCK_SIZE
++    # 256, and without this it JIT-compiles mid-request -- the jit_monitor
++    # warning issue #48 captured seconds before every WSL2 wedge. One grid
++    # row per variant, same buffers as the real launch below (the real launch
++    # then overwrites everything), so the only cost is ~4 compiles at boot.
++    _warm_key = (input_buffers.input_ids.device, num_query_per_req,
++                 sample_from_anchor)
++    if _warm_key not in _PREWARMED:
++        _PREWARMED.add(_warm_key)
++        _bs = min(256, triton.next_power_of_2(max(1, 1 + num_query_per_req)))
++        _warm_sizes = []
++        while _bs <= 256:
++            if _bs != BLOCK_SIZE:
++                _warm_sizes.append(_bs)
++            _bs *= 2
++    else:
++        _warm_sizes = []
++    for _grid1, _bs in [(1, w) for w in _warm_sizes] + [(num_blocks, BLOCK_SIZE)]:
++        _prepare_dflash_inputs_kernel[(num_reqs, _grid1)](
++            input_buffers.input_ids,
++            input_buffers.positions,
++            input_buffers.query_start_loc,
++            input_buffers.seq_lens,
++            query_slot_mapping,
++            context_positions,
++            context_slot_mapping,
++            sample_indices,
++            sample_pos,
++            sample_idx_mapping,
++            temperature,
++            seeds,
++            input_batch.positions,
++            input_batch.query_start_loc,
++            input_batch.idx_mapping,
++            last_sampled,
++            next_prefill_tokens,
++            num_sampled,
++            num_rejected,
++            input_temperature,
++            input_seeds,
++            block_table,
++            block_table.stride(0),
++            parallel_drafting_token_id,
++            block_size,
++            num_query_per_req,
++            num_speculative_steps,
++            max_num_reqs,
++            max_num_tokens,
++            max_model_len,
++            SAMPLE_FROM_ANCHOR=sample_from_anchor,
++            PAD_SLOT_ID=PAD_SLOT_ID,
++            BLOCK_SIZE=_bs,
++        )

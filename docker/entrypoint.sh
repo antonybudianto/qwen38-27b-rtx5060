@@ -6,13 +6,19 @@
 #   bench    bench/run_benchmarks.sh    (client only: benchmarks $HOST:$PORT, no GPU work)
 #   verify   verify.sh [args]
 #   <anything else> is exec'd as a command (e.g. bash)
-# Before serving, verify.sh --no-server runs and aborts on FAIL (model not
-# requantized, patches missing, ...); VERIFY=0 skips that.
+# Before serving, docker/prepare.sh runs (idempotent: a state check and
+# seconds when the model is already prepared, the download + requantization
+# otherwise; PREPARE=0 skips it — this is what makes a bare `docker run` with
+# an empty models volume work), then verify.sh --no-server, which aborts on
+# FAIL (patches missing, ...); VERIFY=0 skips that.
 set -e
 cd /app
 cmd=${1:-single}; shift || true
 case "$cmd" in
   single|batch)
+    if [ "${PREPARE:-1}" != "0" ]; then
+      bash docker/prepare.sh
+    fi
     if [ "${VERIFY:-1}" != "0" ]; then
       bash verify.sh --no-server || { echo "entrypoint: verify.sh FAILED — fix the above or set VERIFY=0"; exit 1; }
     fi

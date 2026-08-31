@@ -3,23 +3,32 @@
 ![Stock vLLM against this repo, same card, same prompts](docs/media/demo.gif)
 
 Serving setup for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on a
-single 24 GB consumer GPU with vLLM. 150k token context, OpenAI-compatible
-API with key auth, and two ready-made configs depending on what you're doing:
+single 24 GB consumer GPU with vLLM — 150k token context and an OpenAI-compatible
+API with key auth, in two ready-made modes.
 
-| | [batch/](batch/) | [single-user/](single-user/) |
+## Quick start
+
+The image is prebuilt and pushed to
+[ghcr.io](https://github.com/syv-ai/qwen38-27b-rtx3090/pkgs/container/qwen38-27b-rtx3090)
+on every commit — the build applies all `patches/` and runs `verify.sh` as its
+gate, so `latest` is always the current stack. The first start pulls it (9.5 GB),
+downloads and requantizes the model (~20 GB, once, into `./models`), and serves
+on port 18020. Pick a mode — one GPU serves one at a time:
+
+```bash
+git clone https://github.com/syv-ai/qwen38-27b-rtx3090 && cd qwen38-27b-rtx3090
+
+docker compose --profile single up -d    # one or a few people chatting
+docker compose --profile batch  up -d    # API backend, many concurrent requests
+```
+
+| | `--profile batch` → [batch/](batch/) | `--profile single` → [single-user/](single-user/) |
 |---|---|---|
 | for | API backends, pipelines, many concurrent requests | one or a few people chatting |
 | aggregate, 64 concurrent (128 in / 512 out) | **~1,035 tok/s** steady-state decode, 948 end-to-end (~1,222 / 1,042 with all layers int8) | n/a (8 slots) |
 | single-stream (C1) decode rate, realistic prompts | 46 tok/s | MTP: **121** tok/s at default sampling, **120** greedy (`CTX=fast`, 64k; 96 / 102 with `CTX=long`, 150k). DFlash2 (`SPEC=dflash2`): **127** default, **130** greedy |
 | reproducing its own context (quoting a document, applying an edit) | 46 tok/s | **381 tok/s** at 25k context — 15.0 tokens per verify step, drafted straight from the prompt (`SPEC=dflash2` + `DFLASH_TOKENS=15`) |
 | trick | 16-bit recurrent state + int8 tensor-core GEMMs | MTP speculation with 4 cheap drafts, a draft vocabulary that covers what the model says, calibrated int4 lm_head/drafter, split-KV verify attention; optionally DFlash2 (7 drafts in one pass, int4-requantized, vLLM PR #52816 backported) with a verify block the context fills |
-
-<sub>Single-stream numbers re-measured 2026-08-22 on current main with
-`bash bench/run_benchmarks.sh single` — `vllm bench serve`, the 8 prompts in
-`bench/prompts_real.jsonl`, 1024 output tokens, C1, decode rate taken as
-`C / mean TPOT`. Quote them against that harness: a client with a different output
-length is not measuring the same thing, and mixing the two is how
-[#3](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/3) got confusing.</sub>
 
 Both modes share one install — the mode is just which launch script you run.
 Speculation wins below ~8 concurrent users on short prompts, plain batching above;
@@ -35,16 +44,6 @@ mode (~1,210 single-user), ~1,000 tok/s at 100k, so a 100k prompt costs ~100 s
 of TTFT ([full matrix](batch/README.md#prefill)). How each number was won:
 [docs/optimizations.md](docs/optimizations.md).
 
-## Quick start
-
-Docker (recommended — image build, model download and requantization, then
-the server; the API is OpenAI-compatible on port 18020):
-
-```bash
-git clone https://github.com/syv-ai/qwen38-27b-rtx3090 && cd qwen38-27b-rtx3090
-docker compose --profile single up -d      # one or a few users; or --profile batch
-```
-
 The server listens on `0.0.0.0` and is unauthenticated unless you give it a key.
 For anything past your own machine, add one first — everything reads it from
 `.env` or `api_key.txt`, and nothing needs it otherwise:
@@ -53,9 +52,22 @@ For anything past your own machine, add one first — everything reads it from
 echo "VLLM_API_KEY=$(openssl rand -hex 24)" > .env
 ```
 
+No compose, no clone — plain Docker runs the same image with one command and
+prepares the model itself on the first boot (into a named volume, so it
+survives container replacement):
+
+```bash
+docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
+  -v qwen-models:/app/models -v qwen-cache:/cache \
+  --restart unless-stopped ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
+```
+
+`batch` after the image name is the other mode, and the knobs compose reads
+from `.env` become `-e` flags (`-e VLLM_API_KEY=...`, `-e SPEC=dflash2`, ...) —
+[docs/docker.md](docs/docker.md#plain-docker-no-compose) has the mapping.
+
 Or by hand in a venv (same steps: model download, requantization, vLLM
-patches, `verify.sh`) — see [Setup](#setup). Then pick a mode:
-[batch/](batch/) for throughput, [single-user/](single-user/) for latency.
+patches, `verify.sh`) — see [Setup](#setup).
 
 ### If you are the only user, do this
 
@@ -171,6 +183,15 @@ which is the property that was missing before `PIECEWISE` — see below.</sub>
 One caveat to the "all of it is lossless" paragraph above: the speculation here
 is still exact, but this mode inherits KVarN's 4/2-bit KV cache, which is lossy —
 the same trade `CTX=huge` already makes (deep-needle retrieval passes at 200k).
+
+The WSL2 column's ~20% deficit is a WSL2 tax, not a Windows tax, and leaving
+WSL for native Windows does not recover it: the same contributor ran
+`aivrar/vllm-windows-build` (0.27.1, 18 of 19 patches apply after a CRLF→LF
+pass) on the same box and measured native Windows *slower* than WSL2 — 66.0
+vs 76.2 tok/s across the task mix, a 4.4× longer warm boot, and the same
+WDDM paging behavior underneath ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25)).
+The bare-metal column is reachable from a Windows box only by putting Linux
+on the metal.
 
 **On WSL2, every `SPEC=dflash2` profile needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1`** —
 not just `CTX=huge`. The drafter's architecture forces vLLM's V2 model runner
@@ -336,6 +357,81 @@ answer, and 400 tokens of fluent Danish inventing a task the prompt never asked 
 sweeps all 128 residues and judges every answer on how much of the document came
 back, and `bench/verbatim.py` self-tests that rule against all three shapes.
 
+### Third-party checkpoints (uncensored builds and others)
+
+`MODEL=` points the launchers at any Qwen3.8-27B checkpoint in the same
+`compressed-tensors` shape. Two routes, easiest first.
+
+**Ready-made:**
+[leminkozey/Qwen3.8-27B-Uncensored-W4A16-AutoRound](https://huggingface.co/leminkozey/Qwen3.8-27B-Uncensored-W4A16-AutoRound)
+([#45](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/45)) is an
+abliterated Qwen3.8-27B already quantized with this repo's own recipe —
+AutoRound W4A16 body plus the `prepare/` head requant — so it serves without
+any preparation. Its author measured ~100 tok/s warm at `SPEC=dflash2
+CTX=huge` on a 3090 with coherent output and a 45k-context needle retrieved,
+and a second tester confirmed `SPEC=mtp` works. Community-built and
+community-verified; not benchmarked on this repo's reference box.
+
+**Any other export**, including single-shard and asymmetric-AWQ ones the base
+model's three `quant_*.py` scripts cannot open, goes through the streaming
+requant (contributed in
+[#37](https://github.com/syv-ai/qwen38-27b-rtx3090/pull/37)). The worked
+example is
+[philbert440/Qwen3.8-27B-Uncensored-Aggressive-W4A16-AWQ](https://huggingface.co/philbert440/Qwen3.8-27B-Uncensored-Aggressive-W4A16-AWQ)
+— an abliterated (de-refused) Qwen3.8-27B, W4A16 AWQ, with the vision tower and
+the grafted MTP head both preserved. Prepare it once, then serve it:
+
+```bash
+venv/bin/python prepare/fetch_thirdparty.py          # ~18.6 GB; or: fetch_thirdparty.py <hf-repo>
+venv/bin/python prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
+venv/bin/python prepare/build_draft_vocab.py  models/Qwen3.8-27B-Uncensored-W4A16 \
+  --ids prepare/draft_vocab_ids.json
+
+MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 SPEC=mtp CTX=long PREFIX_CACHE=1 \
+  MAX_LEN=100000 bash single-user/start_qwen.sh
+```
+
+It needs `prepare/quant_heads_stream.py` rather than the three `quant_*.py` steps
+the base model uses, for two reasons that are properties of the checkpoint and not
+of the model: it ships as **one 18.6 GB shard**, which the three scripts read into
+RAM whole before rewriting, and its body is **asymmetric AWQ**, which those scripts
+would copy onto the symmetric tensors they write — vLLM then looks for a
+`weight_zero_point` that was never written. The streaming script handles both and
+produces the same tensors otherwise; `bash verify.sh --no-server` with `MODEL=` set
+checks the result exactly as it checks the base model.
+
+**`SPEC=dflash2` needs its pool resized for this checkpoint.** After requantization
+it is 15.68 GiB of weights against the fast variant's 14.71, and the DFlash2 branch
+pins the KV pool *in bytes* (`KV_MEM`) rather than sizing it from
+`--gpu-memory-utilization`, so the pool does not give that gigabyte back. The server
+loads, captures graphs, and then dies on the split-KV verify buffer:
+
+```
+Model loading took 15.71 GiB
+reserved 5.2 GiB memory for KV Cache as specified by kv_cache_memory_bytes config
+torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 926.44 MiB is free
+```
+
+Hand that gigabyte back and it comes up. `CTX=long` (int8 KV) is the one to spend it
+on, because it buys roughly twice the context per byte of pool that `CTX=fast` does:
+
+```bash
+MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 SPEC=dflash2 CTX=long PREFIX_CACHE=1 \
+  KV_MEM=4456028569 DFLASH_MAX_LEN=98304 bash single-user/start_qwen.sh
+```
+
+Measured here, RTX 3090 at 250 W: a 4.15 GiB pool holding **103,033 tokens** at
+98,304 `max-model-len` (4.6% margin) and **85.7 tok/s** greedy on a 400-token
+answer. The checkpoint keeps its vision tower, and that run had `VISION=1` — images
+came back described correctly — so the numbers are an upper bound on what the
+default `VISION=0` needs, which drops the tower's weights entirely.
+
+`SPEC=mtp` needs no `KV_MEM` of its own: its pool is profiled from `GPU_UTIL` rather
+than pinned, so it absorbs the extra gigabyte by shrinking the pool for you. It is the
+mode to reach for first on this checkpoint. The pool it lands on will not hold
+`CTX=long`'s stock 150k, though, which is what the `MAX_LEN=100000` above is — the
+figure this checkpoint has been run at.
+
 ### 256k the stock way: int4 KV (`single-user/alternative.sh`, experimental)
 
 ```bash
@@ -483,6 +579,10 @@ other only loosely, and not rows for the table above:
   prompts, output length and rate definition, so deliberately not in the table
   (their own insistence, and correct). Setup gotchas and the full ladder:
   [#35](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/35).
+- **RTX 4090, Windows 11 / WSL2 (Docker path)**: reproduces with zero repo
+  changes; CTX ladder incl. huge's pool byte-identical to the 3090 reference
+  (268,169), concurrency ladder to N=8, and a measured both-ways case for
+  leaving the `KV_MEM` pin alone — [docs/wsl2-4090.md](docs/wsl2-4090.md).
 - **Dual-GPU reports**: the controlled 1-vs-2×3090 A/B in
   [#40](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/40) (+16–35%,
   161.6 C1 greedy at 275 W, PCIe x8 without NVLink; independently reproduced
@@ -550,9 +650,20 @@ memory system's ramp on 16-92 MB reads, not the kernel).
 
 ## Setup
 
+The default install is the container ([Quick start](#quick-start) — the
+prebuilt image already contains everything this section builds), so this
+manual venv path is for hacking on the stack, or running it bare-metal.
+
+> **Python 3.14 works natively** — nothing in this repo needs changing, but
+> `python3.14-dev` does need installing. See [docs/python-314.md](docs/python-314.md),
+> with a full RTX 3090 reproduction of the tables below in
+> [docs/reproductions/native-3090.md](docs/reproductions/native-3090.md).
+
 You need: a 24 GB Ampere or newer NVIDIA card, a recent driver, Python 3.12,
-~40 GB disk. Everything below is CPU-safe to run while the GPU does other
-things. (Or skip the venv and use the container: [docs/docker.md](docs/docker.md).)
+~40 GB disk — and if the host has less than ~16 GB of free RAM, load the
+weights with the streamer instead of the stock loader (gotcha 45: the stock
+loader peaks at whatever RAM exists; the streamer is bounded and faster). Everything below is CPU-safe to run while the GPU does other
+things; the container details live in [docs/docker.md](docs/docker.md).
 
 ```bash
 git clone https://github.com/syv-ai/qwen38-27b-rtx3090 ~/qwen-serving
@@ -586,6 +697,11 @@ venv/bin/python prepare/build_draft_vocab.py models/Qwen3.8-27B-W4A16-AutoRound 
 venv/bin/python prepare/fetch_fast_variant.py
 # optional: the W4A16 DFlash2 block drafter (1.2 GB) for SPEC=dflash2 single-user mode
 venv/bin/python prepare/fetch_dflash2.py
+# optional: a third-party checkpoint instead of the base model (e.g. the uncensored
+# build, ~18.6 GB, its own requant step; MODEL= serves it -- see "Third-party
+# checkpoints" above)
+venv/bin/python prepare/fetch_thirdparty.py
+venv/bin/python prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
 
 # patch vllm (all written against 0.27.1; reapply after upgrades)
 for p in patches/*.patch; do

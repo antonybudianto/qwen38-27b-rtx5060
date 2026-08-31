@@ -24,6 +24,30 @@ score instead of the full 248k vocabulary; `draft_vocab_ids.json` is the shipped
 list, and `--corpus` counts your own instead. It needs
 [patches/qwen3_5-mtp-draft-vocab.patch](../patches/qwen3_5-mtp-draft-vocab.patch).
 
+## A different checkpoint
+
+`quant_heads_stream.py` does the work of `quant_lm_head.py` + `quant_embed.py` +
+`quant_mtp.py` in one pass, for checkpoints those three cannot open: **single-shard**
+ones (they read a shard into RAM whole; the uncensored build ships one 18.6 GB
+`model.safetensors`) and **asymmetric AWQ** bodies (they clone `config_groups.group_0`
+onto the symmetric tensors they write, so vLLM then looks for a `weight_zero_point`
+that does not exist). Same math, same output tensors, peak RSS well under the shard
+size (9.7 GB measured on the 18.6 GB example here -- still not a low-RAM tool).
+
+```bash
+$V prepare/fetch_thirdparty.py                          # ~18.6 GB (or: fetch_thirdparty.py <hf-repo>)
+$V prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
+$V prepare/build_draft_vocab.py  models/Qwen3.8-27B-Uncensored-W4A16 \
+  --ids prepare/draft_vocab_ids.json
+```
+
+Then `MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 bash single-user/start_qwen.sh`.
+`SPEC=dflash2` additionally needs its pinned pool resized, because this checkpoint is
+~1 GB heavier than the one those constants were measured on — the command and the
+numbers are in the main README, "A different checkpoint: the uncensored build".
+`--mtp-bits 4` and `--keep-fc` exist for experimenting with the draft module; the
+defaults (int8, `mtp.fc` quantized) are what was verified.
+
 The two `fetch_*` scripts only download: the fast variant is the int4-GPTQ lm_head and
 drafter plus a draft vocabulary counted over the model's own outputs (worth ~15% in
 single-user mode), and `fetch_dflash2.py` is the W4A16 DFlash2 block drafter. Both are

@@ -9,3 +9,8 @@ venv/
 drafter/data/
 drafter/runs/
 .env
+# local reproduction artifacts (symlinks here, so no trailing slash)
+venv
+models
+api_key.txt
+bench/results/

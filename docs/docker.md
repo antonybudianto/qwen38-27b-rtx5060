@@ -19,7 +19,15 @@ docker compose --profile single up -d               # or --profile batch
 docker compose logs -f single
 ```
 
-The first `up` builds the image (9.5 GB), then the `prepare` service downloads
+**The image is prebuilt**: every push to `main` builds and pushes
+`ghcr.io/syv-ai/qwen38-27b-rtx3090:latest` (plus an immutable `sha-<7>` tag
+per commit) from CI, with the Dockerfile's own patch application and
+`verify.sh --install` as the gate — a patch that stops applying fails the
+build and nothing is pushed. The first `up` pulls it (~9.5 GB,
+`pull_policy: missing`); to pin a known
+build, set `image: ghcr.io/syv-ai/qwen38-27b-rtx3090:sha-<7>` in a compose
+override. Building locally instead still works — `docker compose build` (or
+`up --build`) produces the identical image (~20 minutes) — and the `prepare` service downloads
 the model into `./models` and runs the same requantization scripts as above
 (CPU only, idempotent, ~20 GB + a few minutes; `FAST_VARIANT=0` in `.env`
 skips the ~1 GB fast-variant download), then the server starts. The first
@@ -41,28 +49,10 @@ difference is gotcha 16 below.
   so a venv install and the container can share one download) are read by
   compose itself.
 - `docker compose run --rm single verify` runs `verify.sh` inside the container
-  (GPU, patches, model). The entrypoint runs `verify.sh --no-server` before every
-  start and refuses to serve on a FAIL (`VERIFY=0` skips that).
-- `docker compose --profile bench run --rm bench` runs `bench/run_benchmarks.sh`
-  in a client-only container against the server that is already up, printing the
-  same ROW lines as the venv install:
-
-  ```bash
-  docker compose --profile batch up -d
-  docker compose --profile bench run --rm bench                    # the batch tables
-  docker compose --profile bench run --rm bench single --prefill   # mode + flags
-  ```
-
-  Arguments after the service name go straight to the script, since the service
-  overrides the entrypoint with the script itself; `BENCH_ARGS` in `.env` sets the
-  default (`batch`). `BENCH_TARGET` picks the service to drive (default `single`;
-  use `host.docker.internal` for a server running on the host rather than in
-  compose), and `PORT` is the one the server already reads from `.env`. `./bench`
-  is bind-mounted, so raw vllm logs land in `./bench/results` on the host and
-  editing the script needs no image rebuild. `BENCH_WAIT` (default 1800s) is how
-  long the client polls `/health` before giving up, which covers a first server
-  start's compile. Run it twice and keep the second numbers, exactly as on the
-  venv install.
+  (GPU, patches, model). The entrypoint runs the idempotent `prepare` and then
+  `verify.sh --no-server` before every start — so a missing or half-prepared
+  model heals itself, and a real FAIL refuses to serve (`PREPARE=0` / `VERIFY=0`
+  skip the two steps).
 - Files that `prepare` writes to `./models` are root-owned: the container runs
   as root, like vLLM's own image.
 - The image carries an nvcc (CUDA "base" + `cuda-nvcc`, not the 8 GB "devel"
@@ -71,6 +61,32 @@ difference is gotcha 16 below.
 - On WSL2 the batch default may fail vLLM's free-memory gate; put
   `GPU_UTIL=0.93` in `.env` (see the WSL2 notes below, an independent
   containerized reproduction that predates this compose file).
+
+### Plain docker (no compose)
+
+Compose is convenience, not a requirement — profiles, `.env` passing and the
+separate `prepare` service, nothing the image needs. The same server, one
+command, no checkout:
+
+```bash
+docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
+  -v qwen-models:/app/models -v qwen-cache:/cache \
+  --restart unless-stopped ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
+```
+
+- The entrypoint runs the same idempotent `prepare` before serving, so the
+  empty `qwen-models` volume fills itself on the first boot (~20 GB download +
+  requantization) and later boots pay a state check measured in seconds.
+- `batch` after the image name is the throughput mode (still one GPU, one mode
+  at a time — `docker rm -f qwen` first).
+- Knobs that compose forwards from `.env` become `-e` flags:
+  `-e VLLM_API_KEY=...`, `-e SPEC=dflash2 -e PREFIX_CACHE=1`,
+  `-e GPU_UTIL=0.93` on WSL2, `-e EXTRA_ARGS=...`.
+- To share one model download with a venv install or a compose checkout,
+  bind-mount that directory instead of the named volume:
+  `-v /path/to/models:/app/models`.
+- `docker logs -f qwen` follows the boot; port and health endpoint are the
+  same as compose (`curl localhost:18020/health`).
 
 ### WSL2 notes
 

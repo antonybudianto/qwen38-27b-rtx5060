@@ -1420,7 +1420,19 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # measures only real graph-pool memory. Keyed per (device, shape combo).
         dec_key = ("decode", device, cfg.head_dim, cfg.group, cfg.key_bits,
                    cfg.value_bits, self.num_heads, self.num_kv_heads,
-                   int(getattr(self, "sliding_window", 0) or 0))
+                   int(getattr(self, "sliding_window", 0) or 0),
+                   # (#48) both are compile-relevant: the lookup size is a
+                   # constexpr and the block-table width sets a stride
+                   # specialization bucket. HONEST STATUS: the lookup table is
+                   # sized 1024 at profile time and resized to the real cache
+                   # block count by the first serving build, so the re-keyed
+                   # warmup still compiles the real packed-kv variant INSIDE
+                   # request 1 (one flagged compile, ~200 ms; the fused
+                   # kernels real variants come from graph capture and are
+                   # unaffected). Deriving the size from the pinned
+                   # kv_cache_memory config at profile time would close it;
+                   # follow-up, not done here.
+                   int(self._block_lookup_size), int(self._max_model_len))
         if dec_key not in cls._kernel_warmed:
             self._warm_decode_kernels(device)
             cls._kernel_warmed.add(dec_key)
@@ -1551,8 +1563,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         pool_k = torch.zeros(1, G, Hk, D, dtype=torch.float16, device=device)
         pool_v = torch.zeros_like(pool_k)
         b2s = torch.full((B * n_blocks,), -1, dtype=torch.int32, device=device)
-        bt = torch.arange(B * n_blocks, dtype=torch.int32,
-                          device=device).view(B, n_blocks)
+        # (#48) real serving calls pass the full-width block table, so its
+        # row stride is cdiv(max_model_len, group) -- 1920 at CTX=huge -- and
+        # that lands in a different Triton stride-specialization bucket than a
+        # tiny synthetic width. Allocate the warmup table at the real width
+        # (a few tens of KB) and keep the valid ids in the first columns.
+        bt_width = max(n_blocks, (self._max_model_len + G - 1) // G)
+        bt = torch.zeros(B, bt_width, dtype=torch.int32, device=device)
+        bt[:, :n_blocks] = torch.arange(
+            B * n_blocks, dtype=torch.int32, device=device).view(B, n_blocks)
         sl = torch.full((B,), n_blocks * G, dtype=torch.int32, device=device)
         q = torch.zeros(B, Hq, D, dtype=torch.float16, device=device)
         out = torch.zeros_like(q)
@@ -1567,7 +1586,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             D=D, GROUP=G,
             Q_PER_KV=qpk, Q_PER_KV_PAD=qpk_pad, SLIDING_WINDOW=sw,
             K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
-            NUM_BLOCKS_LOOKUP=B * n_blocks,
+            # (#48) the constexpr must be the SERVING value or every kernel
+            # here compiles a warmup-only variant and the real one still JITs
+            # mid-request. The kernels only use it as an upper bound on block
+            # ids, so the tiny synthetic tensors stay safe.
+            NUM_BLOCKS_LOOKUP=int(self._block_lookup_size),
             K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
@@ -1674,7 +1697,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             kp.stride(0), kp.stride(1),
             MAX_BLOCKS_PER_REQ=n_blocks, D=D, GROUP=G,
             K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
-            NUM_BLOCKS_LOOKUP=B * n_blocks,
+            NUM_BLOCKS_LOOKUP=int(self._block_lookup_size),  # (#48) serving value
             K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,

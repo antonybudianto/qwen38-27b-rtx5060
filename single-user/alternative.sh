@@ -34,6 +34,16 @@ fi
 
 MODEL=${MODEL:-models/Qwen3.8-27B-W4A16-AutoRound}
 DRAFT=${DRAFT:-models/Qwen3.8-27B-DFlash2-W4A16}
+# SPEC=dflash2 (default) or SPEC=off. This script used to hardcode the drafter
+# and silently ignore SPEC -- PR #46's campaign ran an "A/B" against SPEC=off
+# that was really two spec-on arms (the tell: 2.29 emitted tokens per step on
+# an arm that must read 1.00). Unrecognized values refuse for the same reason.
+SPEC=${SPEC:-dflash2}
+case "$SPEC" in
+  dflash2) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":${DFLASH_TOKENS:-7}}") ;;
+  off|none) SPEC_ARGS=() ;;
+  *) echo "SPEC=$SPEC is not a mode here: dflash2 (default) or off." >&2; exit 1 ;;
+esac
 PORT=${PORT:-18020}
 GPU_UTIL=${GPU_UTIL:-0.95}   # 0.93 on WSL2 or with a desktop compositor on the card
 MAX_LEN=${MAX_LEN:-256000}   # 256000 needs the full 0.95; drop MAX_LEN before GPU_UTIL
@@ -68,9 +78,10 @@ exec vllm serve "$MODEL" \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
   --max-num-batched-tokens 2048 \
-  --speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS}" \
+  "${SPEC_ARGS[@]}" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --default-chat-template-kwargs "{\"enable_thinking\": $ENABLE_THINKING}" \
   ${PREFIX_ARGS} \

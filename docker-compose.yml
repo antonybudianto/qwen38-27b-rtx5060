@@ -23,8 +23,14 @@
 # One GPU: run either "single" or "batch", not both.
 
 x-qwen: &qwen
-  image: qwen38-27b-3090:latest
+  # Prebuilt on every main push by .github/workflows/docker-image.yml; the
+  # first `up` pulls it (~9.5 GB, pull_policy below) instead of the 20-minute
+  # local build. `docker compose build` (or `up --build`) still builds the
+  # identical image under the same tag name. Immutable per-commit tags:
+  # ghcr.io/syv-ai/qwen38-27b-rtx3090:sha-<7>.
+  image: ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
   build: .
+  pull_policy: missing
   ipc: host
   env_file:
     - path: .env

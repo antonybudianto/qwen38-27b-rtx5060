@@ -599,3 +599,97 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     And when eviction probing, keep the resend prompt BYTE-identical: a
     two-token label difference shifts every block hash and manufactures a
     convincing, fake "per-request hash instability" (ask how we know).
+
+43. **"Every request re-prefills" is measurable, and the cause is usually the
+    client's bytes, not the cache.** Reported against an agent client in
+    [#47](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/47) (44 s mean
+    TTFT at ~44k context, i.e. a full recompute per turn, while plain chat
+    clients on the same server sat at the documented decode rates). Work the
+    list in order:
+
+    1. **Measure, per request.** The launchers pass
+       `--enable-prompt-tokens-details`, so every response's
+       `usage.prompt_tokens_details.cached_tokens` says how much of that
+       prompt hit. (vLLM never emits DeepSeek's `prompt_cache_hit_tokens`
+       field; this is the equivalent.) Server-side,
+       `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` on `/metrics`
+       give the same as counters.
+    2. **Know the floor.** Hits are counted in whole hash units and the
+       recurrent state resumes only at aligned boundaries
+       (`--mamba-cache-mode align`), so the hit length truncates DOWN to a
+       multiple of the unit — a prompt shorter than one unit can never hit,
+       and a shared prefix pays up to one unit of recompute past the match.
+       This is a fixed tax, not the 100%-miss failure mode.
+    3. **Byte-identity is over the RENDERED prompt.** What the cache hashes
+       is the chat-templated token stream: system prompt + tool definitions +
+       every message, in order. One changed byte at position P invalidates
+       everything after P. The classic offenders are dynamic content early in
+       the payload: a timestamp or "current status" block in the system
+       prompt, a heartbeat line spliced into the history, compaction that
+       rewrites old turns, tool lists whose order is not stable. Diff two
+       consecutive requests' FULL bodies (not just system + tools — the
+       messages array too) and find the first differing byte; that byte is
+       where your cache hit ends.
+    4. **Interleaving evicts.** A cached prefix on this hybrid model holds
+       KV blocks plus a recurrent-state page (~16% of the pool per request at
+       k=7), and the pool is small. Two conversations round-robining — an
+       agent's heartbeat pinging between chat turns is exactly that — can
+       each evict the other before its recheck: measured as 0-of-3 warm in a
+       3-context round-robin on 24 GB
+       ([docs/wsl2-4090.md](wsl2-4090.md), retention section). The CPU
+       offload tier turns that back into 3-of-3 (a RAM restore instead of a
+       re-prefill).
+    5. **The isolating experiment.** Bypass every proxy and fire the same
+       long prompt twice at bare vLLM: if TTFT collapses on the second call,
+       the server cache is healthy and the variable is the client payload
+       (or a proxy that mutates it); if it does not, look at the server —
+       and at 2 and 4 above.
+
+44. **`CTX=long`'s fp8 KV cache has exactly one attention backend on sm86, and
+    it is the one cell of the matrix this repo cannot A/B.** `FLASH_ATTN`
+    refuses fp8 KV at startup ("requires FA3 on SM90 or FA4 on SM100" —
+    [#34](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/34)) and
+    `TRITON_ATTN` refuses it too ("native FP8 (fp8e4nv) requires SM89+",
+    measured on the reference 3090), so the tier always auto-selects
+    FlashInfer. #34 tracks a deterministic Xid-31 MMU write-fault (same
+    virtual address twice, ~40 h uptime each) on that combination with MTP +
+    prefix caching + chunked prefill at 28-34k context; cause unattributed
+    between flashinfer's workspace and the async-scheduling window as of this
+    entry. If you hit it, the flashinfer-free fallback is the int8 tier:
+    `SPEC=dflash2 CTX=long` ships it by default, and for `SPEC=mtp` it is
+    `VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend=TRITON_ATTN
+    --kv-cache-dtype=int8_per_token_head"`. Measured cost on the reference
+    box: 17.9k in + 256 out takes 23.7 s against fp8/FlashInfer's 18.9
+    (~25% wall at that depth, mostly Triton prefill); in exchange the same
+    pinned pool holds more tokens at int8's geometry. The default stays
+    fp8/FlashInfer: two faults on one box do not justify a 25% tax on every
+    other box, but you should know which combination you are running.
+
+45. **On a low-RAM host, don't let the stock loader race page-cache eviction —
+    stream the weights.** A 16 GB host (~10 GiB actually free) died loading the
+    15.9 GiB checkpoint at shard 5/8
+    ([#39](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/39)). Measured
+    here under a 10 GiB cgroup cap standing in for that box: the **stock
+    loader's memory peak was the cap to the byte** (10,737,418,240) — it loads
+    by consuming everything and betting reclaim keeps up, which a fast NVMe
+    wins and a busy desktop loses; pushed past the edge it reclaim-thrashes so
+    hard the process stops responding even to SIGKILL (uninterruptible I/O),
+    which is also what a "hung load" looks like from the outside. The **Run:ai
+    streamer bounds the load instead, and is faster here**: 6.3 s vs 11.7 s to
+    load, 8.46 GB process-wide peak under the same cap (its `memory_limit`
+    caps the staging window; the rest is the engine's ordinary host
+    footprint):
+
+    ```bash
+    venv/bin/pip install runai-model-streamer humanize
+    # NOT runai-model-streamer-s3: it force-imports boto3 at package import
+    # and breaks the loader on a box without it; local files don't need it.
+    EXTRA_ARGS='--load-format=runai_streamer --model-loader-extra-config={"memory_limit":2147483648}' \
+      bash single-user/start_qwen.sh
+    ```
+
+    Two adjacent facts from the same experiment: `swapon` cannot save the
+    stock loader (mmap'd read-only file pages evict, they never swap — only
+    the engine's anonymous memory benefits), and the whole test ran under
+    `SPEC=off`, which as of this entry is a real mode rather than a silent
+    fall-through to mtp.

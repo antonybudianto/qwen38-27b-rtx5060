@@ -184,5 +184,6 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-num-batched-tokens 2048 \
   --compilation-config "{\"max_cudagraph_capture_size\":64,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details \
   ${TOOL_ARGS} \
   ${EXTRA_ARGS}

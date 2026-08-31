@@ -11,8 +11,18 @@ V2 runner; every blocker was allocator/geometry logic:
     block size that is simultaneously a divisor of 2176 (=17x128), a FlashAttention-2
     multiple of 16, and a KVarN tile multiple.
  4. kv_cache_utils.py: sliding-window groups (the drafter) stay out of the scheduler
-    LCM / hash GCD; an explicit --prefix-match-unit now beats the mamba-divergence
-    fallback (which silently ignored it).
+    LCM, but the default hash unit is the GCD over ALL groups INCLUDING them, on
+    BOTH paths that choose it: the hash unit must divide the SW block or fix 5's
+    read guard reports a permanent miss and prefix caching never hits. Invisible
+    under int8 (every block 864); fatal under int4 -- and int4 takes the
+    mamba-divergence FALLBACK (mamba blocks 1696 != cache block 848, measured:
+    groups=[1696 x8, 848]), which used to return the LCM (1696) as the hash unit
+    before the GCD was ever consulted. That second stage is why the explicit
+    --prefix-match-unit 848 from #46 worked while a GCD-only fix still measured
+    0% hits. Both paths now return gcd-all (848 here), the resolver logs its
+    choice at boot, and an explicit --prefix-match-unit beats everything.
+    Validated: int4 + DFlash2 warm 30k re-request 44.1 s -> 6.2 s,
+    cached_tokens 28832.
  5. kv_cache_coordinator.py / single_type_kv_cache_manager.py: the SW manager returns a
     clean miss on the read side and skips caching on the write side, instead of
     asserting (prefix reuse is meaningless for a rolling window anyway). Without the
@@ -51,18 +61,21 @@ V2 runner; every blocker was allocator/geometry logic:
     now counts the port(kvarn-v2) markers per file and refuses to leave a
     partially applied port behind.
 
-One thing this patch does NOT fix, so the caller has to: with prefix caching on,
-the DFlash2 verify step must not be a CAPTURED cuda graph. Acceptance collapses
-to ~1 token per step, and on some trees the output degrades outright. It is the
-capture rather than the drafter -- eager is clean, and so is PIECEWISE, which
-keeps the compiled graphs and leaves only the multi-query verify uncaptured.
-single-user/start_qwen.sh therefore runs SPEC=dflash2 CTX=huge with
-cudagraph_mode=PIECEWISE; anyone driving vllm serve directly needs the same.
-It is a trade rather than a free win -- 3 runs each at 250 W: long context
-(labd copy@20k) 1.97 -> 7.83 tok/step and 38 -> 132 tok/s, but short-prompt
-decode drops 13-18% (de/en/code 78/125/202 -> 74/102/176 tok/s) with the full
-decode graphs gone. The capture mode is fixed at boot, so this mode takes the
-trade that matches long shared prefixes.
+Capture mode, HISTORY AND CURRENT STATE (this header used to contradict
+single-user/start_qwen.sh; issue #48 asked which one to believe -- this is the
+answer). Before a75ee4b, a captured FULL verify with prefix caching collapsed
+DFlash2 acceptance to ~1.97 tok/step at long context; this header therefore
+demanded cudagraph_mode=PIECEWISE. a75ee4b root-caused that as the mod-128
+residue accounting bug, not the capture itself, and after it the comparison was
+re-measured with only the capture toggled: identical at long context (65.7 vs
+67.6 tok/s over six labd tasks at 20k), FULL ahead on short prompts and on
+GSM8K (96.5 vs 95.0). start_qwen.sh therefore now deliberately runs
+SPEC=dflash2 on vLLM's default capture (FULL_AND_PIECEWISE), backed by an
+all-128-residue sweep under FULL with 0 broken; CUDAGRAPH_MODE=PIECEWISE
+remains one env away and is what SPEC=mtp at CTX=huge still pins, for
+correctness (its residue-4 break under FULL is fixed by a75ee4b for dflash2
+only). Anyone driving vllm serve directly can use the default capture mode
+with SPEC=dflash2 on current main; on a pre-a75ee4b tree they must not.
 
 Measured on an RTX 3090 (WSL2, 250 W power limit), fast variant, through
 single-user/start_qwen.sh itself, bench/labd_bench.py --ctx 20000:
@@ -70,8 +83,9 @@ single-user/start_qwen.sh itself, bench/labd_bench.py --ctx 20000:
   (copy at 7.8 tokens per verify step; 53 tok/s over all six tasks),
   245760 max-model-len with 268,169 tokens of KV, 100k-deep needle correct
   in both turns, and a 100k prefix-cache hit takes the follow-up turn from
-  169 s of prefill to 4.7 s. With the captured verify instead: copy drops to
-  1.97 tok/step and 39 tok/s.
+  169 s of prefill to 4.7 s. (Numbers taken pre-a75ee4b with the then-required
+  PIECEWISE verify; the "captured verify: copy drops to 1.97 tok/step" figure
+  that used to close this paragraph was the residue bug, see above.)
 
 Apply AFTER kvarn-0.27.1.patch and the patches/ set (kvarn/install.sh does both):
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < kvarn/kvarn-v2-runner.patch
@@ -145,24 +159,29 @@ Written against vLLM 0.27.1 + this repo's patch set.
                  num_kv_heads=self.num_kv_heads,
 --- a/v1/core/kv_cache_utils.py
 +++ b/v1/core/kv_cache_utils.py
-@@ -656,6 +656,16 @@
+@@ -656,6 +656,21 @@
          else g.kv_cache_spec.block_size
          for g in groups
      ]
-+    # port(kvarn-v2): sliding-window groups (the DFlash drafter) take no part
-+    # in prefix matching and must not skew the LCM/GCD; their block is a
-+    # divisor of the primary block by construction.
++    # port(kvarn-v2): sliding-window groups (the DFlash drafter) stay out of
++    # the scheduler LCM; their block is a divisor of the primary block by
++    # construction.
 +    from vllm.v1.kv_cache_interface import SlidingWindowSpec as _SWS
 +    _non_sw = [
 +        bs for g, bs in zip(groups, group_block_sizes)
 +        if not isinstance(g.kv_cache_spec, _SWS)
 +    ]
++    # The default hash unit, however, must divide the SW block too, or the SW
++    # manager's alignment guard reports a permanent miss and prefix caching
++    # never hits (#46: int4 geometry -- non-SW gcd 1696, SW block 848).
++    _hash_gcd_all = math.gcd(*group_block_sizes)
++    _all_group_bs = list(group_block_sizes)
 +    if _non_sw:
 +        group_block_sizes = _non_sw
      scheduler_block_size = math.lcm(*group_block_sizes)
  
      # Block hashes are only consumed by prefix caching and KV connectors
-@@ -668,7 +678,9 @@
+@@ -668,17 +683,29 @@
      # Mamba groups with block_size != cache_config.block_size
      # (mamba_cache_mode != "align") break divisibility; back off to the
      # scheduler block size.
@@ -173,6 +192,28 @@ Written against vLLM 0.27.1 + this repo's patch set.
          isinstance(g.kv_cache_spec, MambaSpec)
          and g.kv_cache_spec.block_size != cache_config.block_size
          for g in groups
+     ):
+-        return scheduler_block_size, scheduler_block_size
++        # port(kvarn-v2): the fallback hash unit must still divide the SW
++        # block (#46); scheduler_block_size (the non-SW LCM) need not.
++        logger.info(
++            "kvarn-v2 hash-unit fallback: groups=%s cache_block=%s -> "
++            "scheduler=%d hash=%d", _all_group_bs, cache_config.block_size,
++            scheduler_block_size, _hash_gcd_all)
++        return scheduler_block_size, _hash_gcd_all
+ 
+     requested = cache_config.prefix_match_unit
+     hash_block_size = (
+-        requested if requested is not None else math.gcd(*group_block_sizes)
++        requested if requested is not None else _hash_gcd_all
+     )
++    logger.info(
++        "kvarn-v2 hash unit: groups=%s cache_block=%s requested=%s -> "
++        "scheduler=%d hash=%d", _all_group_bs, cache_config.block_size,
++        requested, scheduler_block_size, hash_block_size)
+     if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+         raise ValueError(
+             f"Invalid prefix_match_unit={hash_block_size}; all KV cache group "
 --- a/v1/core/kv_cache_coordinator.py
 +++ b/v1/core/kv_cache_coordinator.py
 @@ -560,8 +560,13 @@
