@@ -152,6 +152,17 @@ gathered and quantized once per layer-chunk into contiguous int8 scratch;
 Q rows carry per-row scales; P.V stays bf16. On the attention itself it is
 1.27x FA2 at 4k rising to 1.35x at 51k; end-to-end with `INT8_ACT` it adds
 +2.7% at 16k and +5.3% at 51k (1,839 / 1,498 tok/s), decode unchanged.
+Alone it adds almost nothing, and that is structural rather than a defect:
+prefill without the int8 GEMMs is GEMM-dominated, so a faster attention has
+less to win. Measured standalone on the reference box (`bench/prefill_ab.sh`,
+two interleaved arms per condition, each reproducing to 0.1%): 1,167 / 1,126 /
+1,012 tok/s at 4k / 16k / 51k against 1,164 / 1,114 / 980 stock — +0.3%,
++1.1%, +3.3%, the gain growing with context exactly as the attention share
+does. A WSL2 3090 measured the same standalone cell 1-6% negative
+([#62](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/62)), so treat
+`PREFILL_ATTN` alone as noise-to-slightly-positive and pair it with
+`INT8_ACT`, where the same kernel is worth +1.8% at 16k and +4.5% at 51k on
+top (1,826 / 1,491 against 1,793 / 1,427).
 Prefill-only by construction: the branch fires for single-request prefill
 chunks on the exact serving geometry and falls through to FA2 otherwise.
 

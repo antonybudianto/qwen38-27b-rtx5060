@@ -108,7 +108,13 @@ INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
 # PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
 # layers during prefill (patches/triton-prefill-attn-int8.patch): 1.27-1.35x FA2 on
 # the attention itself, worth up to ~+5% end-to-end at 51k on top of INT8_ACT
-# (1,839/1,498 tok/s at 16k/51k with both on). Prefill-only; decode and the
+# (1,839/1,498 tok/s at 16k/51k with both on). It is a companion to INT8_ACT, not
+# a standalone switch: on its own it moves prefill +0.3/+1.1/+3.3% at 4k/16k/51k
+# here (1,167/1,126/1,012 against 1,164/1,114/980 stock, two interleaved arms
+# reproducing to 0.1%), because without the int8 GEMMs attention is a smaller
+# share of prefill. A WSL2 3090 measured it 1-6% *negative* standalone (#62), so
+# the honest range for PREFILL_ATTN alone is "within a few percent either way" --
+# set INT8_ACT with it or leave it off. Prefill-only; decode and the
 # split-KV verify keep their existing paths. fp16 selects the same kernel
 # without quantization (a debugging mode); empty keeps FA2.
 PREFILL_ATTN=${PREFILL_ATTN-}
@@ -518,7 +524,10 @@ fi
 # synchronously, which is the only path on which vLLM lets the worker choose how many draft
 # tokens to put up for verification. Note --async-scheduling is already the default in
 # 0.27.1: --no-async-scheduling is what turns it off.
-ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no-async-scheduling)
+# Array, not $( ... || echo ... ): errexit-safe via the fallback, but the
+# unquoted expansion word-splits; match METRICS_ARGS below.
+ASYNC_ARGS=(--no-async-scheduling)
+[ "${ASYNC_SCHED:-1}" = 1 ] && ASYNC_ARGS=(--async-scheduling)
 
 # Tool / function calling. Without BOTH flags vLLM rejects any request carrying
 # `tools` with tool_choice "auto": 400 '"auto" tool choice requires
@@ -536,7 +545,10 @@ ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no
 # 0.27.1, which is the tool-side adapter of the same parser engine that
 # --reasoning-parser qwen3 already uses (vllm/parser/qwen3.py).
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
-TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
+# Array, not $( [ ] && echo ): exits 1 when TOOLS is off (the shape #59 fixed)
+# and word-splits $TOOL_PARSER; the array keeps the parser as one element.
+TOOL_ARGS=()
+[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 
 # REQ_METRICS=1: per-request timing fields in every response plus usage on
 # every request (--enable-per-request-metrics --enable-force-include-usage,
@@ -544,7 +556,10 @@ TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-
 # fields ride on the engine-stats path, so it cannot be paired with
 # --disable-log-stats in EXTRA_ARGS. --enable-prompt-tokens-details is always
 # on. vLLM's per-request *spec-decode* summary flag is nightly-only (not 0.27.1).
-METRICS_ARGS=$([ "${REQ_METRICS:-0}" = 1 ] && echo --enable-per-request-metrics --enable-force-include-usage)
+# Array, not $( [ ] && echo ): that substitution exits 1 when the test is
+# false, which kills a launcher running under `set -e` silently (#59).
+METRICS_ARGS=()
+[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
 
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
@@ -644,12 +659,12 @@ exec venv/bin/vllm serve "$MODEL" \
   ${VISION_ARGS} \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
-  ${ASYNC_ARGS} \
+  "${ASYNC_ARGS[@]}" \
   --max-num-batched-tokens 2048 \
   "${SPEC_ARGS[@]}" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]${CG_MODE}}" \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
-  ${METRICS_ARGS} \
-  ${TOOL_ARGS} \
+  "${METRICS_ARGS[@]}" \
+  "${TOOL_ARGS[@]}" \
   ${EXTRA_ARGS}

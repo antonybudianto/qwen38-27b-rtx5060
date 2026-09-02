@@ -10,6 +10,15 @@ Data (once):
   hf download HuggingFaceFW/fineweb-2 --repo-type dataset --include "data/dan_Latn/test/000_00000.parquet" --local-dir bench/quality-data/fineweb2
 Perplexity needs prompt_logprobs, which needs memory headroom: run the server with
 GPU_UTIL=0.93 for this (gotcha 10 in the README).
+
+On CTX=huge (KVarN) with SPEC=mtp, measure perplexity with PREFIX_CACHE=0. That
+combination corrupts prompt_logprobs: some requests 400 with "Out of range float
+values are not JSON compliant: nan", and the batteries that do complete read
+~23% high on English (12.6-13.7 against 10.76) and drift run to run. Setting
+PREFIX_CACHE=0 makes the same server exact and stable to four decimals. SPEC=off
+and SPEC=dflash2 on KVarN are unaffected, at the same pool size, and so is
+CTX=fast on all three settings, so the published quality tables are not
+implicated. Measured in #64 (gotcha 51).
 Usage: python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]
 """
 import json, os, sys, glob, re, math, time, random

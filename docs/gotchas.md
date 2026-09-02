@@ -514,7 +514,14 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     transfer to the other in either direction. The detector is the one that found it: a
     prompt-length ladder against a known-good rate. On WSL, ladder any `KV_MEM` above
     stock before trusting it; the launcher now prints a warning when the pin exceeds
-    the profile default.
+    the profile default. A cheaper live check, from a second WSL2 box in
+    [#61](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/61): `nvidia-smi dmon`
+    while it generates. Healthy decode on a 24 GB card is high SM occupancy *and*
+    high power draw; host-backed memory shows as **SM near 100% at only 100-200 W**,
+    because the SMs are stalled on PCIe rather than doing work. That reporter's rule
+    of thumb — keep ~2 GB of VRAM free by lowering `GPU_UTIL`, and do not chase the
+    context back with `MAX_LEN`, since the pool is sized by `GPU_UTIL` — matches the
+    two boxes above.
 
     The launcher warns above 12 seats rather than clamping, because unlike `CG` this is
     a VRAM budget rather than a shape: a card bigger than 24 GiB has room where this
@@ -797,3 +804,46 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     but truncates the specialisation attributes at 120 characters, which is
     why it could name the kernel and not the cause. `KVARN_LOOKUP_BLOCKS`
     pins the lookup size if a deployment ever needs to.
+
+51. **`prompt_logprobs` is wrong on `CTX=huge` + `SPEC=mtp` + prefix caching, and
+    the NaN 400s are only its visible half.** Reported as
+    [#64](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/64) from a WSL2
+    3090 — `bench/quality_battery.py --ppl-only` failing with
+    `{"message":"Out of range float values are not JSON compliant: nan"}` on
+    some documents, and perplexity drifting 3.7% between identical runs.
+    Reproduced here on bare metal, on the reporter's own document indices, so
+    it is not a WSL2 effect. What it actually takes is all three of KVarN, MTP
+    and `PREFIX_CACHE=1`; the same 106-document battery, same checkpoint, two
+    concurrent workers:
+
+    | profile | NaN batteries | en perplexity |
+    |---|---|---|
+    | `CTX=huge` `SPEC=mtp` `PREFIX_CACHE=1` | 4 of 5 | 12.6-13.7, drifting |
+    | `CTX=huge` `SPEC=mtp` `PREFIX_CACHE=0` | 0 of 5 | **10.7628**, identical across runs |
+    | `CTX=huge` `SPEC=off` `PREFIX_CACHE=1` | 0 of 5 | 10.7646 |
+    | `CTX=huge` `SPEC=dflash2` `PREFIX_CACHE=1` | 0 of 5 | 10.7643 |
+    | `CTX=fast`, `off` / `mtp` / `dflash2` | 0 of 6 | 10.7614 / 10.7659 / 10.7633 |
+
+    So the inflated perplexity and the NaN are one bug, not two: in the broken
+    combination the logprobs that come back are ~23% worse on English than the
+    same server produces with prefix caching off, and the requests whose
+    corruption reaches a non-finite float are the ones that 400. Every clean
+    configuration agrees to four decimals, which is also what makes the broken
+    one unmistakable.
+
+    Two things that look like the cause and are not. **The documents**: sent one
+    at a time on a single thread, all of them return clean logprobs — it needs
+    co-scheduled requests, and the failures land on adjacent index pairs, which
+    under two workers are exactly the pairs that share a prefill batch. **The
+    pool size**: within MTP it is geometry-dependent (failed at 299k and 312k
+    tokens of pool, clean at 265k, 352k, 359k and 390k), which is what makes it
+    look intermittent across boots — but `SPEC=dflash2` pinned to 312,242
+    tokens, matching the failing MTP geometry to 0.02%, is clean, so the
+    speculator is the variable and the geometry only decides whether it fires.
+    `MAX_LEN` is not involved: 240000 and the 245760 default both fail and both
+    pass depending on the rest.
+
+    Practical rule until the read path is fixed: measure perplexity or anything
+    else using `prompt_logprobs` on KVarN with `PREFIX_CACHE=0`, or on a
+    non-MTP speculator. Ordinary generation is not implicated — needle
+    retrieval and decode rates are normal on the same server.

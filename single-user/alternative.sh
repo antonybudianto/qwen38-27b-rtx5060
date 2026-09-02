@@ -64,11 +64,17 @@ VISION_ARGS="--language-model-only"
 PREFIX_ARGS=""
 [ "$PREFIX_CACHE" = 1 ] && PREFIX_ARGS="--enable-prefix-caching --mamba-cache-mode align"
 
-ASYNC_ARGS=$([ "$ASYNC_SCHED" = 1 ] && echo --async-scheduling || echo --no-async-scheduling)
+# Array, not $( ... || echo ... ): the fallback makes it errexit-safe, but an
+# unquoted expansion still word-splits; match SPEC_ARGS/METRICS_ARGS.
+ASYNC_ARGS=(--no-async-scheduling)
+[ "$ASYNC_SCHED" = 1 ] && ASYNC_ARGS=(--async-scheduling)
 
 # REQ_METRICS=1: per-request timing fields + usage on every response (issue #51).
 # Not with --disable-log-stats (the timing fields need the engine-stats path).
-METRICS_ARGS=$([ "${REQ_METRICS:-0}" = 1 ] && echo --enable-per-request-metrics --enable-force-include-usage)
+# Array, not $( [ ] && echo ): the command substitution exits 1 when the test
+# is false, which under `set -e` killed this script silently (#59).
+METRICS_ARGS=()
+[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
 
 exec vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
@@ -80,13 +86,13 @@ exec vllm serve "$MODEL" \
   ${VISION_ARGS} \
   ${ATTN_ARGS} \
   --mamba-ssm-cache-dtype float16 \
-  ${ASYNC_ARGS} \
+  "${ASYNC_ARGS[@]}" \
   --max-num-batched-tokens 2048 \
   "${SPEC_ARGS[@]}" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
-  ${METRICS_ARGS} \
+  "${METRICS_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --default-chat-template-kwargs "{\"enable_thinking\": $ENABLE_THINKING}" \
   ${PREFIX_ARGS} \

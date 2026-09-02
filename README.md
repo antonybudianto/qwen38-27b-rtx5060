@@ -454,10 +454,18 @@ kernel, which the drafter's 8-row draft block needs
 The trade: the Triton attention backend plus the per-step int4 unpack cost
 about 20% of decode against the shipped config on short prompts (~86 vs ~104
 tok/s e2e on the same probe), and — unlike KVarN, which has GSM8K and
-100k-needle numbers above — **int4-KV quality at depth is unmeasured here**.
-Tool calling round-trips correctly and the lookup lane works; treat the rest
-as experimental until someone runs the quality harness on it, which is a
-contribution this README will gladly take.
+100k-needle numbers above — int4-KV quality at depth now reads:
+
+| metric | result |
+|---|---|
+| GSM8K exact-match (200 questions, greedy, thinking off) | **96.0%** |
+| 100k-token needle at 90% depth (`bench/needle_test.py`) | **retrieved** |
+
+Measured on an RTX 4090 (24 GB) with `bench/quality_battery.py int4kv --gsm-only
+--gsm-n 200` and `bench/needle_test.py 100000 0.9`; the 96.0% sits inside the band
+the other configurations read (95.0-96.5%, docs/quality.md). Tool calling
+round-trips correctly and the lookup lane works; the rest of this configuration
+is still experimental.
 
 ### More than one GPU
 
@@ -564,6 +572,16 @@ tables: [docs/quality.md](docs/quality.md).
 Community reproductions of the single-user headline number, harness runs first.
 `bench/run_benchmarks.sh single`, greedy, second run (the first reads low):
 
+**Set the power limit before you compare anything.** Every number in this repo
+is an RTX 3090 at 250 W, and on this card that is not a soft preference. A
+sustained-load ladder from [#62](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/62)
+(14 minutes per cell, same service): 200 W gives 57.5 tok/s at 781 MHz, 250 W
+gives 85.6 at 978 MHz, and 280 W gives 86.7 — it hits 90 °C within two minutes,
+pins the fan at 100% and throttles back to the same throughput. Prefill loses
+about the same third at 200 W. So a quiet home box capped at 200 W is measuring
+its power cap rather than this stack, and nothing above 250 W is worth the
+noise.
+
 | card | power | C1 decode | notes | source |
 |---|---|---|---|---|
 | RTX 3090 (reference) | 250 W | 133 tok/s | pool 57,669 tok, ppl 8.09 | this README |
@@ -586,6 +604,17 @@ other only loosely, and not rows for the table above:
   changes; CTX ladder incl. huge's pool byte-identical to the 3090 reference
   (268,169), concurrency ladder to N=8, and a measured both-ways case for
   leaving the `KV_MEM` pin alone — [docs/wsl2-4090.md](docs/wsl2-4090.md).
+- **RTX 4090, Windows 11 / WSL2, second box**: all three single-user profiles
+  plus the experimental int4 one (230,830-token pool at 160k), and 135k
+  real-task numbers on the MTP + FP8 daily-driver profile — 62 tok/s decode on
+  QA over the document, TTFT 5.4 s → 0.33 s on a repeat turn. Also the
+  `nvidia-smi dmon` detector for WSL2 host-backed memory now in gotcha 43 —
+  [#61](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/61).
+- **RTX 3090, Windows 11 / WSL2**: independent confirmation of the int8 prefill
+  stack on Ampere — `INT8_ACT=int8` +59%/+57%/+37% at 5k/21k/66k, the int8-QK
+  attention adding +1.8% at 21k and +6.3% at 66k on top, against this repo's
+  +2.7% at 16k and +5.3% at 51k. Plus the power-limit ladder quoted above —
+  [#62](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/62).
 - **Dual-GPU reports**: the controlled 1-vs-2×3090 A/B in
   [#40](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/40) (+16–35%,
   161.6 C1 greedy at 275 W, PCIe x8 without NVLink; independently reproduced
