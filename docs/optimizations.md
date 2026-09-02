@@ -33,6 +33,11 @@ One line each; the rest of this page is the long version.
 9. **Prefix caching for a hybrid model** — opt-in upstream; `PREFIX_CACHE=1`
    makes a follow-up chat turn on a 24k document cost ~1 s instead of ~23 s, and
    64 requests sharing a system prompt 17 s instead of 222 s.
+10. **int8 prefill for single-user mode** (`INT8_ACT=int8`) — prefill is
+   compute-bound at every batch size, so the W4A8 tensor-core path is worth
+   +27-30% prefill (+19% at 51k) on the dflash2 stack with decode unchanged;
+   plus a benchmark-harness fix (seeded prompts) that makes the prefill
+   numbers honest at all.
 
 ## In full
 
@@ -111,6 +116,75 @@ One line each; the rest of this page is the long version.
    mamba/GDN hybrids; `PREFIX_CACHE=1` turns it on in both modes with the recurrent state
    resumed from the last cached block boundary. Follow-up chat turns on a 24k document:
    23 s → 1 s. 64 API requests sharing a 5.8k system prompt: 222 s → 17 s.
+
+### int8 prefill for single-user mode (`INT8_ACT=int8`)
+
+Single-user mode stayed W4A16 because int8 activations buy nothing at batch
+size 1 *decode* — true, and beside the point for prefill, which is
+compute-bound at every concurrency. A torch profile of a 4k prefill on the
+dflash2 stack is 79% Marlin GEMM time with 15 ms of GPU idle out of 2.05 s, so
+the GEMM dtype is the whole game. `INT8_ACT=int8` (default layer set
+`mlp|linear_attn|self_attn`) borrows batch mode's W4A8 path for every linear
+except the int8-weight lm_head/embed and the MTP module:
+
+| prefill tok/s (dflash2 k=15, PC=1, seeded protocol) | 1k | 4k | 16k | 51k |
+|---|---|---|---|---|
+| W4A16 (mode default) | 1,437 | 1,494 | 1,410 | 1,200 |
+| `INT8_ACT=int8 INT8_LAYERS=mlp` | 1,638 | 1,696 | 1,587 | 1,320 |
+| `INT8_ACT=int8` (all linears) | **1,845** | **1,937** | **1,791** | **1,423** |
+
+Decode is unchanged (122±5 vs 121 tok/s C1 over repeats, 3.2 tok/step both
+ways) and quality is the documented int8 trade: GSM8K 95.0% against the fast
+variant's 96.5, perplexity +4.1% (mostly prose, code flat), IFBench flat on
+the batch-mode precedent. The 51k row gains least because the 16
+full-attention layers grow quadratically to ~40% of prefill there, and FA2 at
+head_dim 256 has no faster sm86 alternative (FlashInfer measured within 1.5%,
+and it costs the split-KV verify path at decode).
+
+**int8-QK prefill attention** (`PREFILL_ATTN=int8`,
+`patches/triton-prefill-attn-int8.patch`) attacks what is left after the GEMMs: the
+16 full-attention layers, whose head_dim of 256 pins FA2 at 54-57 TFLOPS on
+sm86 (85% of the card's practical fp16 mma rate — no fp16 rewrite can win).
+A Triton kernel runs QK^T on int8 tensor cores at 2x the fp16 rate,
+SageAttention-style: K is smoothed by its per-head channel mean (softmax-
+invariant, so exact up to int8 rounding — cos > 0.99999 vs fp32 at 4-51k),
+gathered and quantized once per layer-chunk into contiguous int8 scratch;
+Q rows carry per-row scales; P.V stays bf16. On the attention itself it is
+1.27x FA2 at 4k rising to 1.35x at 51k; end-to-end with `INT8_ACT` it adds
++2.7% at 16k and +5.3% at 51k (1,839 / 1,498 tok/s), decode unchanged.
+Prefill-only by construction: the branch fires for single-request prefill
+chunks on the exact serving geometry and falls through to FA2 otherwise.
+
+Things this campaign measured that did NOT pay, so nobody re-walks them:
+
+- **The benchmark harness was mismeasuring prefill.** `vllm bench serve`
+  defaults to `--seed 0`, so every call replays the same prompts; with
+  `--enable-prefix-caching` that hands later calls silent partial prefix hits
+  whose size depends on the server's pool geometry. The old protocol read one
+  config 15-20% low and another 3× high (a 16k prefill "measured" at 4.0 s
+  that cold costs 11.2 s). `bench/run_benchmarks.sh` now seeds every call;
+  the tables above are the seeded numbers, and older published prefill rows
+  are not comparable.
+- **`SPEC=off` prefills ~20% slower than `SPEC=dflash2`** — removing the
+  drafter demotes the server from the V2 model runner to V1. The drafter's
+  own prefill cost on the V2 runner is nil (6 kernel launches in a 4k
+  profile); the "~15% TTFT" figure that used to circulate here predates the
+  fused context-KV precompute.
+- **`PREFIX_CACHE=0` prefills ~20% slower than `PREFIX_CACHE=1`** on this
+  stack, align mode ruled out as the cause (PC=0 + `--mamba-cache-mode align`
+  measures the same as plain PC=0). Do not turn the cache off "for speed".
+- **Bigger prefill chunks do not boot** under the pinned `KV_MEM`:
+  `--max-num-batched-tokens` 4096 and 8192 both inflate the profiled
+  activation peak past the transient floor (engine init fails). 2048 stays.
+- **Marlin tile tuning for the W4A8 GEMMs washes out end-to-end.** The
+  standalone sweep (min-of-rounds, burst clocks) shows +2-20% per GEMM over
+  stock tiles at M=2048 — and exactly +0.4% end-to-end, because sustained
+  250 W throttling flattens the differences the bursts show.
+  `patches/marlin-tune-table.patch` ships the wiring anyway (off by default,
+  `VLLM_MARLIN_TUNE=1`) for cards running without a power cap.
+- `INT8_LAYERS="mlp|linear_attn"` (the GDN-only middle point) crashes at
+  first forward — an inductor codegen bug with the mixed set on this
+  torch/vllm pin. Use `mlp` or the full default.
 
 ### DFlash2 (`SPEC=dflash2`)
 

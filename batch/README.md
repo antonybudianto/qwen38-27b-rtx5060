@@ -68,17 +68,26 @@ default (int8 tensor cores on the MLP GEMMs):
 | 64k | 1,182 | 1,184 | — | 55 s |
 | 100k | 997 | — | — | 103 s |
 
-W4A16 kernels (single-user mode, or batch mode with `INT8_ACT=` unset) for
-comparison — the int8 path is +50% at 1k, tapering to +25% at 100k as the 16
-attention layers take a bigger share:
+Single-user mode (dflash2 k=15, `PREFIX_CACHE=1`), re-measured 2026-09-01 on
+the **seeded** protocol — `bench/run_benchmarks.sh` now passes a distinct
+`--seed` per call; the unseeded harness this table was first built with let
+the prefix cache partially serve repeated bench prompts, which read one config
+15-20% low and another 3× high, so the old W4A16 rows here are not comparable:
 
-| input length | conc 1 | conc 4 | conc 8-16 | single-request TTFT |
-|---|---|---|---|---|
-| 1k | 1,210 tok/s | 1,215 | 1,213 | 0.85 s |
-| 4k | 1,185 | 1,185 | 1,183 | 3.5 s |
-| 16k | 1,112 | 1,117 | 1,116 | 14.7 s |
-| 64k | 906 | 908 | — | 72 s |
-| 100k | 795 | — | — | 129 s |
+| input length, conc 1 | W4A16 (mode default) | `INT8_ACT=int8` (all linears) |
+|---|---|---|
+| 1k | 1,437 tok/s (TTFT 0.71 s) | **1,845** (0.55 s) |
+| 4k | 1,494 (2.7 s) | **1,937** (2.1 s) |
+| 16k | 1,410 (11.6 s) | **1,791** (9.1 s) |
+| 51k | 1,200 (42.6 s) | **1,423** (35.8 s) |
+
+Decode at C1 is unchanged by the int8 path (122±5 vs 121 tok/s over repeats);
+quality is the documented int8 trade
+([docs/optimizations.md](../docs/optimizations.md), GSM8K 95.0 vs 96.5, PPL
++4.1%). `SPEC=off` and `PREFIX_CACHE=0` each measure ~20% *slower* prefill
+than the dflash2 defaults — the drafter rides the V2 model runner and the
+prefix-cache path is the fast allocation path — so neither is a "lean" prefill
+configuration.
 
 Two things to plan capacity around. First, concurrency does nothing for
 prefill: chunked prefill feeds everything through the same 2,048-token
@@ -87,6 +96,33 @@ shares, and queueing is linear (four 16k prompts at once means the last one
 waits ~40 s). Second, the falloff with length is mild — ~45% from 1k to 100k
 on the int8 path, ~34% on W4A16 — because just 16 of 64 layers pay quadratic
 attention; this is one of the places the hybrid architecture genuinely helps.
+
+### Raw-engine cells (no speculation, no prefix caching)
+
+For apples-to-apples comparison with other 3090 stacks, the standard "raw"
+protocol people ask for: `SPEC=off PREFIX_CACHE=0`, 7,681-token prompts,
+511-token generations (8,192 tokens resident per request), C simultaneous
+requests, distinct seeds per call. PP = total prompt tokens / wall time of
+1-token-output runs at the same concurrency; TG = C × 1000 / mean TPOT
+(true tokens per second — with speculation off every round emits exactly one
+token per request). RTX 3090 at 250 W, this checkpoint (W4A16-AutoRound-fast).
+
+| cell | W4A16 raw: PP / TG-agg | + server-side int8 (`INT8_ACT=int8 PREFILL_ATTN=int8`): PP / TG-agg |
+|---|---|---|
+| C1 | 1,172 / 46.9 tok/s | **1,849** / 45.2 |
+| C4 | 1,168 / 94.8 | **1,858** / 110.1 |
+| C8 | 1,169 / 111.5 | **1,911** / 143.7 |
+
+PP is flat in C because chunked prefill feeds every request through the same
+per-step token budget. The int8 column is still "raw" by the usual definition
+— no draft model, no cache reuse — it is a server-side kernel choice, the
+same class of decision as picking a weight quant. A sanity check for anyone
+comparing TG numbers: at true spec-off, `TG per stream x round latency = 1`
+token per round. A C1 cell reporting ~110 TG at a ~45 ms round is emitting
+~5 tokens per round — that is a speculative path still active (this repo's
+own `SPEC=off` used to silently fall through to MTP; see the launcher
+comment), not raw decode. Raw single-stream decode for 16 GB of weights on a
+936 GB/s card is bounded near ~50 tok/s.
 
 ## Shared prompts: `PREFIX_CACHE=1`
 
@@ -105,6 +141,16 @@ It costs ~14% of the KV pool (223,821 → 193,298 tokens, 1.29x concurrency at 1
 1.49x) — one extra recurrent-state page per request — and nothing on workloads with no shared
 prefix (870 tok/s on the 128 in / 512 out row, i.e. unchanged). Answers are identical; the
 state resume is exact.
+
+One failure mode to know about on mixed workloads (a long-running conversation
+plus unrelated traffic on the same server): a hybrid cache hit needs the mamba
+group's retained state snapshot *and* the attention blocks, and stock vLLM's
+eviction order kills the snapshot first — one lost block and the whole
+conversation re-prefills at 0% hit even though its attention KV is fully
+cached. `patches/mamba-align-checkpoint-order.patch` (in the standard patch
+set, default off) fixes the ordering when enabled with
+`VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS=1`; mechanism, measurements and the
+capacity caveat are in [docs/gotchas.md](../docs/gotchas.md) #49.
 
 ## Setup
 

@@ -1,0 +1,209 @@
+Mamba "align" prefix caching: keep the conversation's reachable state
+snapshots alive until request end (issue #52; upstream vllm#45238).
+
+A hybrid prefix-cache hit is the INTERSECTION of per-group hits
+(HybridKVCacheCoordinator.find_longest_cache_hit): the mamba group can only
+resume from a retained state snapshot, so losing the snapshots inside the
+shared prefix discards the whole attention-group match. Prefix caching then
+reports a clean 0% on a conversation whose attention blocks are 100% cached,
+and the turn re-prefills from scratch.
+
+Three stock behaviors compose into exactly the periodic TTFT spikes of
+issue #52 (and the upstream thread):
+
+  1. GEOMETRY: align mode materializes roughly one usable prompt-region
+     snapshot per turn, at the last prefill chunk-step boundary (~2048-token
+     grid, aligned down to the 448-token mamba block). The coordinator only
+     accepts a mamba snapshot at or below the attention match minus one
+     EAGLE margin (448 tokens with spec decode), so on the ~22% of turns
+     (448/2048) where the snapshot lands inside that margin, the turn needs
+     the PREVIOUS generation's snapshot instead. That frequency — roughly
+     one turn in 4-5 — is the reported period.
+  2. CoW RELEASE: the previous generation's snapshot is exactly the block a
+     turn's partial hit resumes from. The hit CoWs the state and releases
+     the cached copy right after the copy runs, EARLY in the turn — so by
+     turn end the chain's most valuable block is one of the oldest free
+     blocks in the pool.
+  3. EVICTION ORDER: remove_skipped_blocks frees the newly written boundary
+     snapshots mid-decode too. Net: every block a follow-up turn could
+     resume from sits near the head of the free queue, while the attention
+     blocks they unlock sit safely at the tail.
+
+Any concurrent traffic between turns then evicts the snapshots first; a
+geometry-unlucky turn with the fallback gone reconciles to 0. Reproduced on
+syv (RTX 3090, dflash2, PREFIX_CACHE=1, pool shrunk to 32.6k tokens): a
+12-turn conversation with two unrelated 3.4k-token requests interleaved
+between turns holds 81-91% hits for five turns, then 0% on EVERY turn —
+TTFT 2.1 s -> 17-31 s, each a full re-prefill — with the instrumented
+lookup showing the coordinator finding and discarding a 16,576-token
+attention match (num_uncached_common_prefix_tokens = 16576).
+
+The fix (opt-in, VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS=1) retains, per running
+request and mamba group, up to THREE state blocks until the request finishes — the CoW-carried key it resumed from and
+the last written prompt-region snapshots (rolling; a fourth frees the
+oldest) — and frees them after everything else, giving them the freshest
+eviction position in the pool. It reorders and briefly holds blocks the
+request already owns; hit semantics, scheduling and model output are
+unchanged.
+
+Two stronger variants were built, measured, and deliberately NOT shipped:
+pinning every hashed mamba page starved the attention pool outright, and a
+bounded evict-last rotation in the allocator displaced each skipped
+eviction onto the conversation's own attention tail, collapsing the very
+hit it protected. The unit of value is the attention chain PLUS its
+snapshot; when between-turn traffic exceeds the whole free pool, nothing
+survives by policy — that regime is capacity sizing, not eviction order.
+
+Validation (this patch):
+  - Failure cell (12-turn conversation, two interleaved 3.4k-token requests
+    per gap, pool shrunk to 32.6k tokens): 0% from turn 6 on stock code,
+    TTFT 17-31 s per turn. That cell turned out to be capacity-bound — the
+    interleaves' per-gap block churn exceeds the entire free pool, so no
+    eviction policy holds it (five variants and stock all fail identically
+    there). It is where the diagnosis came from, not what the patch targets.
+  - No-harm A/B at two realistic pool sizes (4.2 GB and 5.6 GB, 12 turns,
+    interleaved traffic): with retention enabled, hit rate and TTFT are
+    identical to stock turn-for-turn (82-92% hits, 1.9-2.9 s TTFT).
+  - The win regime is the reported one — context comparable to the pool,
+    light background traffic, enough turns for the ~22% geometry lottery —
+    which a short cell cannot cheaply occupy. On such a deployment the
+    periodic 0% turns are predicted to become one-generation-shorter hits.
+    The patch ships DEFAULT OFF: enable with
+    VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS=1 and please report either way.
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/mamba-align-checkpoint-order.patch
+
+Written against vLLM 0.27.1.
+
+--- a/v1/core/single_type_kv_cache_manager.py
++++ b/v1/core/single_type_kv_cache_manager.py
+@@ -1,7 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ from abc import ABC, abstractmethod
++
++# Opt-in for issue #52: hold each running request's reachable mamba "align"
++# state snapshots (the CoW-carried key it resumed from and the last written
++# prompt-region boundaries, <= 3 blocks per request per group) until the
++# request finishes, and free them last. Costs a few held blocks per running
++# request; no effect on hit semantics or model output.
++_KEEP_ALIGN_CHECKPOINTS = (
++    os.environ.get("VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS") == "1"
++)
++
+ from collections import defaultdict
+ from collections.abc import Sequence
+ from typing import ClassVar
+@@ -1297,6 +1308,13 @@
+             # into a private cow_block; we record that block for connector
+             # offload (see _pending_partial_tail_offloads).
+             self._producer_partial_tail_reqs: dict[str, int] = {}
++            # Cached state blocks at the last prompt-region boundaries, held
++            # until request end instead of being freed mid-decode. They are the
++            # only mamba blocks a follow-up strict-extension request can hit,
++            # and freeing them mid-decode puts them at the front of the
++            # eviction line while the attention blocks they unlock sit safely
++            # at the back (issue #52 / upstream #45238).
++            self._deferred_state_blocks: dict[str, list[KVCacheBlock]] = {}
+ 
+     @classmethod
+     def find_longest_cache_hit(
+@@ -1461,8 +1479,37 @@
+                 < cdiv(processed_computed_tokens, self.block_size) - 1
+             ):
+                 blocks = self.req_to_blocks[request_id]
+-                if blocks[last_state_block_idx] != self._null_block:
+-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
++                blk = blocks[last_state_block_idx]
++                if blk != self._null_block:
++                    boundary_tok = (last_state_block_idx + 1) * self.block_size
++                    # Keep the cached state snapshots at the last prompt-region
++                    # boundaries alive until the request finishes: they are the
++                    # only snapshots a follow-up turn's prefix hit can resume
++                    # from, and the finish-time free puts them at the freshest
++                    # end of the eviction queue (behind the whole conversation's
++                    # attention blocks instead of ahead of them). Align mode
++                    # only materializes state at prefill chunk-step boundaries
++                    # (~chunk_size apart, aligned down to the mamba block), so
++                    # the servable snapshot can sit up to chunk_size below the
++                    # prompt end; keep the LAST TWO at/below it (states past
++                    # the prompt end can never serve: with a reasoning model
++                    # the re-rendered history diverges right at the prompt end
++                    # because think blocks are stripped). Bounded: <= 2 blocks
++                    # held per request per group.
++                    if (
++                        _KEEP_ALIGN_CHECKPOINTS
++                        and blk.block_hash is not None
++                        and num_prompt_tokens is not None
++                        and boundary_tok <= num_prompt_tokens
++                    ):
++                        deferred = self._deferred_state_blocks.setdefault(
++                            request_id, []
++                        )
++                        deferred.append(blk)
++                        if len(deferred) > 3:
++                            self.block_pool.free_blocks([deferred.pop(0)])
++                    else:
++                        self.block_pool.free_blocks([blk])
+                     blocks[last_state_block_idx] = self._null_block
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+@@ -1663,9 +1710,41 @@
+                             # The moved entry is only filled by this step's
+                             # copy, so defer same-step hits on it.
+                             self.cached_blocks_this_step.add(cow_block.block_hash)
++                        if (
++                            _KEEP_ALIGN_CHECKPOINTS
++                            and cow_block.block_hash is not None
++                        ):
++                            # This block now carries the chain's reachable
++                            # boundary state — the one snapshot the NEXT turn's
++                            # hit resumes from. Releasing it right after the
++                            # copy plants it at the front of the eviction line
++                            # every turn (issue #52); hold it until request end
++                            # and free it last instead.
++                            cow_block.ref_cnt += 1
++                            deferred = self._deferred_state_blocks.setdefault(
++                                request_id, []
++                            )
++                            deferred.append(cow_block)
++                            if len(deferred) > 3:
++                                self.block_pool.free_blocks([deferred.pop(0)])
+                     else:
+                         self._apply_cow(request_id, block_idx, source_block, cow_block)
+                         returned_blocks = [cow_block] + returned_blocks
++                        if (
++                            _KEEP_ALIGN_CHECKPOINTS
++                            and source_block.block_hash is not None
++                        ):
++                            # Same reasoning as the running-request CoW above:
++                            # source_block stays the cached copy of the chain's
++                            # reachable boundary state; keep it alive until
++                            # request end so it is freed last.
++                            source_block.ref_cnt += 1
++                            deferred = self._deferred_state_blocks.setdefault(
++                                request_id, []
++                            )
++                            deferred.append(source_block)
++                            if len(deferred) > 3:
++                                self.block_pool.free_blocks([deferred.pop(0)])
+                 req_blocks.extend(new_blocks)
+                 self._allocated_block_reqs.add(request_id)
+                 self._partial_hit_reqs.pop(request_id, None)
+@@ -1684,6 +1763,13 @@
+                 for entry in self._pending_partial_tail_offloads
+                 if entry[0] != request_id
+             ]
++            deferred = self._deferred_state_blocks.pop(request_id, None)
++            if deferred:
++                # The caller frees the returned list in reverse order (tail
++                # blocks are evicted first), so putting the prompt-boundary
++                # state snapshots at the FRONT makes them the last blocks
++                # freed — the freshest eviction position in the pool.
++                return deferred + super().pop_blocks_for_free(request_id)
+         return super().pop_blocks_for_free(request_id)
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:

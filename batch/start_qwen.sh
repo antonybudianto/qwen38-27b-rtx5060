@@ -107,6 +107,10 @@ fi
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
 
+# REQ_METRICS=1: per-request timing fields + usage on every response (issue #51).
+# Not with --disable-log-stats (the timing fields need the engine-stats path).
+METRICS_ARGS=$([ "${REQ_METRICS:-0}" = 1 ] && echo --enable-per-request-metrics --enable-force-include-usage)
+
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
 # the tower, for a client that sends images: screenshots into a coding assistant,
@@ -185,5 +189,6 @@ exec venv/bin/vllm serve "$MODEL" \
   --compilation-config "{\"max_cudagraph_capture_size\":64,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
+  ${METRICS_ARGS} \
   ${TOOL_ARGS} \
   ${EXTRA_ARGS}

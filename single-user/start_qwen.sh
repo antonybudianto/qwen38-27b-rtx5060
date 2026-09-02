@@ -43,8 +43,10 @@
 #
 # max-num-seqs is 8 here: fewer state slots to reserve (each request holds
 # k+1 recurrent-state slots), and past a handful of concurrent users you
-# should be running batch mode anyway. Int8 activations are pointless at
-# batch size 1 (memory-bound), so this mode stays W4A16.
+# should be running batch mode anyway. Int8 activations buy nothing at
+# batch size 1 *decode* (memory-bound) — but prefill is compute-bound at any
+# concurrency, so INT8_ACT below borrows batch mode's W4A8 path for the
+# prompt-side win; see "Prefill" in ../batch/README.md.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -73,6 +75,44 @@ fi
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
 PORT=${PORT:-18020}
 MAX_SEQS=${MAX_SEQS:-}
+# INT8_ACT=int8 turns on the W4A8 Marlin path (weights stay int4, activations
+# quantized per token to int8, int8 tensor cores) for the layers INT8_LAYERS
+# selects — the same knob batch mode ships on by default. At batch size 1 it
+# does nothing for decode (memory-bound; C1 122±5 vs 121 tok/s over repeats,
+# tok/step 3.2 either way) but prefill is compute-bound at every concurrency
+# — a 4k prefill on this stack is 79% Marlin GEMM time with 15 ms of GPU idle
+# (torch profile), so the GEMM dtype is the whole game. Measured on the
+# seeded protocol (bench/run_benchmarks.sh --prefill), dflash2 k=15, PC=1:
+#
+#   prefill tok/s        1k     4k     16k    51k
+#   W4A16 (default)    1,437  1,494  1,410  1,200
+#   INT8_LAYERS=mlp    1,638  1,696  1,587  1,320   (+14/+13/+13/+10%)
+#   INT8_LAYERS=all*   1,845  1,937  1,791  1,423   (+29/+30/+27/+19%)
+#
+#   *all = "mlp|linear_attn|self_attn" — every linear except the int8-weight
+#    lm_head/embed and the MTP module. The 51k row gains least because 16
+#    full-attention layers grow quadratically (~40% of time at 51k) and FA2 at
+#    head_dim 256 has no faster sm86 alternative (FlashInfer measured within
+#    1.5%).
+#
+# Quality (bench/quality_battery.py, this stack): all-linears = GSM8K 95.0%
+# (fast-variant baseline 96.5), PPL 8.423 vs 8.095 (+4.1%, mostly prose;
+# code ~flat); mlp = the batch-mode trade (+2.2% PPL, GSM8K 95.0). IFBench
+# was flat on the batch int8 default. "mlp|linear_attn" (GDN-only middle
+# point) crashes at first forward on this torch/vllm combo — an inductor
+# codegen bug with the mixed set; use mlp or all.
+INT8_ACT=${INT8_ACT-}
+INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
+[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
+[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+# PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
+# layers during prefill (patches/triton-prefill-attn-int8.patch): 1.27-1.35x FA2 on
+# the attention itself, worth up to ~+5% end-to-end at 51k on top of INT8_ACT
+# (1,839/1,498 tok/s at 16k/51k with both on). Prefill-only; decode and the
+# split-KV verify keep their existing paths. fp16 selects the same kernel
+# without quantization (a debugging mode); empty keeps FA2.
+PREFILL_ATTN=${PREFILL_ATTN-}
+[ -n "$PREFILL_ATTN" ] && export VLLM_PREFILL_ATTN=$PREFILL_ATTN
 # 0.93 here, NOT batch mode's 0.972: the DeltaNet workspace in the MTP decode
 # path allocates beyond the startup memory profile (docs/gotchas.md, gotcha 4).
 GPU_UTIL=${GPU_UTIL:-0.93}
@@ -498,6 +538,14 @@ ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
 
+# REQ_METRICS=1: per-request timing fields in every response plus usage on
+# every request (--enable-per-request-metrics --enable-force-include-usage,
+# issue #51; llama-swap reads them). Off by default only because the timing
+# fields ride on the engine-stats path, so it cannot be paired with
+# --disable-log-stats in EXTRA_ARGS. --enable-prompt-tokens-details is always
+# on. vLLM's per-request *spec-decode* summary flag is nightly-only (not 0.27.1).
+METRICS_ARGS=$([ "${REQ_METRICS:-0}" = 1 ] && echo --enable-per-request-metrics --enable-force-include-usage)
+
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
 # the tower, for a client that sends images: screenshots into a coding assistant,
@@ -602,5 +650,6 @@ exec venv/bin/vllm serve "$MODEL" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]${CG_MODE}}" \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
+  ${METRICS_ARGS} \
   ${TOOL_ARGS} \
   ${EXTRA_ARGS}

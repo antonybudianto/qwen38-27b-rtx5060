@@ -40,8 +40,11 @@ configuration is three environment variables away:
 [If you are the only user](#if-you-are-the-only-user-do-this).
 
 Prefill is a separate budget from either: ~1,810 tok/s at 1k inputs in batch
-mode (~1,210 single-user), ~1,000 tok/s at 100k, so a 100k prompt costs ~100 s
-of TTFT ([full matrix](batch/README.md#prefill)). How each number was won:
+mode, and in single-user mode ~1,440 tok/s stock or **~1,850-1,940 with
+`INT8_ACT=int8`** (1,423 at 51k in), measured on the seeded benchmark protocol
+([full matrix](batch/README.md#prefill); older published prefill rows came
+from an unseeded harness that let the prefix cache contaminate the numbers,
+and are not comparable). How each number was won:
 [docs/optimizations.md](docs/optimizations.md).
 
 The server listens on `0.0.0.0` and is unauthenticated unless you give it a key.

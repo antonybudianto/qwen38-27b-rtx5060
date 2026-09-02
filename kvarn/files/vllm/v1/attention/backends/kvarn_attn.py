@@ -1230,6 +1230,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._is_sink_t: torch.Tensor | None = None        # [num_blocks] bool
         self._block_to_slot_t: torch.Tensor | None = None  # [num_blocks] int32
         self._block_lookup_size: int = 0
+        # (#48) An upper bound on this deployment's cache block count, taken
+        # from the config at construction (the only moment before serving when
+        # a vLLM config is in scope). _ensure_pool sizes the lookup to it at
+        # profile time, so NUM_BLOCKS_LOOKUP -- a kernel constexpr -- is the
+        # same value in the warmup variant and in serving.
+        self._lookup_upper_bound: int = self._derive_lookup_upper_bound()
 
         # Cached fp16 Hadamard for the rotate-on-store matmul in
         # do_kv_cache_update (avoids a per-call .float() cast that allocates).
@@ -1364,7 +1370,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # has its own block_id space, so the two groups must NOT share a mirror.
         gk = self._group_key
         mkey = (device, gk)
-        num_blocks = max(num_blocks_hint, cls._max_known_block_id.get(gk, 0) + 1, 1024)
+        num_blocks = max(num_blocks_hint, cls._max_known_block_id.get(gk, 0) + 1, 1024,
+                         int(getattr(self, "_lookup_upper_bound", 0)))
         existing = cls._block_to_slot_t_per_device.get(mkey)
         if existing is None or existing.shape[0] < num_blocks:
             new_b2s = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
@@ -1423,15 +1430,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                    int(getattr(self, "sliding_window", 0) or 0),
                    # (#48) both are compile-relevant: the lookup size is a
                    # constexpr and the block-table width sets a stride
-                   # specialization bucket. HONEST STATUS: the lookup table is
-                   # sized 1024 at profile time and resized to the real cache
-                   # block count by the first serving build, so the re-keyed
-                   # warmup still compiles the real packed-kv variant INSIDE
-                   # request 1 (one flagged compile, ~200 ms; the fused
-                   # kernels real variants come from graph capture and are
-                   # unaffected). Deriving the size from the pinned
-                   # kv_cache_memory config at profile time would close it;
-                   # follow-up, not done here.
+                   # specialization bucket. The lookup is sized from the
+                   # config-derived upper bound (_lookup_upper_bound) at the
+                   # first _ensure_pool, i.e. at profile time, and the serving
+                   # hint never exceeds it -- so this key does not change
+                   # between profile time and serving and the packed-kv
+                   # variant compiled here IS the serving variant.
+                   # KVARN_SPEC_DEBUG=1 logs the launch-level specialisation
+                   # facts of both launches if a box still sees a compile.
                    int(self._block_lookup_size), int(self._max_model_len))
         if dec_key not in cls._kernel_warmed:
             self._warm_decode_kernels(device)
@@ -1540,6 +1546,65 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
         self._fa_K_buf = cls._shared_fa_K_buf[bkey]
         self._fa_V_buf = cls._shared_fa_V_buf[bkey]
+    def _derive_lookup_upper_bound(self) -> int:
+        """(#48) Upper bound on the KV-cache block count of this deployment,
+        from the config alone, so the block->slot lookup can be sized ONCE at
+        profile time and its size (a kernel constexpr, NUM_BLOCKS_LOOKUP) never
+        moves afterwards. Budget: the pinned ``kv_cache_memory_bytes`` when set,
+        else the device's total memory (looser, still a bound). Per-block
+        bytes: ONE layer's tile (``num_kv_heads * tile_bytes_aligned``) -- every
+        layer of the group draws on the same pool, so "the whole budget in a
+        single layer" is >= the real count (here ~24.5k vs 6,103 real).
+        Over-sizing costs 4 B per slot and nothing in-kernel: every kernel
+        guards ``block_id < NUM_BLOCKS_LOOKUP``. ``KVARN_LOOKUP_BLOCKS`` pins it.
+        0 when no bound can be derived (unit tests): the 1024 floor applies."""
+        env = int(os.environ.get("KVARN_LOOKUP_BLOCKS", "0"))
+        if env > 0:
+            return env
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+            vcfg = get_current_vllm_config_or_none()
+            budget = None
+            if vcfg is not None:
+                budget = getattr(vcfg.cache_config, "kv_cache_memory_bytes", None)
+            if not budget:
+                budget = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()).total_memory
+            per_block = max(1, int(self.num_kv_heads)
+                            * int(self.kvarn_config.tile_bytes_aligned))
+            return int(budget) // per_block + 1
+        except Exception:
+            return 0
+
+    def _log_launch_spec(self, site: str, *args) -> None:
+        """(#48) ``KVARN_SPEC_DEBUG=1``: log what Triton specialises a
+        packed-kv launch on -- pointer 16-B alignment, integer divisibility by
+        16 / equality to 1 -- for the warmup launch and the first real launches,
+        so a warmup-vs-serving variant mismatch can be read off the log rather
+        than inferred (``--jit-monitor-verbose`` truncates the attrs)."""
+        if os.environ.get("KVARN_SPEC_DEBUG", "0") != "1":
+            return
+        cls = type(self)
+        counts = cls.__dict__.get("_spec_debug_count")
+        if counts is None:
+            counts = {}
+            setattr(cls, "_spec_debug_count", counts)
+        if counts.get(site, 0) >= 3:
+            return
+        counts[site] = counts.get(site, 0) + 1
+        parts = []
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                align = "@16" if a.data_ptr() % 16 == 0 else "@UNALIGNED"
+                parts.append(f"{str(a.dtype).replace('torch.', '')}{align}{tuple(a.shape)}")
+            elif isinstance(a, int):
+                parts.append(f"i{a}" + ("%16" if a % 16 == 0 else ("==1" if a == 1 else "")))
+            else:
+                parts.append(type(a).__name__)
+        from vllm.logger import init_logger
+        init_logger(__name__).info("kvarn packed-kv launch [%s] lookup=%d %s", site,
+                                   int(self._block_lookup_size), " ".join(parts))
+
     def _warm_decode_kernels(self, device: torch.device) -> None:
         """Compile + autotune every decode-path Triton kernel on tiny synthetic
         state (see the issue #10 note at the call site in ``_ensure_pool``).
@@ -1690,6 +1755,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)
         vp = torch.zeros_like(kp)
         cu_k = torch.arange(B + 1, dtype=torch.int32, device=device) * (n_blocks * G)
+        self._log_launch_spec(
+            "warmup", bt, sl, cu_k, b2s, cache, pool_k, pool_v, kp, vp,
+            bt.stride(0), cache.stride(0), cache.stride(1),
+            pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
+            kp.stride(0), kp.stride(1), n_blocks)
         _kvarn_build_packed_kv_kernel[(B * n_blocks, Hk)](
             bt, sl, cu_k, b2s, cache, pool_k, pool_v, kp, vp,
             bt.stride(0), cache.stride(0), cache.stride(1),
@@ -2542,6 +2612,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         K_packed = self._fa_K_buf
         V_packed = self._fa_V_buf
+        self._log_launch_spec(
+            "serve", md.block_table, seq_lens, cu_k, self._block_to_slot_t,
+            kv_cache, self._tail_K_pool, self._tail_V_pool, K_packed, V_packed,
+            md.block_table.stride(0), kv_cache.stride(0), kv_cache.stride(1),
+            self._tail_K_pool.stride(0), self._tail_K_pool.stride(1),
+            self._tail_K_pool.stride(2), K_packed.stride(0), K_packed.stride(1),
+            max_blocks)
         _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
             md.block_table, seq_lens, cu_k,
             self._block_to_slot_t,

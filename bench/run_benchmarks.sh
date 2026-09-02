@@ -17,7 +17,7 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 cd "$REPO"
-MODE=${1:-batch}; shift || true
+MODE=${1:-single}; shift || true
 DO_PREFILL=0; DO_LONG=0
 for a in "$@"; do case $a in --prefill) DO_PREFILL=1;; --long) DO_LONG=1;; esac; done
 export PATH="$REPO/venv/bin:$PATH"
@@ -56,12 +56,19 @@ try:
 except Exception: print('-')"; }
 
 echo "# $(date) mode=$MODE server=$HOST:$PORT"
-$B --dataset-name random --random-input-len 256 --random-output-len 256 --num-prompts 16 --max-concurrency 8 > $OUT/warmup.log 2>&1 \
-  || { echo "warmup run failed, aborting:"; tail -n 20 $OUT/warmup.log; exit 1; }
+# Every random-dataset call gets its own --seed. The bench default (0) hands
+# every call the SAME prompts, and with --enable-prefix-caching that turns
+# later calls into silent partial prefix-cache hits whose size depends on the
+# server's pool geometry: measured on the single-user stack, the old protocol
+# read prefill 15-20% LOW on one config and 3x HIGH on another (a 16k prefill
+# "measured" at 4.0 s that cold costs 11.2 s). Distinct seeds per call make
+# every request a cold miss; SEED_BASE pins them for reproducibility.
+SEED=${SEED_BASE:-1000}
+$B --dataset-name random --seed $((SEED+=1)) --random-input-len 256 --random-output-len 256 --num-prompts 16 --max-concurrency 8 > /dev/null 2>&1   # warmup
 
 if [ "$MODE" = "batch" ]; then
   for W in "128 512" "256 256"; do set -- $W
-    $B --dataset-name random --ignore-eos --random-input-len $1 --random-output-len $2 --num-prompts 256 --max-concurrency 64 > $OUT/batch_${1}_${2}.log 2>&1
+    $B --dataset-name random --seed $((SEED+=1)) --ignore-eos --random-input-len $1 --random-output-len $2 --num-prompts 256 --max-concurrency 64 > $OUT/batch_${1}_${2}.log 2>&1
     row "64conc $1in/$2out" $OUT/batch_${1}_${2}.log 64
   done
 fi
@@ -81,7 +88,7 @@ for T in default 0; do
 done
 if [ $DO_PREFILL = 1 ]; then
   pf() { LEN=$1; C=$2; N=$3
-    $B --dataset-name random --random-output-len 1 --random-input-len $LEN --num-prompts $N --max-concurrency $C > $OUT/prefill_${LEN}_c$C.log 2>&1
+    $B --dataset-name random --seed $((SEED+=1)) --random-output-len 1 --random-input-len $LEN --num-prompts $N --max-concurrency $C > $OUT/prefill_${LEN}_c$C.log 2>&1
     IN=$(num "Total input tokens" 4 $OUT/prefill_${LEN}_c$C.log); DUR=$(num "Benchmark duration" 4 $OUT/prefill_${LEN}_c$C.log)
     [ -n "$IN" ] || { fail "prefill len=$LEN conc=$C" $OUT/prefill_${LEN}_c$C.log; return; }
     echo "ROW prefill len=$LEN conc=$C | $(div "$IN" "$DUR" 0) tok/s | meanTTFT=$(num "Mean TTFT" 4 $OUT/prefill_${LEN}_c$C.log) ms"; }
@@ -92,9 +99,9 @@ if [ $DO_PREFILL = 1 ]; then
   pf 102400 1 2
 fi
 if [ $DO_LONG = 1 ]; then
-  $B --dataset-name random --ignore-eos --random-input-len 100000 --random-output-len 256 --num-prompts 1 --max-concurrency 1 > $OUT/long_100k.log 2>&1
+  $B --dataset-name random --seed $((SEED+=1)) --ignore-eos --random-input-len 100000 --random-output-len 256 --num-prompts 1 --max-concurrency 1 > $OUT/long_100k.log 2>&1
   echo "ROW 1x100k/256 | meanTTFT=$(num "Mean TTFT" 4 $OUT/long_100k.log) ms | TPOT=$(num "Mean TPOT" 4 $OUT/long_100k.log) ms"
-  $B --dataset-name random --ignore-eos --random-input-len 60000 --random-output-len 1024 --num-prompts 4 --max-concurrency 4 > $OUT/long_4x60k.log 2>&1
+  $B --dataset-name random --seed $((SEED+=1)) --ignore-eos --random-input-len 60000 --random-output-len 1024 --num-prompts 4 --max-concurrency 4 > $OUT/long_4x60k.log 2>&1
   echo "ROW 4x60k/1024 conc4 | e2e=$(num "Output token throughput" 5 $OUT/long_4x60k.log) tok/s | medITL=$(num "Median ITL" 4 $OUT/long_4x60k.log) ms | dur=$(num "Benchmark duration" 4 $OUT/long_4x60k.log)s"
 fi
 echo "# raw logs in $OUT"

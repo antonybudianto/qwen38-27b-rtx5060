@@ -160,7 +160,15 @@ def _kvarn_scatter_store_kernel(
 # and, on the chunked-prefill route, a fresh compile every time the value
 # crosses a %16 boundary). Opt it out of specialisation so warmup and
 # serving share ONE variant. Triton 3.7.1 accepts parameter names here.
-@triton.jit(do_not_specialize=["MAX_BLOCKS_PER_REQ"])
+# (#48, round 2) stride_bt_b too: Triton also specialises ints on
+# divisibility by 16, and the block table's row stride is its WIDTH -- the
+# warmup's cdiv(max_model_len, group) = 1920 carries the divisibility
+# attribute, the runner's real table is one column wider (1921) and does not.
+# Measured with KVARN_SPEC_DEBUG=1: that single attribute was the last
+# warmup-vs-serving variant difference after the lookup size was stabilised.
+# The stride is only ever multiplied into a row offset, so the hint buys the
+# kernel nothing.
+@triton.jit(do_not_specialize=["MAX_BLOCKS_PER_REQ", "stride_bt_b"])
 def _kvarn_build_packed_kv_kernel(
     Block_table_ptr,    # [B, max_blocks]                          int32
     Seq_lens_ptr,       # [B]                                      int32
