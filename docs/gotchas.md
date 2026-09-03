@@ -847,3 +847,38 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     else using `prompt_logprobs` on KVarN with `PREFIX_CACHE=0`, or on a
     non-MTP speculator. Ordinary generation is not implicated — needle
     retrieval and decode rates are normal on the same server.
+
+52. **`DFLASH_TOKENS=15` asserted at engine start on the int4 path, because the
+    drafter's promoted block only has to *cover* the primary page, not divide
+    it.** Filed as
+    [#63](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/63), fixed in
+    `patches/hybrid-sw-block-promote.patch`. `alternative.sh`
+    (`int4_per_token_head`) died in a bare `assert` in
+    `kv_cache_coordinator.py` at `DFLASH_TOKENS=15` — at any `MAX_LEN`, with
+    prefix caching on or off — while `DFLASH_TOKENS=7` on the identical config
+    booted.
+
+    The chain, all of it visible in the boot log:
+
+    | | `DFLASH_TOKENS=7` | `DFLASH_TOKENS=15` |
+    |---|---|---|
+    | mamba page (grows with the spec-decode state) → primary block | 1696 | **1840** |
+    | drafter's covering block (16 → smallest multiple whose page covers) | 848 | **928** |
+    | primary / drafter | exactly 2 | 1.983 |
+    | result | boots | `AssertionError` |
+
+    The scheduler's granularity is the LCM of the primary groups' blocks and
+    every group's block has to divide it. `_promote_indivisible_block_sizes`
+    only guaranteed the drafter's page *covers* the maximum, and 848 divided
+    1696 by luck. The fix rounds the promotion up to the smallest divisor of
+    the primary block instead — 928 → 1840, after which the primary layers
+    scale 1840 → 3680 through the branch they already take.
+
+    Two things worth knowing. **It is an int4-only shape**: on
+    `int8_per_token_head` (`CTX=long`) the primary block and the drafter's
+    covering block come out *equal* (864 at 7, 944 at 15), so divisibility is
+    free and both arms are byte-identical before and after the fix —
+    `CTX=long DFLASH_TOKENS=7` still pools 138,696 tokens. **The wider verify
+    block is not free on int4**: at 15 the pool is 53,908 tokens against
+    142,843 at 7, and the 256k default no longer fits (`estimated maximum
+    model length is 180320`, a clear `ValueError` rather than an assert).

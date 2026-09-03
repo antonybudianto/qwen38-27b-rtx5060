@@ -45,11 +45,25 @@ $PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer(
   || fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. pip install flashinfer-python flashinfer-cubin==0.6.13 (#35)" 
 
 echo "== vLLM patches (patches/*.patch)"
+# A later patch can rewrite the region an earlier one added -- both still apply, in
+# order, but the earlier one's lines are no longer in the tree, so neither check
+# above can see it. The later patch declares "Supersedes: <basename>" in its header;
+# that only counts if the later patch is itself applied (#67 over #57).
+superseded_by() {
+  local target="$1" q
+  for q in patches/*.patch; do
+    grep -q "^Supersedes: $target\$" "$q" || continue
+    patch -p1 -R --dry-run -s -d "$SP" < "$q" >/dev/null 2>&1 || $PY patches/_check_applied.py "$q" "$SP" 2>/dev/null || continue
+    basename "$q"; return 0
+  done
+  return 1
+}
 # The reverse dry-run is exact, but two patches touching the same file (the DFlash2 pair)
 # can no longer be reversed individually once both are applied; then look for their content.
 for p in patches/*.patch; do
   if patch -p1 -R --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then ok "$(basename $p) applied"
   elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$(basename $p) applied (content check; hunks overlap another patch)"
+  elif s=$(superseded_by "$(basename $p)"); then ok "$(basename $p) applied (superseded by $s, which is applied)"
   elif patch -p1 -N --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then fail "$(basename $p) NOT applied (patch -p1 -d $SP < $p)"
   else fail "$(basename $p) neither applied nor applicable — vLLM version mismatch?"; fi
 done
