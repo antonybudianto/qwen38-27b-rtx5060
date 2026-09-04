@@ -216,7 +216,15 @@ if [ "$SPEC" = "dflash2" ]; then
   # instead of 8 and 56k of context instead of 64k. Worth setting for a coding assistant
   # applying edits or a RAG front-end quoting sources; the default stays 7.
   DRAFT_TOKENS=${DFLASH_TOKENS:-7}
-  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS}"
+  # draft_sample_method is NOT optional here, and the default is the wrong one (#73).
+  # The 0.27.1 fork allocated the draft-logits buffer unconditionally in its own
+  # speculator; the 0.28 port inherits the upstream base class, which allocates it only
+  # when the config asks. Without it the rejection test loses its denominator -- the
+  # draft probability is pinned to 1 and acceptance is strictly stricter. Measured on the
+  # reference 3090, CTX=fast k=15: 2.66 tok/step and 101.4 tok/s unset against 3.23 and
+  # 121.7 set, with 3.19/120.5 on 0.27.1. The boot log says which you got: draft_logits.
+  # The mtp branch below has always set it.
+  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
   # The split-KV verify attention (patches/spec-decode-attn.patch) sizes its partial
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.

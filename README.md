@@ -712,7 +712,10 @@ cd ~/qwen-serving
 
 python3 -m venv venv
 venv/bin/pip install vllm==0.28.0 huggingface_hub hf_transfer ninja \
-  flashinfer-python flashinfer-cubin==0.6.13
+  flashinfer-python flashinfer-cubin==0.6.13 pandas
+# pandas is what `vllm[bench]` pulls in for the custom-dataset path: without it
+# bench/prefill_ab.sh's decode guard dies with "Please install vllm[bench] for
+# bench support" after the prefill rows have already run.
 # flashinfer makes the DFlash2 selector ~2x faster than its torch.topk fallback,
 # and vLLM only *uses* it if nvcc is on PATH or flashinfer-cubin is installed --
 # a bare `pip install flashinfer-python` silently falls back with one INFO line

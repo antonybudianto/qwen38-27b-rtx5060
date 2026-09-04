@@ -40,7 +40,9 @@ DRAFT=${DRAFT:-models/Qwen3.8-27B-DFlash2-W4A16}
 # an arm that must read 1.00). Unrecognized values refuse for the same reason.
 SPEC=${SPEC:-dflash2}
 case "$SPEC" in
-  dflash2) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":${DFLASH_TOKENS:-7}}") ;;
+  # draft_sample_method: see start_qwen.sh -- on 0.28 the draft-logits buffer is only
+  # allocated when the config asks, and without it acceptance drops ~16% (#73).
+  dflash2) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":${DFLASH_TOKENS:-7},\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}") ;;
   off|none) SPEC_ARGS=() ;;
   *) echo "SPEC=$SPEC is not a mode here: dflash2 (default) or off." >&2; exit 1 ;;
 esac
