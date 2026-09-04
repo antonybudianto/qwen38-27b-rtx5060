@@ -12,7 +12,7 @@ rare code -8 becomes -7 (one LSB) in flipped groups.
 Apply from the installed vllm package directory:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/marlin-int8-negative-scales.patch
 
-Written against vLLM 0.27.1.
+Validated against vLLM 0.28.0.
 
 --- a/model_executor/kernels/linear/mixed_precision/marlin.py
 +++ b/model_executor/kernels/linear/mixed_precision/marlin.py

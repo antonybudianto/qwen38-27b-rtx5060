@@ -1,67 +1,5 @@
-Drafter-free n-gram chains for DFlash2 (VLLM_DFLASH2_CHAIN=1, default off).
-
-While a request keeps reproducing its own context, whole verify blocks are
-proposed from its history alone — context-KV insert + suffix lookup +
-point-mass rewrite, a handful of small eager kernels — and the draft model's
-forward AND its CUDA-graph replay are skipped entirely, until the first
-rejected token ends the chain. The proposal stays lossless: every position's
-draft distribution is a point mass on the proposed token, a legal q for
-vLLM's rejection sampler; positions past the match's continuation hold token
-0 and get rejected, which is exactly the exit signal.
-
-Ported from Dmtrii-tesla/dflash2-ngram-vllm (Apache-2.0), offered for
-cherry-pick in issue #38 by its author, who independently rebuilt this
-repo's lookup lane and added this layer on top. Their three load-bearing
-design calls are preserved:
-
-  - the entry/exit state machine lives in propose(), on the host, once per
-    step -- under FULL cudagraphs any Python inside _generate_draft runs at
-    capture time only (their v1 died exactly there);
-  - the one value crossing GPU->host is a captured D2H memcpy of a
-    per-request flag into pinned memory, replayed by the graph every step,
-    read one step stale -- the same pattern the sticky/adaptive controllers
-    already use;
-  - entry evidence is the lookup's match_len (reaches nmax), not its valid
-    count (clamped to k; keying on it can never fire).
-
-Adaptations to this tree: propose() composes the chain decision ahead of
-the existing wrapper (which carries the dormant dflash3 extension
-machinery) instead of replacing the method, and _chain_generate mirrors
-this tree's current prepare_dflash_inputs signature. Constraints: single
-request in the batch, dp_size == 1, no mm inputs -- one shared decision
-per batch, like the sticky long block. While a chain is active,
-next_num_draft_tokens pins the full verify block so the tail is not
-thrown away.
-
-Envs: VLLM_DFLASH2_CHAIN (off), VLLM_DFLASH2_CHAIN_MINMATCH (8, tokens of
-longest context match required to enter), VLLM_DFLASH2_CHAIN_LOG_SEC (30,
-period of the "chain: N/M steps engaged" line; 0 silences). Requires
-VLLM_DFLASH2_LOOKUP=1; warns and disables itself otherwise. No compiled or
-captured shape depends on any of them (chain steps run eagerly), so they
-stay out of the compile-cache key by construction.
-
-Measured on this card (1x 3090 @ 250 W, CTX=fast, DFLASH_TOKENS=7,
-bench/labd_bench.py --ctx 20000 + run_benchmarks single, chain on vs off):
-
-  copy (25k ctx, greedy)   256.9 -> 274.8 tok/s (+7.0%), reproduced twice
-  six-task labd total      99.9 -> 99.2-101.4 (flat)
-  C1 chat greedy           137.6/137.9 -> 135.3 (within spread)
-  C1 chat T=default        129.7/126.6 -> 117.6 UNGATED (-8%); with the
-                           greedy-only gate chains never engage there and
-                           the cell reads 123.5, inside the sampling band
-  engage rate              ~6% of steps on the mixed suite
-  correctness              bench/verbatim.py all shapes; tool-calling round
-                           trip; scheduler sees a legal q every step
-
-Why the temperature gate: a point-mass q accepts with probability p(token),
-so under sampling the chain's context copy displaces the drafter's
-distribution-aware proposals on exactly the steps it wins under greedy.
-Greedy requests keep the whole win; sampled requests keep the drafter.
-
-Off-state: pool byte-identical (68,605 tokens), bench within run-to-run
-spread of the pre-port baseline.
-
---- generated hunks below ---
+diff --git a/v1/worker/gpu/spec_decode/dflash2/speculator.py b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 9d299de5a..1371aab30 100644
 --- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
 +++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
 @@ -2,6 +2,7 @@
@@ -72,10 +10,10 @@ spread of the pre-port baseline.
  from typing import Any
  
  import torch
-@@ -11,7 +12,10 @@
- from vllm.config.compilation import CUDAGraphMode
- from vllm.triton_utils import tl, tldevice, triton
- from vllm.v1.worker.gpu.sample.gumbel import tl_rand32, tl_rand64
+@@ -11,7 +12,10 @@ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 -from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 +from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
 +    DFlashSpeculator,
@@ -84,7 +22,7 @@ spread of the pre-port baseline.
  
  logger = init_logger(__name__)
  from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
-@@ -277,6 +281,54 @@
+@@ -255,6 +259,54 @@ class DFlash2Speculator(DFlashSpeculator):
          self._lookup_sticky = int(os.environ.get("VLLM_DFLASH2_LOOKUP_STICKY", "3"))
          self._sticky = 0
  
@@ -139,7 +77,7 @@ spread of the pre-port baseline.
          if self._lookup:
              logger.info(
                  "DFlash2 lookup-augmented drafting on (k=%d nmin=%d nmax=%d nstrong=%d "
-@@ -299,6 +351,11 @@
+@@ -277,6 +329,11 @@ class DFlash2Speculator(DFlashSpeculator):
          unanimity across the batch. Below CHEAP_CTX tokens of context an extra verify
          position is nearly free (+6% per step at 1.5k against +27% at 25k), so there the
          flag alone is enough."""
@@ -151,7 +89,7 @@ spread of the pre-port baseline.
          if not self._adaptive:
              return None
          emitted = getattr(self, "last_num_emitted", None)
-@@ -336,6 +393,249 @@
+@@ -314,6 +371,251 @@ class DFlash2Speculator(DFlashSpeculator):
          self._prev_want = want
          return self.num_speculative_steps if long_block else self.draft_block
  
@@ -379,7 +317,9 @@ spread of the pre-port baseline.
 +        self._lookup_use[:num_reqs].fill_(1)
 +        self.draft_tokens[:num_reqs].copy_(tokens)
 +        draft_logits = self.draft_logits
-+        assert draft_logits is not None
++        if draft_logits is None:
++            # Greedy rejection sampling does not consume a proposal distribution.
++            return self.draft_tokens[:num_reqs]
 +        block_k = triton.next_power_of_2(self.selector_top_k)
 +        _point_mass_draft_logits_kernel[(num_reqs * k,)](
 +            draft_logits,
@@ -401,7 +341,7 @@ spread of the pre-port baseline.
      def set_req_states(self, req_states) -> None:
          """The token history the lookup matches against (set by the model runner)."""
          self._req_states = req_states
-@@ -343,6 +643,10 @@
+@@ -326,6 +628,10 @@ class DFlash2Speculator(DFlashSpeculator):
      def set_sampling_states(self, sampling_states) -> None:
          self._req_top_p = sampling_states.top_p.gpu
          self._req_top_k = sampling_states.top_k.gpu
@@ -412,7 +352,7 @@ spread of the pre-port baseline.
  
      def _sample_path(
          self,
-@@ -490,3 +794,16 @@
+@@ -479,3 +785,16 @@ class DFlash2Speculator(DFlashSpeculator):
              BLOCK_K=block_k,
              num_warps=1,
          )

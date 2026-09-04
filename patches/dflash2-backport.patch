@@ -1,3 +1,6 @@
+RETIRED on vLLM 0.28.0: DFlash2 is native in this release. Kept as the
+historical v0.27.1 backport for reference; do not apply it to the current stack.
+
 DFlash2 speculative decoding on vLLM 0.27.1 (single-user SPEC=dflash2).
 
 Backport of vLLM PR #52816 ("[Spec Decode] DFlash2: local convolution + candidate

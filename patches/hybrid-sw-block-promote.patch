@@ -62,7 +62,7 @@ DFLASH_TOKENS=15 is untouched: 228,296 tokens, same as before.
 Apply from the repo root, after hybrid-kv-groups-v2-cudagraph.patch:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/hybrid-sw-block-promote.patch
 
-Written against vLLM 0.27.1. Reapply after upgrades.
+Validated against vLLM 0.28.0. Reapply after upgrades.
 
 --- a/v1/core/kv_cache_utils.py
 +++ b/v1/core/kv_cache_utils.py

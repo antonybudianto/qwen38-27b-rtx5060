@@ -14,7 +14,7 @@ way past that is a smaller cache, not a different engine, and
 know of: Hadamard rotation + iterative variance normalization + 4-bit keys /
 2-bit values per 128-token tile, at ~840 B/token/layer here. It ships as a
 fork of vLLM 0.23; [kvarn/](../kvarn/) is our port of its dense backend onto the
-0.27.1 this repo runs (`bash kvarn/install.sh`, then `KV=kvarn` in batch mode
+0.28.0 this repo runs (`bash kvarn/install.sh`, then `KV=kvarn` in batch mode
 or `CTX=huge` in single-user mode).
 
 Measured on the 3090 (`--kv-cache-dtype kvarn_k4v2_g128 --block-size 128`,
@@ -73,7 +73,7 @@ set `KV=kvarn` (batch) or `CTX=huge` (single-user); the KV-cache format is an
 engine-level choice in vLLM, so it can't be switched per request. Port notes and what
 to watch when bumping vLLM are in [kvarn/README.md](../kvarn/README.md).
 
-(vLLM 0.27.1 also has TurboQuant built in — `--kv-cache-dtype turboquant_4bit_nc`
+(vLLM 0.28.0 also has TurboQuant built in — `--kv-cache-dtype turboquant_4bit_nc`
 gives a similar 413k-token pool here and about 15% slower decode, but its
 chunked-prefill path allocates O(context) scratch outside the memory profile
 and OOMs at 32k+ prompts on this card at 0.972 utilization, and at 128k even
@@ -81,7 +81,7 @@ at 0.90. KVarN's prefill path is bounded and did 240k.)
 
 ### The built-in per-token-head modes
 
-vLLM 0.27.1 also ships `int8_per_token_head`, `fp8_per_token_head` and
+vLLM 0.28.0 also ships `int8_per_token_head`, `fp8_per_token_head` and
 `int4_per_token_head` (dynamic per-token, per-head scales; the int4 one with a
 rotation and asymmetric zero-points), all only in the Triton attention
 backend. Measured on the 3090 in the batch config at 0.93 utilization, same

@@ -83,10 +83,9 @@ index 40b57ac..0a3471b 100644
  
  
  def _new_descriptor_buffers(
-@@ -492,6 +557,9 @@ class CPUOffloadingWorker(OffloadingWorker):
- 
-             if mmap_region is not None:
-                 cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
+@@ -786,5 +786,8 @@ class CPUOffloadingWorker(OffloadingWorker):
+            elif mmap_region is not None:
+                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)
 +                # (fix 2026-08-28) ride the device-VA delta with the view
 +                cpu_tensor._offload_ptr_delta = (
 +                    getattr(mmap_region, "device_delta", 0) or 0)

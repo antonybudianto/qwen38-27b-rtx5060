@@ -15,6 +15,9 @@ Realistic chat prompts (8 mixed English/Danish/code tasks in
 [bench/prompts_real.jsonl](../bench/prompts_real.jsonl), 1,024-token answers),
 `vllm bench serve --dataset-name custom`, RTX 3090 at 250 W:
 
+> These are vLLM 0.27.1 baseline measurements. Re-benchmark on a GPU after the
+> v0.28.0 upgrade before using the figures for capacity planning.
+
 **`CTX=fast` + fast variant (the default; 64k context)**, as reproduced by
 `bash bench/run_benchmarks.sh single`:
 
@@ -77,7 +80,8 @@ per step, which is the stable signal.
 is a 5-layer block drafter that predicts 7 tokens in one non-autoregressive
 pass from the target's layer 5/19/33/47/61 hidden states, plus a path selector
 over 16 candidates per slot. It runs on vLLM's V2 model runner through
-`patches/dflash2-backport.patch` (vLLM PR #52816 backported to 0.27.1) with the
+vLLM 0.28.0's native DFlash2 support plus
+`patches/dflash2-lookup-drafting.patch` and `patches/dflash2-ngram-chains.patch` with the
 drafter requantized to W4A16 by this repo (1.19 GB instead of 3.85 GB —
 `drafter/README.md`): per step it reads ~1 GB of drafter plus an 8-token verify,
 26.5 ms vs MTP's 24.8, and accepts 3.2-3.4 tokens per step at default sampling
@@ -296,7 +300,7 @@ attempt that did not help).
 
 k=4 is the fastest but not the default: on the FlashInfer attention backend
 (the only one that supports fp8 KV on Ampere, and fp8 KV is what makes 150k
-context fit) vLLM 0.27.1 dies with an illegal memory access as soon as one
+context fit) the vLLM 0.28.0 FlashInfer path dies with an illegal memory access as soon as one
 request finishes while another is mid-generation with 4 drafts (with or
 without our patches; the vendored PR #50021 bounds fix does not cure it;
 club-3090 sees the same "n=4 eventually dies, n=3 stable" on their rigs, and

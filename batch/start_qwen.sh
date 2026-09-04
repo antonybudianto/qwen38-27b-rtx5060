@@ -102,7 +102,7 @@ fi
 # which reads as the model being bad at tools rather than as a misconfigured server.
 # The name is the call format, not the checkpoint -- nothing here is Qwen3-Coder.
 # qwen3_coder, qwen3_xml and mimo are three names for one Qwen3EngineToolParser in
-# 0.27.1, which is the tool-side adapter of the same parser engine that
+# 0.28.0, which is the tool-side adapter of the same parser engine that
 # --reasoning-parser qwen3 already uses (vllm/parser/qwen3.py).
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 # Array, not $( [ ] && echo ): exits 1 when TOOLS is off (the shape #59 fixed)

@@ -1,0 +1,28 @@
+diff --git a/v1/worker/gpu/spec_decode/dflash/speculator.py b/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 1bd78be21..0556bcbb4 100644
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -362,7 +362,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # sampling slots it was given (bonus + drafts), num_rejected how many of those were
+         # thrown away, so the difference is the tokens it emitted. dflash2/lookup.py decides
+         # the next block length from it.
+-        self.last_num_emitted = (num_sampled - num_rejected) if num_sampled is not None else None
++        self.last_num_emitted = num_sampled if num_sampled is not None else None
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+diff --git a/v1/worker/gpu/spec_decode/dflash2/speculator.py b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 1371aab30..ac0d41df0 100644
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -516,9 +516,7 @@ class DFlash2Speculator(DFlashSpeculator):
+         self.draft_max_seq_len = min(
+             max_seq_len + self.num_query_per_req, self.max_model_len
+         )
+-        self.last_num_emitted = (
+-            (num_sampled - num_rejected) if num_sampled is not None else None
+-        )
++        self.last_num_emitted = num_sampled if num_sampled is not None else None
+ 
+         if aux_hidden_states:
+             hidden_states = self.model.combine_hidden_states(

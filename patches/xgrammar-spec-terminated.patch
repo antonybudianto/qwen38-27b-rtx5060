@@ -6,7 +6,7 @@ xgrammar matcher terminates: the matcher completes at the grammar's own end (a
 tool call's closing tag, a JSON schema's final brace, or the stop token), and
 the same step's remaining accepted tokens -- a newline after </tool_call>, the
 stop token itself, anything after it under ignore_eos -- arrive at
-accept_tokens() anyway. 0.27.1 treats both arrivals as failure:
+accept_tokens() anyway. The v0.28.0 base treats both arrivals as failure:
 
   - a post-termination token inside one call fails matcher.accept_token()
     ("Failed to advance FSM ... Please file an issue", plus xgrammar's

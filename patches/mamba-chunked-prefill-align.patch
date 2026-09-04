@@ -1,0 +1,57 @@
+Fix state loss and NaN generation during chunked prefill in Mamba/GDN models:
+
+1. v1/worker/mamba_utils.py: In `preprocess_mamba_align_fused_kernel`, `src_col` was
+   always stored as the previous state column. During fresh prefill and when the
+   state column is unchanged, that asks the pre-copy kernel to copy an invalid or
+   already-current state; during chunked prefill continuation, crossing a Mamba
+   block boundary must instead copy the state from `state_idx` to `new_state_idx`.
+   Fixed to: `src_col = tl.where((num_computed == 0) | (state_idx < 0) | (state_idx == new_state_idx), -1, state_idx)`
+
+2. third_party/flash_linear_attention/ops/chunk_o.py: Compute `m_t` before the `USE_G` path
+   and mask `b_g` with it before evaluating `tl.exp(b_g)` and
+   `tl.exp(b_g[:, None] - b_g[None, :])`, preventing uninitialized memory in partial boundary
+   chunks from evaluating to NaNs in Triton.
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/mamba-chunked-prefill-align.patch
+
+diff --git a/third_party/flash_linear_attention/ops/chunk_o.py b/third_party/flash_linear_attention/ops/chunk_o.py
+--- a/third_party/flash_linear_attention/ops/chunk_o.py
++++ b/third_party/flash_linear_attention/ops/chunk_o.py
+@@ -112,15 +112,16 @@
+         # [BT, BK] @ [BK, BT] -> [BT, BT]
+         b_A += tl.dot(b_q, b_k)
+ 
++    o_t = i_t * BT + tl.arange(0, BT)
++    m_t = o_t < T
+     if USE_G:
+         g += bos * H + i_h
+         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+         b_g = tl.load(p_g, boundary_check=(0,))
++        b_g = tl.where(m_t, b_g, 0.0)
+         b_o = b_o * exp(b_g)[:, None]
+         b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+ 
+-    o_t = i_t * BT + tl.arange(0, BT)
+-    m_t = o_t < T
+     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
+     b_A = tl.where(m_A, b_A, 0)
+ 
+diff --git a/v1/worker/mamba_utils.py b/v1/worker/mamba_utils.py
+--- a/v1/worker/mamba_utils.py
++++ b/v1/worker/mamba_utils.py
+@@ -419,10 +419,10 @@
+-    src_off = tl.maximum(num_accepted - 1, 0)
+-    tl.store(src_col_ptr + req_indices, state_idx, mask=mask)
+-    tl.store(src_off_ptr + req_indices, src_off, mask=mask)
+-
+     num_computed = tl.load(num_computed_tokens_ptr + req_indices, mask=mask, other=0)
+     query_start = tl.load(query_start_loc_ptr + offsets, mask=mask, other=0)
+     query_end = tl.load(query_start_loc_ptr + offsets + 1, mask=mask, other=0)
+     computed_after = num_computed + query_end - query_start
+     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
++    src_off = tl.maximum(num_accepted - 1, 0)
++    src_col = tl.where((num_computed == 0) | (state_idx < 0) | (state_idx == new_state_idx), -1, state_idx)
++    tl.store(src_col_ptr + req_indices, src_col, mask=mask)
++    tl.store(src_off_ptr + req_indices, src_off, mask=mask)
+     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)

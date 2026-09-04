@@ -1,5 +1,5 @@
 Sort-free top-k/top-p for small k, multi-block row softmax, and top-k/top-p
-truncated drafts (vLLM 0.27.1).
+truncated drafts (vLLM 0.28.0).
 
 Three sampler costs that dominate a single-user speculative-decode step at the
 model's default sampling (temperature 1.0, top-p 0.95, top-k 20):

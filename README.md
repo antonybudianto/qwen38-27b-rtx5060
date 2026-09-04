@@ -28,7 +28,16 @@ docker compose --profile batch  up -d    # API backend, many concurrent requests
 | aggregate, 64 concurrent (128 in / 512 out) | **~1,035 tok/s** steady-state decode, 948 end-to-end (~1,222 / 1,042 with all layers int8) | n/a (8 slots) |
 | single-stream (C1) decode rate, realistic prompts | 46 tok/s | MTP: **121** tok/s at default sampling, **120** greedy (`CTX=fast`, 64k; 96 / 102 with `CTX=long`, 150k). DFlash2 (`SPEC=dflash2`): **127** default, **130** greedy |
 | reproducing its own context (quoting a document, applying an edit) | 46 tok/s | **381 tok/s** at 25k context — 15.0 tokens per verify step, drafted straight from the prompt (`SPEC=dflash2` + `DFLASH_TOKENS=15`) |
-| trick | 16-bit recurrent state + int8 tensor-core GEMMs | MTP speculation with 4 cheap drafts, a draft vocabulary that covers what the model says, calibrated int4 lm_head/drafter, split-KV verify attention; optionally DFlash2 (7 drafts in one pass, int4-requantized, vLLM PR #52816 backported) with a verify block the context fills |
+| trick | 16-bit recurrent state + int8 tensor-core GEMMs | MTP speculation with 4 cheap drafts, a draft vocabulary that covers what the model says, calibrated int4 lm_head/drafter, split-KV verify attention; optionally native vLLM 0.28.0 DFlash2 (7 drafts in one pass, int4-requantized) with a verify block the context fills |
+<sub>Single-stream numbers re-measured 2026-08-22 on current main with
+`bash bench/run_benchmarks.sh single` — `vllm bench serve`, the 8 prompts in
+`bench/prompts_real.jsonl`, 1024 output tokens, C1, decode rate taken as
+`C / mean TPOT`. Quote them against that harness: a client with a different output
+length is not measuring the same thing, and mixing the two is how
+[#3](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/3) got confusing.</sub>
+
+> Version note: this branch pins vLLM 0.28.0; the throughput and quality tables are
+> retained as reference baselines while the v0.28.0 GPU matrix is being re-measured.
 
 Both modes share one install — the mode is just which launch script you run.
 Speculation wins below ~8 concurrent users on short prompts, plain batching above;
@@ -148,14 +157,14 @@ Every other knob: [single-user/](single-user/).
 ### DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 
 ```bash
-bash kvarn/install.sh                # applies kvarn-v2-runner.patch as its second stage
+bash kvarn/install.sh                # applies the v0.28.0 KVarN + V2-runner ports
 SPEC=dflash2 CTX=huge PREFIX_CACHE=1 bash single-user/start_qwen.sh
 ```
 
 Where `CTX=long` doubles the DFlash2 pool with int8 KV (138k), the KVarN cache
 takes the same idea further: 268k tokens of pool at 245760 max-model-len, on the
 same pinned budget. No kernel work — the KVarN Triton kernels run unmodified on
-the V2 runner; the seven fixes in `kvarn/kvarn-v2-runner.patch` are allocator and
+the V2 runner; the seven fixes in `kvarn/kvarn-v2-runner-0.28.0.patch` are allocator and
 geometry logic (the patch header walks through them, including an upstream vLLM
 bug in the mamba align resume path, and a NaN path in the DFlash2 candidate
 selector that KVarN noise exposes on verbatim-reproduction content). Two
@@ -666,7 +675,7 @@ prefix-cache hits, so single runs carry ±3-5% on tokens/step —
 `bench/run_benchmarks.sh single` reproduces 111.1 / 120.0 tok/s decode at C1,
 the best repeats read 119 / 124.)
 Going deeper (k=5) loses again: 106 / 105. k=4 is the knee, but on vLLM
-0.27.1's FlashInfer backend (needed for fp8 KV, i.e. for 150k context) four
+0.28.0's FlashInfer backend (needed for fp8 KV, i.e. for 150k context) four
 drafts crash the engine with an illegal memory access as soon as one request
 finishes while another is mid-generation — club-3090 reports the same "n=4
 eventually dies, n=3 stable" pattern — so `CTX=long` drafts 3 and gives up
@@ -702,7 +711,7 @@ git clone https://github.com/syv-ai/qwen38-27b-rtx3090 ~/qwen-serving
 cd ~/qwen-serving
 
 python3 -m venv venv
-venv/bin/pip install vllm huggingface_hub hf_transfer ninja \
+venv/bin/pip install vllm==0.28.0 huggingface_hub hf_transfer ninja \
   flashinfer-python flashinfer-cubin==0.6.13
 # flashinfer makes the DFlash2 selector ~2x faster than its torch.topk fallback,
 # and vLLM only *uses* it if nvcc is on PATH or flashinfer-cubin is installed --
@@ -735,9 +744,12 @@ venv/bin/python prepare/fetch_dflash2.py
 venv/bin/python prepare/fetch_thirdparty.py
 venv/bin/python prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
 
-# patch vllm (all written against 0.27.1; reapply after upgrades)
+# patch vllm (all compatible patches are written against 0.28.0; reapply after upgrades)
 for p in patches/*.patch; do
-  patch -p1 -d venv/lib/python3.12/site-packages/vllm < $p
+  case "$p" in
+    patches/dflash2-backport.patch) echo "skip $p (DFlash2 is native in vLLM 0.28.0)"; continue ;;
+  esac
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < "$p"
 done
 # optional: the KVarN 4/2-bit KV cache for 262k context (docs/long-context.md)
 bash kvarn/install.sh
@@ -747,7 +759,7 @@ openssl rand -hex 24 > api_key.txt
 ```
 
 Then `bash verify.sh --no-server` — it checks the venv and vLLM version, that
-every patch in `patches/` is actually applied, and that the model has been
+every compatible patch in `patches/` is actually applied, and that the model has been
 requantized (lm_head, embeddings, MTP module, draft head). Then pick a mode
 and follow its README:
 

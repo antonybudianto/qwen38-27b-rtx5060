@@ -1,0 +1,28 @@
+name: patch integrity
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  git-apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check repository
+        uses: actions/checkout@v4
+
+      - name: Check pinned vLLM source
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: v0.28.0
+          path: .ci/vllm
+          fetch-depth: 1
+
+      - name: Validate patch series with git apply
+        run: bash patches/check_vllm_series.sh .ci/vllm/vllm

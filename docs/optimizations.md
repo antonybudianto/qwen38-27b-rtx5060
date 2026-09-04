@@ -208,15 +208,14 @@ plus a selector that walks a coherent path through 16 candidates per slot. On
 the bf16 model it reports 4.80 tokens per step vs 4.28 for MTP at the same block
 size. What it took to make it pay on a 24 GB card, in order:
 
-1. **Backport.** vLLM's support is [PR #52816](https://github.com/vllm-project/vllm/pull/52816)
-   on main, on the V2 model runner. `patches/dflash2-backport.patch` carries it to
-   0.27.1 plus the pieces of main it silently relies on (sentinel `-1` sample
-   rows, sliding-window null-block guards, K draft slots, NaN guards) and one
-   semantic fix: 0.27.1 caches temperature-*applied* draft logits, main caches
-   raw ones, and the PR's selector cached raw scores — on 0.27.1 that would have
-   verified against the wrong q for 0 < T ≠ 1. The draft also shares the target's
-   *quantized* lm_head (upstream refuses), and the V2 sampler now takes our
-   sort-free small-k top-k/top-p path. MTP mode is untouched (re-measured:
+1. **Native support plus the repo port.** vLLM's support is [PR #52816](https://github.com/vllm-project/vllm/pull/52816)
+   and is native in v0.28.0 on the V2 model runner. The old
+   `patches/dflash2-backport.patch` is retired on this tag; v0.28.0's native
+   implementation is layered with `patches/dflash2-lookup-drafting.patch` and
+   `patches/dflash2-ngram-chains.patch`, which carry the quantized candidate
+   head, context lookup, and drafter-free chain extensions. The DFlash2 port
+   also shares the target's *quantized* lm_head (upstream refuses), and the V2
+   sampler now takes our sort-free small-k top-k/top-p path. MTP mode is untouched (re-measured:
    110.7 / 113.4 tok/s, 73,777-token pool).
 2. **The drafter itself is 1.92B parameters, 3.85 GB in bf16** — read once per
    step, that is +5 ms on a 3090 and no gain (106 / 112 tok/s, measured), and it

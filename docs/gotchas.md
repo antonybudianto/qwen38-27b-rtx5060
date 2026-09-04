@@ -172,7 +172,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     padded to `num_speculative_tokens` and a worker asking for fewer is ignored, silently.
     Adaptive block length (`LOOKUP=1` with `DFLASH_TOKENS > 7`) needs `ASYNC_SCHED=0`; at
     batch 1 that costs under 1%.
-22. **`--async-scheduling` is already the default in 0.27.1.** The flag exists and passing it
+22. **`--async-scheduling` is already the default in 0.28.0.** The flag exists and passing it
     changes nothing; `--no-async-scheduling` is what turns it off. Two hours of "the adaptive
     block isn't working" was this.
 23. **A longer verify block costs KV pool per request slot, not per token.**
@@ -540,7 +540,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     fixed by `patches/xgrammar-spec-terminated.patch`). A speculative verify window
     can legally accept tokens past the point where the xgrammar matcher terminates —
     the newline after a closing `</tool_call>` tag, the stop token itself, anything
-    after it under `ignore_eos`. 0.27.1 treats both arrivals as failure, the
+    after it under `ignore_eos`. The v0.28.0 base treats both arrivals as failure, the
     scheduler logs `Unexpected: grammar rejected tokens ... Terminating request`,
     and the client gets an HTTP error for a request whose output was completely
     valid. The longer the verify block, the more reliably the window covers the
