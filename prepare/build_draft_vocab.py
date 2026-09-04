@@ -104,16 +104,21 @@ print(f"draft head: packed {tuple(sub_p.shape)} {sub_p.dtype}, scales {tuple(sub
       f"{(sub_p.numel()*4 + sub_s.numel()*2)/1e6:.0f} MB")
 
 extra = "model_extra_tensors.safetensors"
+# The three quant_*.py scripts leave the base model's extras in this file; a
+# single-shard export processed by prepare/quant_heads_stream.py has no extras
+# file at all (#37) -- the draft head becomes its first content.
 tensors = {}
-with safe_open(d + extra, framework="pt") as f:
-    meta = f.metadata()
-    for k in f.keys():
-        tensors[k] = f.get_tensor(k)
+meta = None
+if os.path.exists(d + extra):
+    with safe_open(d + extra, framework="pt") as f:
+        meta = f.metadata()
+        for k in f.keys():
+            tensors[k] = f.get_tensor(k)
+    if not os.path.exists(d + extra + ".bak-draft"):
+        shutil.copy(d + extra, d + extra + ".bak-draft")
 tensors["mtp.draft_lm_head.weight_packed"] = sub_p
 tensors["mtp.draft_lm_head.weight_scale"] = sub_s
 tensors["mtp.draft_lm_head.weight_shape"] = sub_shape
-if not os.path.exists(d + extra + ".bak-draft"):
-    shutil.copy(d + extra, d + extra + ".bak-draft")
 save_file(tensors, d + extra, metadata=meta or {"format": "pt"})
 for s in ("weight_packed", "weight_scale", "weight_shape"):
     wm[f"mtp.draft_lm_head.{s}"] = extra

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Check that this repo is installed the way the README numbers assume:
-# venv + vLLM version, every patch applied, the model requantized (lm_head,
+# venv + vLLM version, every compatible patch applied, the model requantized (lm_head,
 # embed_tokens, MTP module, draft head), keys/files present, and — if a
 # server is running — that it answers and which backend/pool it came up with.
 #
@@ -24,7 +24,7 @@ PY=${PY:-$HERE/venv/bin/python}
 echo "== environment"
 [ -x "$PY" ] && ok "python: $PY" || { fail "no $PY (see README Setup)"; exit 1; }
 VER=$($PY -c "import vllm; print(vllm.__version__)" 2>/dev/null | tail -n1)
-[ "$VER" = "0.27.1" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.27.1)"
+[ "$VER" = "0.28.0" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.28.0)"
 SP=$($PY -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] && ok "vllm package at $SP" || { fail "cannot import vllm with $PY"; exit 1; }
 if [ $INSTALL = 0 ]; then
@@ -35,14 +35,39 @@ print(f"  PASS  GPU: {p.name}, {p.total_memory/2**30:.1f} GiB, sm{p.major}{p.min
 EOF
 command -v nvidia-smi >/dev/null && { PL=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1); ok "power limit ${PL} W (README numbers are at 250 W)"; }
 fi
-for t in triton flashinfer compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
+for t in triton compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
+# a bare `import flashinfer` passes while vLLM still falls back to torch.topk:
+# has_flashinfer() additionally wants nvcc on PATH or the flashinfer-cubin
+# package (#35). Test what the server will actually use.
+export FLASHINFER_DISABLE_VERSION_CHECK=1  # cubin publishes 0.6.13 vs python 0.6.16.post3; the launchers export this too
+$PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
+  && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
+  || fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. pip install flashinfer-python flashinfer-cubin==0.6.13 (#35)" 
 
 echo "== vLLM patches (patches/*.patch)"
+# A later patch can rewrite the region an earlier one added -- both still apply, in
+# order, but the earlier one's lines are no longer in the tree, so neither check
+# above can see it. The later patch declares "Supersedes: <basename>" in its header;
+# that only counts if the later patch is itself applied (#67 over #57).
+superseded_by() {
+  local target="$1" q
+  for q in patches/*.patch; do
+    grep -q "^Supersedes: $target\$" "$q" || continue
+    patch -p1 -R --dry-run -s -d "$SP" < "$q" >/dev/null 2>&1 || $PY patches/_check_applied.py "$q" "$SP" 2>/dev/null || continue
+    basename "$q"; return 0
+  done
+  return 1
+}
 # The reverse dry-run is exact, but two patches touching the same file (the DFlash2 pair)
 # can no longer be reversed individually once both are applied; then look for their content.
 for p in patches/*.patch; do
+  if [ "$(basename "$p")" = "dflash2-backport.patch" ]; then
+    ok "dflash2-backport.patch retired (DFlash2 is native in vLLM 0.28.0)"
+    continue
+  fi
   if patch -p1 -R --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then ok "$(basename $p) applied"
   elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$(basename $p) applied (content check; hunks overlap another patch)"
+  elif s=$(superseded_by "$(basename $p)"); then ok "$(basename $p) applied (superseded by $s, which is applied)"
   elif patch -p1 -N --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then fail "$(basename $p) NOT applied (patch -p1 -d $SP < $p)"
   else fail "$(basename $p) neither applied nor applicable — vLLM version mismatch?"; fi
 done
@@ -50,12 +75,12 @@ grep -q "VLLM_MARLIN_INT8_INCLUDE_RE" "$SP/envs.py" 2>/dev/null && ok "int8 laye
 
 echo "== KVarN (optional, kvarn/)"
 if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
-  if patch -p1 -R --dry-run -s -d "$SP" < kvarn/kvarn-0.27.1.patch >/dev/null 2>&1; then
+  if patch -p1 -R --dry-run -s -d "$SP" < kvarn/kvarn-0.28.0.patch >/dev/null 2>&1; then
     $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null && ok "KVarN backend importable, patch applied (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
-  else fail "KVarN modules present but kvarn-0.27.1.patch not applied (bash kvarn/install.sh)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner.patch "$SP" >/dev/null 2>&1; then
-    ok "kvarn-v2-runner.patch applied (SPEC=dflash2 + CTX=huge available)"
-  else warn "kvarn-v2-runner.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
+  else fail "KVarN modules present but kvarn-0.28.0.patch not applied (bash kvarn/install.sh)"; fi
+  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.28.0.patch "$SP" >/dev/null 2>&1; then
+    ok "kvarn-v2-runner-0.28.0.patch applied (SPEC=dflash2 + CTX=huge available)"
+  else warn "kvarn-v2-runner-0.28.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
 if [ $INSTALL = 0 ]; then
@@ -127,7 +152,7 @@ fi
 echo "== single-user DFlash2 drafter (optional, SPEC=dflash2)"
 if [ -f "$HERE/models/Qwen3.8-27B-DFlash2-W4A16/config.json" ]; then
   $PY -c "import json,sys; c=json.load(open('$HERE/models/Qwen3.8-27B-DFlash2-W4A16/config.json')); assert c['architectures']==['DFlash2DraftModel'] and c['quantization_config']['quant_method']=='compressed-tensors'" 2>/dev/null && ok "DFlash2 drafter present, W4A16 (models/Qwen3.8-27B-DFlash2-W4A16)" || fail "models/Qwen3.8-27B-DFlash2-W4A16 is not a quantized DFlash2DraftModel checkpoint"
-  [ -f "$SP/model_executor/models/qwen3_dflash2.py" ] || fail "DFlash2 drafter present but patches/dflash2-backport.patch not applied"
+  [ -f "$SP/model_executor/models/qwen3_dflash2.py" ] || fail "DFlash2 drafter present but vLLM 0.28.0 native DFlash2 support is missing"
 elif [ -f "$HERE/models/Qwen3.8-27B-DFlash2/config.json" ]; then warn "only the bf16 DFlash2 drafter is present (3.85 GB; venv/bin/python prepare/fetch_dflash2.py for the 1 GB W4A16 one)"
 else warn "no DFlash2 drafter (venv/bin/python prepare/fetch_dflash2.py; SPEC=dflash2 single-user mode needs it)"; fi
 

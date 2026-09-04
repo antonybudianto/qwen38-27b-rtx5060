@@ -1,0 +1,98 @@
+Route marlin_gemm through the locally built tunable Marlin extension.
+
+VLLM_MARLIN_TUNE=1 loads ~/marlin-tune/src (the standalone build of this same
+vLLM 0.27.1 Marlin source with a runtime (size_n, size_k, key, m_max) -> tile
+config table resolved inside marlin_mm) and routes ops.marlin_gemm through it.
+CUDA graphs and torch.compile see a single custom op either way — the load is
+EAGER at import because an import/set_table inside the wrapper would land
+inside dynamo tracing and graph-break the boot.
+
+Two row families share the table (marlin_best.py):
+  - fp16-activation decode rows (m_max<=16): the M<=8/16 verify GEMMs,
+    +3-7% per GEMM on sm86.
+  - int8-activation prefill rows, keyed 100+weight_bits and only consulted at
+    M>=1024 (the C++ lookup maps a_bits==8 onto that key), so decode GEMMs can
+    never match them: chunked-prefill W4A8 GEMMs at M=2048, where stock's tile
+    heuristic leaves 2-20% per GEMM on the table (gate_up: >+20%).
+
+The fake-tensor impl mirrors stock's dtype rule (int8/fp8 activations produce
+scale-dtype output), without which torch.compile traces the wrong dtype on the
+W4A8 path.
+
+No-op without the extension: a failed import logs and falls back to stock.
+Build the extension per ~/marlin-tune/src/build.sh (CUDA 13 pip toolchain);
+install its path as a .pth in the venv (echo .../marlin-tune/src > site-packages/marlin_tune.pth).
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/marlin-tune-table.patch
+
+Written against vLLM 0.27.1.
+
+--- a/_custom_ops.py
++++ b/_custom_ops.py
+@@ -1197,6 +1197,53 @@
+     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
+ 
+ 
++import os as _os
++
++_MARLIN_TUNE_ENABLED = _os.environ.get("VLLM_MARLIN_TUNE", "0") == "1"
++_MARLIN_TUNE_OP = None
++
++
++def _load_marlin_tune():
++    """RTX 3090 (sm86) tile table for the M<=16 decode/verify GEMMs: the same 0.27.1
++    marlin source built standalone (~/marlin-tune/src) with a (size_n, size_k,
++    num_bits, m_max) -> config table resolved inside marlin_mm, so CUDA graphs and
++    torch.compile see one op and no Python branches on size_m. Shapes without a
++    table row run the stock heuristics of the same source. VLLM_MARLIN_TUNE=1
++    turns it on; regenerate with bench_marlin.py --grid on an idle GPU."""
++    global _MARLIN_TUNE_OP
++    import marlin_best
++    import marlin_tune_ext
++
++    marlin_tune_ext.set_table(marlin_best.table())
++    try:
++        @register_fake("_C_marlin_tune::marlin_gemm")
++        def _marlin_tune_fake(a, c, b_q_weight, b_bias, b_scales, a_scales,
++                              global_scale, b_zeros, g_idx, perm, workspace,
++                              b_q_type_id, size_m, size_n, size_k,
++                              is_k_full=True, use_atomic_add=False,
++                              use_fp32_reduce=False, is_zp_float=False):
++            dtype = a.dtype
++            if dtype not in [torch.half, torch.bfloat16]:
++                dtype = b_scales.dtype  # int8/fp8 activations: out follows scales
++            return torch.empty((size_m, size_n), dtype=dtype, device=a.device)
++    except RuntimeError:
++        pass  # fake already registered
++    _MARLIN_TUNE_OP = torch.ops._C_marlin_tune.marlin_gemm
++    logger.info_once("marlin_gemm: routing through the sm86-tuned _C_marlin_tune "
++                     "build (%d table rows)", len(marlin_best.table()))
++
++
++if _MARLIN_TUNE_ENABLED:
++    # Load EAGERLY at import: set_table/import inside the hot wrapper lands inside
++    # dynamo tracing of the compiled model and graph-breaks the boot (gb0007).
++    try:
++        _load_marlin_tune()
++    except Exception:
++        logger.exception("VLLM_MARLIN_TUNE=1 but the tuned marlin build failed to "
++                         "load; continuing on stock marlin")
++        _MARLIN_TUNE_ENABLED = False
++
++
+ def marlin_gemm(
+     a: torch.Tensor,
+     c: torch.Tensor | None,
+@@ -1218,6 +1265,11 @@
+     use_fp32_reduce: bool = False,
+     is_zp_float: bool = False,
+ ) -> torch.Tensor:
++    if _MARLIN_TUNE_OP is not None:
++        return _MARLIN_TUNE_OP(
++            a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
++            g_idx, perm, workspace, b_q_type.id, size_m, size_n, size_k,
++            is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)
+     return torch.ops._C.marlin_gemm(
+         a,
+         c,

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the KVarN KV-cache port into this repo's vLLM 0.27.1 venv:
+# Install the KVarN KV-cache port into this repo's vLLM 0.28.0 venv:
 # copies the new modules into site-packages/vllm and applies the upstream hunks.
 # usage: bash kvarn/install.sh            (idempotent-ish: re-copying files is fine;
 #        the patch is applied with --forward so a second run is a no-op)
@@ -10,10 +10,10 @@ PY=${PY:-$REPO/venv/bin/python}
 SP=$("$PY" -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] || { echo "cannot import vllm with $PY (README: Setup)"; exit 1; }
 cp -r "$HERE/files/vllm/." "$SP/"
-patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-0.27.1.patch" || true
+patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-0.28.0.patch" || true
 # V2-runner port: lets SPEC=dflash2 run with CTX=huge (KVarN KV + prefix caching, 240k).
-# Depends on hunks from both the patches/ set and kvarn-0.27.1.patch, hence applied last.
-patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-v2-runner.patch" || true
+# Depends on hunks from both the patches/ set and kvarn-0.28.0.patch, hence applied last.
+patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-v2-runner-0.28.0.patch" || true
 find "$SP" -type d -name __pycache__ -path "*kvarn*" -prune -exec rm -rf {} + 2>/dev/null || true
 "$PY" - "$SP" "$HERE" <<'PY'
 import sys
@@ -35,7 +35,7 @@ print("tile bytes", c.tile_bytes, "-> per token per head", c.tile_bytes_aligned 
 # counting them per file says exactly which ones did not land.
 sp, here = Path(sys.argv[1]), Path(sys.argv[2])
 want, current = {}, None
-for line in (here / "kvarn-v2-runner.patch").read_text().splitlines():
+for line in (here / "kvarn-v2-runner-0.28.0.patch").read_text().splitlines():
     if line.startswith("+++ b/"):
         current = line[len("+++ b/"):].strip()
         want.setdefault(current, 0)
@@ -48,7 +48,7 @@ for rel, expected in sorted(want.items()):
     if found < expected:
         short.append(f"  {rel}: {found}/{expected} markers")
 if short:
-    print("\nERROR: kvarn-v2-runner.patch did not apply completely:", file=sys.stderr)
+    print("\nERROR: kvarn-v2-runner-0.28.0.patch did not apply completely:", file=sys.stderr)
     print("\n".join(short), file=sys.stderr)
     print(
         "\nThis vLLM tree differs from the one the patch was cut against.\n"

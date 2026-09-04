@@ -1,5 +1,5 @@
 Split-KV attention for speculative-decode batches on the FLASH_ATTN backend
-(vLLM 0.27.1, Ampere), with query-row tiling so the verify block can be longer
+(vLLM 0.28.0, Ampere), with query-row tiling so the verify block can be longer
 than the drafter's.
 
 FlashAttention-2 only splits the KV sequence across thread blocks when a request

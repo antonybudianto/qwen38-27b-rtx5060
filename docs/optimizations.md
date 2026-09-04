@@ -33,6 +33,11 @@ One line each; the rest of this page is the long version.
 9. **Prefix caching for a hybrid model** — opt-in upstream; `PREFIX_CACHE=1`
    makes a follow-up chat turn on a 24k document cost ~1 s instead of ~23 s, and
    64 requests sharing a system prompt 17 s instead of 222 s.
+10. **int8 prefill for single-user mode** (`INT8_ACT=int8`) — prefill is
+   compute-bound at every batch size, so the W4A8 tensor-core path is worth
+   +27-30% prefill (+19% at 51k) on the dflash2 stack with decode unchanged;
+   plus a benchmark-harness fix (seeded prompts) that makes the prefill
+   numbers honest at all.
 
 ## In full
 
@@ -112,6 +117,86 @@ One line each; the rest of this page is the long version.
    resumed from the last cached block boundary. Follow-up chat turns on a 24k document:
    23 s → 1 s. 64 API requests sharing a 5.8k system prompt: 222 s → 17 s.
 
+### int8 prefill for single-user mode (`INT8_ACT=int8`)
+
+Single-user mode stayed W4A16 because int8 activations buy nothing at batch
+size 1 *decode* — true, and beside the point for prefill, which is
+compute-bound at every concurrency. A torch profile of a 4k prefill on the
+dflash2 stack is 79% Marlin GEMM time with 15 ms of GPU idle out of 2.05 s, so
+the GEMM dtype is the whole game. `INT8_ACT=int8` (default layer set
+`mlp|linear_attn|self_attn`) borrows batch mode's W4A8 path for every linear
+except the int8-weight lm_head/embed and the MTP module:
+
+| prefill tok/s (dflash2 k=15, PC=1, seeded protocol) | 1k | 4k | 16k | 51k |
+|---|---|---|---|---|
+| W4A16 (mode default) | 1,437 | 1,494 | 1,410 | 1,200 |
+| `INT8_ACT=int8 INT8_LAYERS=mlp` | 1,638 | 1,696 | 1,587 | 1,320 |
+| `INT8_ACT=int8` (all linears) | **1,845** | **1,937** | **1,791** | **1,423** |
+
+Decode is unchanged (122±5 vs 121 tok/s C1 over repeats, 3.2 tok/step both
+ways) and quality is the documented int8 trade: GSM8K 95.0% against the fast
+variant's 96.5, perplexity +4.1% (mostly prose, code flat), IFBench flat on
+the batch-mode precedent. The 51k row gains least because the 16
+full-attention layers grow quadratically to ~40% of prefill there, and FA2 at
+head_dim 256 has no faster sm86 alternative (FlashInfer measured within 1.5%,
+and it costs the split-KV verify path at decode).
+
+**int8-QK prefill attention** (`PREFILL_ATTN=int8`,
+`patches/triton-prefill-attn-int8.patch`) attacks what is left after the GEMMs: the
+16 full-attention layers, whose head_dim of 256 pins FA2 at 54-57 TFLOPS on
+sm86 (85% of the card's practical fp16 mma rate — no fp16 rewrite can win).
+A Triton kernel runs QK^T on int8 tensor cores at 2x the fp16 rate,
+SageAttention-style: K is smoothed by its per-head channel mean (softmax-
+invariant, so exact up to int8 rounding — cos > 0.99999 vs fp32 at 4-51k),
+gathered and quantized once per layer-chunk into contiguous int8 scratch;
+Q rows carry per-row scales; P.V stays bf16. On the attention itself it is
+1.27x FA2 at 4k rising to 1.35x at 51k; end-to-end with `INT8_ACT` it adds
++2.7% at 16k and +5.3% at 51k (1,839 / 1,498 tok/s), decode unchanged.
+Alone it adds almost nothing, and that is structural rather than a defect:
+prefill without the int8 GEMMs is GEMM-dominated, so a faster attention has
+less to win. Measured standalone on the reference box (`bench/prefill_ab.sh`,
+two interleaved arms per condition, each reproducing to 0.1%): 1,167 / 1,126 /
+1,012 tok/s at 4k / 16k / 51k against 1,164 / 1,114 / 980 stock — +0.3%,
++1.1%, +3.3%, the gain growing with context exactly as the attention share
+does. A WSL2 3090 measured the same standalone cell 1-6% negative
+([#62](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/62)), so treat
+`PREFILL_ATTN` alone as noise-to-slightly-positive and pair it with
+`INT8_ACT`, where the same kernel is worth +1.8% at 16k and +4.5% at 51k on
+top (1,826 / 1,491 against 1,793 / 1,427).
+Prefill-only by construction: the branch fires for single-request prefill
+chunks on the exact serving geometry and falls through to FA2 otherwise.
+
+Things this campaign measured that did NOT pay, so nobody re-walks them:
+
+- **The benchmark harness was mismeasuring prefill.** `vllm bench serve`
+  defaults to `--seed 0`, so every call replays the same prompts; with
+  `--enable-prefix-caching` that hands later calls silent partial prefix hits
+  whose size depends on the server's pool geometry. The old protocol read one
+  config 15-20% low and another 3× high (a 16k prefill "measured" at 4.0 s
+  that cold costs 11.2 s). `bench/run_benchmarks.sh` now seeds every call;
+  the tables above are the seeded numbers, and older published prefill rows
+  are not comparable.
+- **`SPEC=off` prefills ~20% slower than `SPEC=dflash2`** — removing the
+  drafter demotes the server from the V2 model runner to V1. The drafter's
+  own prefill cost on the V2 runner is nil (6 kernel launches in a 4k
+  profile); the "~15% TTFT" figure that used to circulate here predates the
+  fused context-KV precompute.
+- **`PREFIX_CACHE=0` prefills ~20% slower than `PREFIX_CACHE=1`** on this
+  stack, align mode ruled out as the cause (PC=0 + `--mamba-cache-mode align`
+  measures the same as plain PC=0). Do not turn the cache off "for speed".
+- **Bigger prefill chunks do not boot** under the pinned `KV_MEM`:
+  `--max-num-batched-tokens` 4096 and 8192 both inflate the profiled
+  activation peak past the transient floor (engine init fails). 2048 stays.
+- **Marlin tile tuning for the W4A8 GEMMs washes out end-to-end.** The
+  standalone sweep (min-of-rounds, burst clocks) shows +2-20% per GEMM over
+  stock tiles at M=2048 — and exactly +0.4% end-to-end, because sustained
+  250 W throttling flattens the differences the bursts show.
+  `patches/marlin-tune-table.patch` ships the wiring anyway (off by default,
+  `VLLM_MARLIN_TUNE=1`) for cards running without a power cap.
+- `INT8_LAYERS="mlp|linear_attn"` (the GDN-only middle point) crashes at
+  first forward — an inductor codegen bug with the mixed set on this
+  torch/vllm pin. Use `mlp` or the full default.
+
 ### DFlash2 (`SPEC=dflash2`)
 
 The one lever left after all of the above is acceptance, and Qwen's MTP head
@@ -123,15 +208,14 @@ plus a selector that walks a coherent path through 16 candidates per slot. On
 the bf16 model it reports 4.80 tokens per step vs 4.28 for MTP at the same block
 size. What it took to make it pay on a 24 GB card, in order:
 
-1. **Backport.** vLLM's support is [PR #52816](https://github.com/vllm-project/vllm/pull/52816)
-   on main, on the V2 model runner. `patches/dflash2-backport.patch` carries it to
-   0.27.1 plus the pieces of main it silently relies on (sentinel `-1` sample
-   rows, sliding-window null-block guards, K draft slots, NaN guards) and one
-   semantic fix: 0.27.1 caches temperature-*applied* draft logits, main caches
-   raw ones, and the PR's selector cached raw scores — on 0.27.1 that would have
-   verified against the wrong q for 0 < T ≠ 1. The draft also shares the target's
-   *quantized* lm_head (upstream refuses), and the V2 sampler now takes our
-   sort-free small-k top-k/top-p path. MTP mode is untouched (re-measured:
+1. **Native support plus the repo port.** vLLM's support is [PR #52816](https://github.com/vllm-project/vllm/pull/52816)
+   and is native in v0.28.0 on the V2 model runner. The old
+   `patches/dflash2-backport.patch` is retired on this tag; v0.28.0's native
+   implementation is layered with `patches/dflash2-lookup-drafting.patch` and
+   `patches/dflash2-ngram-chains.patch`, which carry the quantized candidate
+   head, context lookup, and drafter-free chain extensions. The DFlash2 port
+   also shares the target's *quantized* lm_head (upstream refuses), and the V2
+   sampler now takes our sort-free small-k top-k/top-p path. MTP mode is untouched (re-measured:
    110.7 / 113.4 tok/s, 73,777-token pool).
 2. **The drafter itself is 1.92B parameters, 3.85 GB in bf16** — read once per
    step, that is +5 ms on a 3090 and no gain (106 / 112 tok/s, measured), and it
@@ -254,11 +338,22 @@ single biggest thing in this repo for you. (The other three changes on this page
 lookup drafting, the KV-group fix and the V2 graph accounting — only fire on the DFlash2
 path and are inert in batch mode.)
 
-Its limits are memory- and window-shaped, not speed-shaped: each request holds
-1+7 recurrent-state slots (0.7 GB), so from 8 concurrent long generations MTP's
-e2e is higher again (309 vs 235 tok/s); and the drafter's 2,048-token attention
-window loses acceptance on long-context tasks (2.3-2.6 vs 2.6-3.0 tokens per
-step at 12-36k, where MTP is 5-10% ahead e2e). `CTX=long`/`huge` stay MTP. For
-one to four people chatting with normal context — what single-user mode is for
-— it is the fastest config in this repo. Full table in
+Its limits are memory- and window-shaped: each *resident* request holds 1+7
+recurrent-state slots — 0.88 GiB, 15.8% of the `CTX=fast` pool, before it stores any
+context — so six requests are resident and the seventh is preempted, against eight for
+MTP's 0.44 GiB; from 8 concurrent long generations MTP's e2e is higher again (309 vs
+235 tok/s). The drafter's 2,048-token attention window separately loses acceptance on
+long-context tasks (2.3-2.6 vs 2.6-3.0 tokens per step at 12-36k, where MTP is 5-10%
+ahead e2e). `CTX=long`/`huge` stay MTP.
+
+It is not only memory-shaped, though, and that sentence used to say it was. Per-stream
+decode falls hard with concurrency — 137 / 97 / 46 tok/s at 1 / 2 / 4 distinct
+4k-token streams — because every resident request adds ~7 ms to the forward pass
+(25.9 → 49.1 ms). Aggregate throughput still rises (137 → 309 tok/s) and nothing is
+preempted, so the verify step is batching; it is latency per user that goes. MTP does
+the same thing (126 / 103 / 46 per stream, ~5 ms per resident), so this is the hybrid
+model plus speculation on one 3090, not something DFlash2 does wrong — what is
+DFlash2's own is running out of state pages at five residents where MTP holds eight
+and reaches 383 tok/s aggregate at C8. For **one person** with normal context — what single-user mode is
+for — it is the fastest config in this repo. Full table in
 [single-user/README.md](../single-user/README.md).

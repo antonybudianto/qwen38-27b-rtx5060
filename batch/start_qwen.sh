@@ -13,7 +13,8 @@
 #    change for +2.2% perplexity. Needs both marlin patches from patches/.
 #    INT8_LAYERS=gate_up is the gentler variant (+0.9% PPL, ~+15%);
 #    INT8_ACT= (empty) turns it off entirely (pure W4A16, quality-neutral).
-#  - --language-model-only skips the vision tower entirely (~2.7 GB saved)
+#  - --language-model-only skips the vision tower entirely (0.858 GiB on this
+#    checkpoint); VISION=1 keeps it for a client that sends images
 #  - expandable_segments is required: the DeltaNet prefill kernels allocate
 #    transient workspace and fragment the allocator, OOMs at util >= 0.978 without it
 #  - gpu-memory-utilization 0.972 is the sweet spot on a headless box
@@ -23,6 +24,23 @@
 #  - kv-cache-dtype fp8 roughly doubles the usable context/pool
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
+# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# A dead engine leaves its OffloadingConnector region behind as
+# /dev/shm/vllm_offload_*.mmap; the next boot then dies with OSError: Bad
+# address in shared_offload_region.py, and under restart policies that loops
+# (#33 found 70 ghosts after one host OOM). Unlink stale regions no live
+# process maps. VLLM_OFFLOAD_KEEP_SHM=1 skips this (several engines sharing
+# /dev/shm across namespaces, where the liveness scan cannot see the owner).
+if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
+  for f in /dev/shm/vllm_offload_*.mmap; do
+    [ -e "$f" ] || continue
+    grep -lqs "$f" /proc/[0-9]*/maps 2>/dev/null || { echo "[start_qwen] removing stale offload region $f"; rm -f "$f"; }
+  done
+fi
 REPO="$(dirname "$DIR")"
 cd "$REPO"
 
@@ -84,19 +102,77 @@ fi
 # which reads as the model being bad at tools rather than as a misconfigured server.
 # The name is the call format, not the checkpoint -- nothing here is Qwen3-Coder.
 # qwen3_coder, qwen3_xml and mimo are three names for one Qwen3EngineToolParser in
-# 0.27.1, which is the tool-side adapter of the same parser engine that
+# 0.28.0, which is the tool-side adapter of the same parser engine that
 # --reasoning-parser qwen3 already uses (vllm/parser/qwen3.py).
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
-TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
+# Array, not $( [ ] && echo ): exits 1 when TOOLS is off (the shape #59 fixed)
+# and word-splits $TOOL_PARSER; the array keeps the parser as one element.
+TOOL_ARGS=()
+[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+
+# REQ_METRICS=1: per-request timing fields + usage on every response (issue #51).
+# Not with --disable-log-stats (the timing fields need the engine-stats path).
+# Array, not $( [ ] && echo ): the command substitution exits 1 when the test
+# is false, which under `set -e` killed this script silently (#59).
+METRICS_ARGS=()
+[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
+
+# Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
+# 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
+# the tower, for a client that sends images: screenshots into a coding assistant,
+# captioning, document photos.
+#
+# Only --language-model-only needs a knob. It is hardcoded in the exec line below, so
+# the alternative is countering it with --no-language-model-only from EXTRA_ARGS and
+# depending on which flag argparse saw last -- which regresses silently: images are
+# still accepted and still counted as prompt tokens, and the model answers from
+# placeholder embeddings. The two flags VISION=1 adds have no such conflict and can
+# be overridden from EXTRA_ARGS, which is expanded after them. The pixel cap is
+# shipped rather than left to the processor default because vLLM profiles the encoder
+# at the largest image it will accept, and that peak comes out of the KV pool:
+# 2097152 px = 2048 image tokens.
+if [ "${VISION:-0}" = 1 ]; then
+  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+  # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
+  # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
+  # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:
+  # the tower is 0.85 GiB of the ~1.1 GiB transient margin the KV_MEM comment sizes, and
+  # graph capture then dies allocating the split-KV verify buffer --
+  #   torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 787.50 MiB is free
+  #     (spec_decode_attn.py:184, self.part_o)
+  # measured here, VISION=1 VISION_OFFLOAD=0 SPEC=dflash2, RTX 3090 at 250 W. With the
+  # offload the same config comes up with the full 69,758-token pool and reads images.
+  #
+  # It is close to free: isolated-tower measurement at PCIe 4.0 x16, one 8192-patch image,
+  # median of 10 forwards, 891.3 -> 9.0 MiB of resident weights and 1160.5 -> 308.2 MiB of
+  # peak allocation for 296 -> 333 ms of encode, output bit-exact either way. Set
+  # VISION_OFFLOAD=0 only on a card with room to spare, where 36 ms per image buys nothing.
+  [ "${VISION_OFFLOAD:-1}" = 1 ] && export VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-1}
+else
+  VISION_ARGS="--language-model-only"
+fi
 
 export PATH="$REPO/venv/bin:$PATH"
-# Overridable for WSL2 (see single-user/start_qwen.sh).
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# Off under WSL, where the VMM calls break Marlin repack — see the long note in
+# single-user/start_qwen.sh. Overridable both ways.
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+  ALLOC_DEFAULT=expandable_segments:False
+  [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
+    "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
+else
+  ALLOC_DEFAULT=expandable_segments:True
+fi
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);
 # the attention kernels JIT fine. Remove this if you have a recent CUDA toolkit.
 export VLLM_USE_FLASHINFER_SAMPLER=0
-export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+# "Off" for these is UNSET, not empty. vllm/envs.py registers VLLM_MARLIN_INPUT_DTYPE
+# through env_with_choices(..., None, ["int8", "fp8"]), which rejects "" outright --
+# `ValueError: Invalid value '' ... Valid options: ['int8', 'fp8']` -- so exporting the
+# empty string killed the engine at startup instead of turning the feature off. That is
+# the documented way to disable it (issue #20), so export only when non-empty.
+[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
+[ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
 
 # API key: put it in api_key.txt in the repo root, or export VLLM_API_KEY.
 if [ -z "$VLLM_API_KEY" ] && [ -f "$REPO/api_key.txt" ]; then
@@ -111,12 +187,14 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
-  --language-model-only \
+  ${VISION_ARGS} \
   $KV_ARGS \
   --mamba-ssm-cache-dtype float16 \
   --async-scheduling \
   --max-num-batched-tokens 2048 \
   --compilation-config "{\"max_cudagraph_capture_size\":64,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
-  ${TOOL_ARGS} \
+  --enable-prompt-tokens-details \
+  "${METRICS_ARGS[@]}" \
+  "${TOOL_ARGS[@]}" \
   ${EXTRA_ARGS}

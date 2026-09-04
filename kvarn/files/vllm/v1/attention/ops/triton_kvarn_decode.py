@@ -160,7 +160,15 @@ def _kvarn_scatter_store_kernel(
 # and, on the chunked-prefill route, a fresh compile every time the value
 # crosses a %16 boundary). Opt it out of specialisation so warmup and
 # serving share ONE variant. Triton 3.7.1 accepts parameter names here.
-@triton.jit(do_not_specialize=["MAX_BLOCKS_PER_REQ"])
+# (#48, round 2) stride_bt_b too: Triton also specialises ints on
+# divisibility by 16, and the block table's row stride is its WIDTH -- the
+# warmup's cdiv(max_model_len, group) = 1920 carries the divisibility
+# attribute, the runner's real table is one column wider (1921) and does not.
+# Measured with KVARN_SPEC_DEBUG=1: that single attribute was the last
+# warmup-vs-serving variant difference after the lookup size was stabilised.
+# The stride is only ever multiplied into a row offset, so the hint buys the
+# kernel nothing.
+@triton.jit(do_not_specialize=["MAX_BLOCKS_PER_REQ", "stride_bt_b"])
 def _kvarn_build_packed_kv_kernel(
     Block_table_ptr,    # [B, max_blocks]                          int32
     Seq_lens_ptr,       # [B]                                      int32
@@ -973,17 +981,15 @@ def kvarn_verify_attention(
 
     common["VQ_INDIRECT"] = True
 
-    # Split-K mirrors the decode driver's heuristic: long context with too few
-    # programs to fill the SMs. Verify batches are tiny (NQ <= maxq * B), so
-    # long-context verify nearly always wants the split.
-    sm_count = getattr(impl, "_sm_count", 0) or torch.cuda.get_device_properties(
-        device).multi_processor_count
+    # Split-K mirrors the decode driver's long-context heuristic. Verify
+    # batches are tiny (NQ <= maxq * B), so the one-stage VQ_INDIRECT kernel
+    # can return finite but incorrect logits on the long-context sm86 path.
+    # KVARN_SPLIT_K=1 is an explicit force-on; KVARN_SPLIT_K=0 does not disable
+    # the correctness-required auto split.
     _sw = int(getattr(impl, "sliding_window", 0) or 0)
     _sk_env = os.environ.get("KVARN_SPLIT_K")
-    if _sk_env is not None:
-        split_k = _sk_env == "1"
-    else:
-        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= sm_count)
+    auto_split = (_sw <= 0) and (max_ctx_blocks >= 16)
+    split_k = auto_split or _sk_env == "1"
 
     if not split_k:
         _kvarn_fused_decode_kernel[(NQ, Hk)](

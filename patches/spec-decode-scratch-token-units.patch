@@ -1,0 +1,420 @@
+int4 3D scratch: split the sequence policy from the token allocation
+
+WHAT THIS FIXES, AND WHOSE DEFECT IT IS
+
+This corrects a defect in the multi-query 3D extension WE contributed in #46
+(spec-decode-int4-kv-mq3d.patch, syv-fork fermion 2026-08-27). It is not a
+bug in upstream vLLM. Upstream sizes the three softmax_segm_* scratch buffers
+by seq_threshold_3D -- a SEQUENCE count -- and snaps that threshold to the
+nearest decode capture size when CUDA graphs are on. In upstream that is
+correct, because upstream's own dispatch rule sends every multi-query batch
+to 2D (`or max_seqlen_q > 1`): on the 3D path, tokens == sequences by
+construction, so a buffer sized in sequences holds every token it will see.
+
+Our #46 extension opened the 3D path to multi-query verify batches
+(max_seqlen_q <= 16) for DFlash2, and knew the buffers were token-indexed --
+its own comment says the q=1 equivalence "is what the old num_seqs check
+silently relied on for scratch-buffer capacity". It added a runtime capacity
+CHECK (_capacity_ok) rather than resizing the ALLOCATION. The check made the
+path memory-safe. It also made the failure silent: the extension promised 3D
+for batches up to 16 tokens while the buffers held seq_threshold_3D rows,
+which the capture snap had reduced 32 -> 8 on this config. Every eligible
+batch of 9..16 tokens quietly took the 2D path, in capture-enabled mode --
+the only mode that ships. Nothing logged it.
+
+Found by the gate campaign built to vet this kernel before asking for
+default-on. Measured on an RTX 3090 (sm86), Qwen3.8-27B W4A16, DFlash2:
+  capture-enabled  q=9 -> 2D, q_token_capacity_failed
+  fully eager      q=9 -> 3D
+Same config, same request. Forcings both ways (hold engine mode fixed, move
+only the scratch rows) flip q=9 in each direction: capacity is the deciding
+predicate; mode is what shrinks the capacity in stock.
+
+WHAT THIS DOES NOT DO
+
+It does not make anything measurably faster at the default draft depth of 7.
+Ten interleaved boots at 6.7k and 68k context, every number carrying its own
+dispatch census: +0.13% and 0.0%, inside a 0.54% same-config spread. At depth
+7 the ordinary verify batch is 8 tokens, 8 is a capture size that already ran
+3D, and the 9..16 band this fixes is 0.66% of attention calls. The extension's
+headline win was never broken; its edge was. Deeper speculation would put the
+band in the common case, but the drafter checkpoint is trained for 7 and
+depth 11 does not fit this card, so that arm is untested here. This patch
+stands on correctness: the policy and the allocation now agree, and any
+future disagreement is visible instead of silent.
+
+It also does not touch the capture-size snap itself. Which topology an
+already-captured graph replays is a separate change with its own gate.
+
+THE CHANGE
+
+  seq_threshold_3D           SEQUENCES, policy -- unchanged
+  MAX_QUERY_LEN_3D           QUERY TOKENS PER SEQUENCE; one source for both
+                             eligibility and allocation
+  scratch_token_capacity_3d  TOTAL QUERY TOKENS, allocation:
+    min(max_num_batched_tokens,
+        min(max_num_seqs, seq_threshold_3D) * MAX_QUERY_LEN_3D)
+
+derived from the engine's config objects at construction, printed with its
+inputs and byte cost in the boot record. Construction asserts all three
+buffers carry the declared capacity, so an oversized buffer cannot mask an
+undersized sibling. A capacity failure on policy-eligible work marks the
+backend DEGRADED, increments an observable counter (mq3d_breach_state()),
+and emits ONE rate-limited diagnostic with the first specimen; 2D remains
+the safe fallback.
+
+Cost here: 16 rows, 28.22 MiB across 4 live allocations (+14.11 MiB over
+stock). Allocation is per attention-backend instance, not per layer (64
+layers, 4 allocations). The formula scales with max_num_seqs -- 903 MiB at
+32 -- and that is stated rather than silently capped, because a silent cap
+would recreate exactly the accidental fallback this removes.
+
+The reason-bit debug line replaces the earlier debug line rather than adding to it, so
+VLLM_INT4_MQ_3D_DEBUG=1 prints once per attention call as before.
+
+VERIFICATION
+
+  property test    238,276 policy-eligible batches over 4,032 config tuples,
+                   0 violations; the pre-fix formula fails it 129,498 times
+  operator oracle  9/9 rows incl. [17] vs [16,1] (both total 17: the first
+                   rejects on POLICY, the second is ADMITTED), padded
+                   zero-length row, over-capacity breach; independent fp32
+                   reference; mutating back to sequence units breaches every
+                   multi-query row and leaves exactly q=1 and [17] green --
+                   the defect's own signature. Built and run by a second seat
+                   that did not write this patch.
+  live             max_num_seqs=8: tokens=64 across 8 sequences dispatches 3D
+  mutation         rows back to sequence units refuses boot at the assert;
+                   declared capacity shrunk to 8 -> q=9 red, count exact
+                   (first=1, final=16), one diagnostic
+  CI order         applies clean on the stock 0.27.1 wheel with all 27
+                   patches in Dockerfile glob order (0 failed, 0 fuzzy)
+
+---
+
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -59,6 +59,10 @@
+ # constants
+ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
++# Max query tokens PER SEQUENCE eligible for the 3D path. ONE source: it bounds both
++# eligibility (max_seqlen_q) and allocation (scratch_token_capacity_3d), so the two can
++# never drift apart the way a literal in the dispatch site did.
++MAX_QUERY_LEN_3D = 16
+ 
+ 
+ @dataclass
+@@ -79,7 +83,9 @@
+     block_table: torch.Tensor
+     slot_mapping: torch.Tensor
+ 
+-    seq_threshold_3D: int
++    seq_threshold_3D: int          # SEQUENCES  (policy)
++    max_query_len_3d: int          # QUERY TOKENS PER SEQUENCE  (eligibility)
++    scratch_token_capacity_3d: int  # TOTAL QUERY TOKENS  (allocation)
+     num_par_softmax_segments: int
+     softmax_segm_output: torch.Tensor
+     softmax_segm_max: torch.Tensor
+@@ -158,9 +164,53 @@
+ 
+         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+         headdim_padded = next_power_of_2(self.headdim)
++
++        # ---- UNIT SPLIT ------------------------------------------------------------
++        # These three quantities were one variable, in three different units. The
++        # scratch buffers are indexed by QUERY TOKEN, but were sized by
++        # seq_threshold_3D, a SEQUENCE policy -- and in capture-enabled mode that
++        # policy is snapped to the nearest decode capture size, which on this config
++        # shrinks it 32 -> 8. The result was a silent 2D fallback for every
++        # multi-query batch of 9..16 tokens, in capture-enabled mode only, i.e. the
++        # only mode that ships. Measured: q=9 falls back with q_token_capacity_failed
++        # in capture-enabled and runs 3D fully eager, same config, same request.
++        #
++        #   self.seq_threshold_3D        -- SEQUENCES.  Policy. Unchanged here (the
++        #                                   capture-snap question is a separate change).
++        #   self.max_query_len_3d        -- QUERY TOKENS PER SEQUENCE. Eligibility.
++        #   self.scratch_token_capacity_3d -- TOTAL QUERY TOKENS. Allocation.
++        #
++        # The bound is derived from the engine's own config objects, not from an
++        # observed run, the environment, or a launcher default. Eligibility already
++        # requires num_seqs <= seq_threshold_3D, and no batch can carry more query
++        # tokens than the scheduler will place in one, so this is the smallest
++        # capacity that can hold every policy-eligible batch.
++        self.max_query_len_3d = MAX_QUERY_LEN_3D
++        _sched = self.vllm_config.scheduler_config
++        self.scratch_token_capacity_3d = min(
++            _sched.max_num_batched_tokens,
++            min(_sched.max_num_seqs, self.seq_threshold_3D) * self.max_query_len_3d,
++        )
++
++        _rows = self.scratch_token_capacity_3d
++        _row_bytes = 4 * (
++            self.num_heads_q * self.num_par_softmax_segments * headdim_padded
++            + 2 * self.num_heads_q * self.num_par_softmax_segments
++        )
++        # Bind the inputs and the resulting cost into the boot record: a capacity that
++        # cannot be read back at boot is a capacity nobody can audit later.
++        logger.info(
++            "int4 3D scratch: capacity=%d query tokens (min of max_num_batched_tokens=%d, "
++            "min(max_num_seqs=%d, seq_threshold_3D=%d) * max_query_len_3d=%d); "
++            "%d B/row, %.2f MiB for this instance",
++            _rows, _sched.max_num_batched_tokens, _sched.max_num_seqs,
++            self.seq_threshold_3D, self.max_query_len_3d,
++            _row_bytes, _row_bytes * _rows / 2**20,
++        )
++
+         self.softmax_segm_output = torch.empty(
+             (
+-                self.seq_threshold_3D,
++                _rows,
+                 self.num_heads_q,
+                 self.num_par_softmax_segments,
+                 headdim_padded,
+@@ -169,15 +219,24 @@
+             device=device,
+         )
+         self.softmax_segm_max = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (_rows, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.softmax_segm_expsum = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (_rows, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
++        # All three buffers must agree with the DECLARED capacity. One oversized
++        # buffer can otherwise mask another undersized one until a different reducer
++        # path is taken.
++        assert (
++            self.softmax_segm_output.shape[0]
++            == self.softmax_segm_max.shape[0]
++            == self.softmax_segm_expsum.shape[0]
++            == self.scratch_token_capacity_3d
++        ), "int4 3D scratch buffers disagree with the declared token capacity"
+         self.rswa_window = model_config.rswa_window
+         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
+         if self.rswa_window is not None:
+@@ -246,6 +305,8 @@
+             suffix_kv_lens=suffix_kv_lens,
+             prefix_scheduler_metadata=prefix_scheduler_metadata,
+             seq_threshold_3D=self.seq_threshold_3D,
++            max_query_len_3d=self.max_query_len_3d,
++            scratch_token_capacity_3d=self.scratch_token_capacity_3d,
+             num_par_softmax_segments=self.num_par_softmax_segments,
+             softmax_segm_output=self.softmax_segm_output,
+             softmax_segm_max=self.softmax_segm_max,
+@@ -686,6 +747,8 @@
+         block_table = attn_metadata.block_table
+ 
+         seq_threshold_3D = attn_metadata.seq_threshold_3D
++        max_query_len_3d = attn_metadata.max_query_len_3d
++        scratch_token_capacity_3d = attn_metadata.scratch_token_capacity_3d
+         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
+         softmax_segm_output = attn_metadata.softmax_segm_output
+         softmax_segm_max = attn_metadata.softmax_segm_max
+@@ -751,6 +814,8 @@
+             k_descale=k_descale,
+             v_descale=v_descale,
+             seq_threshold_3D=seq_threshold_3D,
++            max_query_len_3d=max_query_len_3d,
++            scratch_token_capacity_3d=scratch_token_capacity_3d,
+             num_par_softmax_segments=num_par_softmax_segments,
+             softmax_segm_output=softmax_segm_output,
+             softmax_segm_max=softmax_segm_max,
+--- a/v1/attention/ops/int4_per_token_head.py
++++ b/v1/attention/ops/int4_per_token_head.py
+@@ -13,6 +13,29 @@
+ from __future__ import annotations
+ 
+ import os
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# Observable breach state for the int4 3D scratch capacity invariant.
++# Sixteen identical error lines per request are not loud, they are floodable -- and a
++# flood is how an operator learns to filter the message out. So: a durable counter, a
++# DEGRADED marker, and exactly ONE diagnostic carrying the first specimen. Tests assert
++# the counter and the state, not the logger call, because a repaired log line can still
++# fail silently at operator level.
++MQ3D_CAPACITY_BREACH = {
++    "count": 0,          # total policy-eligible batches that exceeded declared capacity
++    "degraded": False,   # sticky: the derived capacity is wrong for this configuration
++    "first": None,       # the first specimen, kept for diagnosis
++}
++
++
++def mq3d_breach_state():
++    """Read the int4 3D capacity-breach state. Non-zero count means the derived
++    scratch capacity is too small for work the policy declared eligible: correctness
++    is preserved by the 2D fallback, performance is not."""
++    return dict(MQ3D_CAPACITY_BREACH)
+ from typing import Any
+ 
+ import torch
+@@ -694,6 +717,8 @@
+     k_scale_cache,
+     v_scale_cache,
+     seq_threshold_3D,
++    max_query_len_3d,
++    scratch_token_capacity_3d,
+     num_par_softmax_segments,
+     softmax_segm_output,
+     softmax_segm_max,
+@@ -752,10 +777,33 @@
+     # buffers directly. Opt-in via VLLM_INT4_MQ_3D=1 (promotion gates open).
+     _mq = max_seqlen_q > 1
+     _mq_3d_enabled = os.environ.get("VLLM_INT4_MQ_3D", "0") == "1"
+-    _capacity_ok = (
++
++    # The eligibility bound and the allocation bound now come from ONE source (see
++    # MAX_QUERY_LEN_3D / scratch_token_capacity_3d in triton_attn.py). The literal 16
++    # that used to sit here could not be changed without silently desynchronising the
++    # two. Falling back to the old literal keeps callers that predate the split working.
++    _qlen_cap = max_query_len_3d if max_query_len_3d is not None else 16
++    _qlen_ok = max_seqlen_q <= _qlen_cap
++    _scratch_present = (
+         softmax_segm_output is not None
+         and softmax_segm_max is not None
+         and softmax_segm_expsum is not None
++    )
++    # Defense in depth: the declared capacity is authoritative, but still verify the
++    # buffers actually carry it. An oversized buffer must not be allowed to mask an
++    # undersized sibling until some other reducer path dereferences it.
++    _declared = scratch_token_capacity_3d
++    _buffers_agree = _scratch_present and (
++        _declared is None
++        or (
++            softmax_segm_output.shape[0] == _declared
++            and softmax_segm_max.shape[0] == _declared
++            and softmax_segm_expsum.shape[0] == _declared
++        )
++    )
++    _capacity_ok = (
++        _scratch_present
++        and _buffers_agree
+         and q.shape[0] <= softmax_segm_output.shape[0]
+         and q.shape[0] <= softmax_segm_max.shape[0]
+         and q.shape[0] <= softmax_segm_expsum.shape[0]
+@@ -763,21 +811,73 @@
+     use_3d = not (
+         seq_threshold_3D is None
+         or num_par_softmax_segments is None
+-        or softmax_segm_output is None
+-        or softmax_segm_max is None
+-        or softmax_segm_expsum is None
+-        or (_mq and not (_mq_3d_enabled and max_seqlen_q <= 16 and _capacity_ok))
++        or not _scratch_present
++        or (_mq and not (_mq_3d_enabled and _qlen_ok and _capacity_ok))
+         or num_seqs > seq_threshold_3D
+         or is_batch_invariant
+     )
++
++    # A capacity failure on work the POLICY declared eligible is an internal invariant
++    # breach, not a runtime condition: capacity is sized so this cannot happen. 2D is
++    # still the correct and safe fallback, so we do not raise -- but silence here is
++    # exactly how the seq-vs-token bug stayed invisible, so it is logged loudly and
++    # names the numbers that disagree. Query lengths above the policy cap are NOT this:
++    # they are rejected by policy first and never reach the capacity question.
++    if _mq and _mq_3d_enabled and _qlen_ok and not _capacity_ok:
++        _specimen = {
++            "max_seqlen_q": int(max_seqlen_q),
++            "qlen_cap": int(_qlen_cap),
++            "num_seqs": int(num_seqs),
++            "tokens": int(q.shape[0]),
++            "declared": _declared,
++            "rows": [
++                None if t is None else int(t.shape[0])
++                for t in (softmax_segm_output, softmax_segm_max, softmax_segm_expsum)
++            ],
++        }
++        MQ3D_CAPACITY_BREACH["count"] += 1
++        if not MQ3D_CAPACITY_BREACH["degraded"]:
++            MQ3D_CAPACITY_BREACH["degraded"] = True
++            MQ3D_CAPACITY_BREACH["first"] = _specimen
++            # ONE diagnostic, with the first specimen. Subsequent breaches only move
++            # the counter -- the state is the signal, not the log volume.
++            logger.error(
++                "int4 3D DEGRADED: derived scratch capacity is too small for "
++                "policy-eligible work. First specimen: %s. Falling back to 2D, which is "
++                "correct but slower. This is a configuration/derivation defect, not a "
++                "runtime condition; further breaches increment the counter silently.",
++                _specimen,
++            )
++    # The reason bit: which predicate said no. Kept because "it fell back" was the whole
++    # defect -- the seq-vs-token bug was invisible for as long as the fallback had no
++    # stated cause. Off unless explicitly enabled.
+     if os.environ.get("VLLM_INT4_MQ_3D_DEBUG") == "1":
++        _why = []
++        if seq_threshold_3D is None: _why.append("no_seq_threshold")
++        if num_par_softmax_segments is None: _why.append("no_segments")
++        if not _scratch_present: _why.append("scratch_absent")
++        if _mq and not _mq_3d_enabled: _why.append("mq_but_flag_off")
++        if _mq and not _qlen_ok: _why.append(f"max_query_len_policy>{_qlen_cap}")
++        if _mq and _mq_3d_enabled and _qlen_ok and not _buffers_agree:
++            _why.append("buffers_disagree_with_declared_capacity")
++        if _mq and _mq_3d_enabled and _qlen_ok and _buffers_agree and not _capacity_ok:
++            _why.append("q_token_capacity_failed")
++        if seq_threshold_3D is not None and num_seqs > seq_threshold_3D:
++            _why.append("num_seqs_threshold_failed")
++        if is_batch_invariant: _why.append("batch_invariant_guard")
+         print(
+             f"[int4-mq3d] tokens={q.shape[0]} num_seqs={num_seqs} "
+             f"max_seqlen_q={max_seqlen_q} use_3d={use_3d} "
+-            f"segments={num_par_softmax_segments if use_3d else 1}",
++            f"declared_capacity={scratch_token_capacity_3d} "
++            f"qlen_cap={_qlen_cap} seq_threshold_3D={seq_threshold_3D} "
++            f"rows={None if softmax_segm_output is None else softmax_segm_output.shape[0]} "
++            f"| breach_count={MQ3D_CAPACITY_BREACH['count']} "
++            f"degraded={MQ3D_CAPACITY_BREACH['degraded']} "
++            f"| reasons={','.join(_why) if _why else 'NONE(3d eligible)'}",
+             flush=True,
+         )
+ 
++
+     # 3D never reads ``output_ptr`` and 2D never reads the segm tensors,
+     # but Triton needs a non-null pointer everywhere; reuse ``out`` as
+     # the placeholder for the unused side.
+@@ -938,6 +1038,8 @@
+     k_scale_cache: torch.Tensor,
+     v_scale_cache: torch.Tensor,
+     seq_threshold_3D: int | None = None,
++    max_query_len_3d: int | None = None,
++    scratch_token_capacity_3d: int | None = None,
+     num_par_softmax_segments: int | None = None,
+     softmax_segm_output: torch.Tensor | None = None,
+     softmax_segm_max: torch.Tensor | None = None,
+@@ -977,6 +1079,8 @@
+         k_scale_cache=k_scale_cache,
+         v_scale_cache=v_scale_cache,
+         seq_threshold_3D=seq_threshold_3D,
++        max_query_len_3d=max_query_len_3d,
++        scratch_token_capacity_3d=scratch_token_capacity_3d,
+         num_par_softmax_segments=num_par_softmax_segments,
+         softmax_segm_output=softmax_segm_output,
+         softmax_segm_max=softmax_segm_max,
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -838,6 +838,8 @@
+     k_descale,
+     v_descale,
+     seq_threshold_3D=None,
++    max_query_len_3d=None,
++    scratch_token_capacity_3d=None,
+     num_par_softmax_segments=None,
+     softmax_segm_output=None,
+     softmax_segm_max=None,
+@@ -905,6 +907,8 @@
+             k_scale_cache=k_scale_cache,
+             v_scale_cache=v_scale_cache,
+             seq_threshold_3D=seq_threshold_3D,
++            max_query_len_3d=max_query_len_3d,
++            scratch_token_capacity_3d=scratch_token_capacity_3d,
+             num_par_softmax_segments=num_par_softmax_segments,
+             softmax_segm_output=softmax_segm_output,
+             softmax_segm_max=softmax_segm_max,

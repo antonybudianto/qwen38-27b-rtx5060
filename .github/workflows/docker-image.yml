@@ -1,0 +1,75 @@
+# Build the Docker image and push it to GitHub Container Registry, so
+# `docker compose pull` replaces the 20-minute local build.
+#
+#   ghcr.io/syv-ai/qwen38-27b-rtx3090:latest      tracks main
+#   ghcr.io/syv-ai/qwen38-27b-rtx3090:sha-<7>     immutable, one per commit
+#
+# The Dockerfile itself is the quality gate: it applies every patch in
+# patches/ against the pinned vLLM and runs `verify.sh --install`, so a
+# patch that no longer applies fails the build and nothing is pushed.
+# (verify's GPU checks are behind the --install flag, which is why this
+# builds on a GPU-less runner.)
+#
+# The weekly cron rebuilds `latest` without a commit so base-image fixes
+# (CUDA runtime, Ubuntu CVEs) are picked up.
+
+name: docker image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-image
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      # The image is ~9.5 GB and the default runner does not have room to
+      # build it next to the preinstalled toolchains. ~25 GB comes back here.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max

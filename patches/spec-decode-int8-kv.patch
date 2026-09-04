@@ -37,7 +37,7 @@ aligned, which 260 does satisfy) and unpacking would recover most of the 61%; no
 Apply from the repo root, after spec-decode-attn.patch:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/spec-decode-int8-kv.patch
 
-Written against vLLM 0.27.1. Reapply after upgrades.
+Validated against vLLM 0.28.0. Reapply after upgrades.
 
 --- a/v1/attention/backends/flash_attn.py
 +++ b/v1/attention/backends/flash_attn.py

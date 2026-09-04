@@ -1,4 +1,4 @@
-Register the single-user speed knobs as vLLM env vars (vLLM 0.27.1).
+Register the single-user speed knobs as vLLM env vars (vLLM 0.28.0).
 
 VLLM_MARLIN_TUNE / VLLM_MARLIN_TUNE_DIR (tuned Marlin build, see marlin-tune/),
 VLLM_SPEC_DECODE_ATTN (patches/spec-decode-attn.patch) and VLLM_DRAFT_TOPK_TOPP

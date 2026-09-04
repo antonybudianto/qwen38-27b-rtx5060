@@ -1,30 +1,33 @@
-# KVarN KV cache, ported to vLLM 0.27.1
+# KVarN KV cache, ported to vLLM 0.28.0
 
 [KVarN](https://github.com/huawei-csl/KVarN) (Huawei CSL, Apache-2.0) is a
 KV-cache compression scheme — Hadamard rotation, iterative variance
 normalization, 4-bit keys / 2-bit values per 128-token tile — shipped as a
 native vLLM attention backend inside a fork of vLLM 0.23.0. This directory is
-that backend ported onto the vLLM 0.27.1 this repo runs, dense (non-MLA) path
+that backend ported onto the vLLM 0.28.0 this repo runs, dense (non-MLA) path
 only, and tuned for the Qwen3.8-27B / RTX 3090 setup here.
 
 What's in it:
 
 - `files/vllm/...` — the KVarN modules (backend, Triton kernels, config,
-  Sinkhorn reference), copied from KVarN and adapted to the 0.27.1 backend API
-  (every change is marked `# port(0.27.1)`; upstream KVarN headers kept).
-- `kvarn-0.27.1.patch` — the seven small hunks upstream vLLM needs to know the
+  Sinkhorn reference), copied from KVarN and adapted to the 0.28.0 backend API
+  (the original adaptation markers are retained in the source files).
+- `kvarn-0.28.0.patch` — the small hunks upstream vLLM needs to know the
   new `kvarn_*` cache dtypes (cache dtype literals, dtype map, backend registry
   + priority, a `KVQuantMode.KVARN`, the KV-cache spec branch in the attention
   layer, and the hybrid-model page alignment branch).
+- `kvarn-v2-runner-0.28.0.patch` — the V2 runner, sliding-cache, and DFlash2
+  correctness fixes layered on top of the base port.
 - `install.sh` — copies the modules into `venv/lib/python3.12/site-packages/vllm`
   and applies the patch (safe to re-run).
 
 Port notes, for whoever bumps vLLM next:
 
-- 0.27.1 calls `get_kv_cache_shape(..., cache_dtype_str="auto")` for specs
-  whose `kv_quant_mode` is `NONE`; KVarN's shape depends on the preset, so the
-  port adds `KVQuantMode.KVARN` and passes it through the (reused)
-  `TQFullAttentionSpec`. Without that the engine dies at KV-cache init.
+- 0.28.0's attention spec uses `cache_dtype_str="auto"` for specs whose
+  `kv_quant_mode` is `NONE`; KVarN's shape depends on the preset, so the port
+  adds `KVQuantMode.KVARN` and passes the packed slot size through
+  `FullAttentionSpec(state_content_bytes=...)`. Without that the engine dies
+  at KV-cache init.
 - The impl→builder wiring uses `get_layers_from_vllm_config` instead of
   KVarN's `attention.py` `impl.layer_name` hunk, and a small owner registry so
   the MTP draft layer isn't flushed by two builders.

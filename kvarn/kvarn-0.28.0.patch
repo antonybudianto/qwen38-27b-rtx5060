@@ -1,0 +1,235 @@
+KVarN dense KV-cache integration for vLLM 0.28.0.
+
+The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_content_bytes rather than the old TQFullAttentionSpec/tq_slot_size representation. This port preserves the packed KVarN tile layout and tail-pool budgeting on the new interfaces.
+
+--- generated against the v0.28.0 tree after the active repo patches ---
+
+--- a/config/cache.py
++++ b/config/cache.py
+@@ -29,6 +29,10 @@
+     "turboquant_4bit_nc",
+     "turboquant_k3v4_nc",
+     "turboquant_3bit_nc",
++    "kvarn_k4v2_g128",
++    "kvarn_k4v4_g128",
++    "kvarn_k4v2_g64",
++    "kvarn_k4v4_g64",
+     "int4_per_token_head",
+     "int8_per_token_head",
+     "fp8_per_token_head",
+--- a/model_executor/layers/attention/attention.py
++++ b/model_executor/layers/attention/attention.py
+@@ -645,6 +645,26 @@
+                 page_size_padded=shared_page,
+             )
+         else:
++            if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith(
++                "kvarn_"
++            ):
++                from vllm.model_executor.layers.quantization.kvarn.config import (
++                    KVarNConfig,
++                )
++
++                kvarn_config = KVarNConfig.from_cache_dtype(
++                    self.kv_cache_dtype, self.head_size
++                )
++                slot_bytes = kvarn_config.tile_bytes_aligned // kvarn_config.group
++                return FullAttentionSpec(
++                    block_size=block_size,
++                    num_kv_heads=self.num_kv_heads,
++                    head_size=self.head_size,
++                    head_size_v=self.head_size_v,
++                    dtype=self.kv_cache_torch_dtype,
++                    kv_quant_mode=quant_mode,
++                    state_content_bytes=slot_bytes,
++                )
+             return FullAttentionSpec(
+                 block_size=block_size,
+                 num_kv_heads=self.num_kv_heads,
+--- a/platforms/cuda.py
++++ b/platforms/cuda.py
+@@ -151,6 +151,7 @@
+                 AttentionBackendEnum.FLASH_ATTN,
+                 AttentionBackendEnum.TRITON_ATTN,
+                 AttentionBackendEnum.FLEX_ATTENTION,
++                AttentionBackendEnum.KVARN,
+                 AttentionBackendEnum.TURBOQUANT,
+             ]
+         else:
+@@ -159,6 +160,7 @@
+                 AttentionBackendEnum.FLASHINFER,
+                 AttentionBackendEnum.TRITON_ATTN,
+                 AttentionBackendEnum.FLEX_ATTENTION,
++                AttentionBackendEnum.KVARN,
+                 AttentionBackendEnum.TURBOQUANT,
+             ]
+ 
+@@ -349,7 +351,71 @@
+                 "To raise the WSL2 VM memory ceiling, increase the `memory` "
+                 "setting in %%USERPROFILE%%\\.wslconfig and run "
+                 "`wsl --shutdown`."
++            )
++
++        # KVarN keeps a fixed-size fp16 tail pool for each active request.
++        # Bound scheduler concurrency to the pool budget before worker startup;
++        # the backend itself cannot safely grow this allocation after CUDA graph
++        # buffers have been created.
++        cache_config = vllm_config.cache_config
++        cache_dtype = getattr(cache_config, "cache_dtype", None)
++        if (
++            model_config is not None
++            and isinstance(cache_dtype, str)
++            and cache_dtype.startswith("kvarn_")
++            and not getattr(model_config, "use_mla", False)
++        ):
++            from vllm.model_executor.layers.quantization.kvarn.config import (
++                KVarNConfig,
++            )
++
++            head_size = model_config.get_head_size()
++            if head_size not in (128, 256, 512):
++                raise ValueError(
++                    f"{cache_dtype} requires head_dim in (128, 256, 512), "
++                    f"but this model has head_dim={head_size}."
++                )
++
++            # KVarN's dense backend has no sliding-window mask. Preserve the
++            # full-precision SW layers in hybrid models unless explicitly opted in.
++            hf_text_config = getattr(model_config, "hf_text_config", None)
++            layer_types = getattr(hf_text_config, "layer_types", None)
++            has_swa = (
++                "sliding_attention" in layer_types
++                if layer_types
++                else getattr(hf_text_config, "sliding_window", None) is not None
++            )
++            skip_layers = cache_config.kv_cache_dtype_skip_layers
++            if os.environ.get("KVARN_QUANT_SLIDING") == "1":
++                while "sliding_window" in skip_layers:
++                    skip_layers.remove("sliding_window")
++            elif has_swa and "sliding_window" not in skip_layers:
++                skip_layers.append("sliding_window")
++
++            kvarn_cfg = KVarNConfig.from_cache_dtype(cache_dtype, head_size)
++            weight_bytes = kvarn_cfg.estimate_weight_bytes(
++                model_config.model,
++                tensor_parallel_size=parallel_config.tensor_parallel_size,
++            )
++            supported = kvarn_cfg.max_supported_seqs(
++                total_gpu_bytes=cls.get_device_total_memory(),
++                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
++                num_layers=KVarNConfig.num_kvarn_layers(
++                    model_config, parallel_config
++                ),
++                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
++                gpu_memory_utilization=cache_config.gpu_memory_utilization,
++                weight_bytes=weight_bytes,
+             )
++            if scheduler_config.max_num_seqs > supported:
++                logger.warning(
++                    "KVarN (%s): capping max_num_seqs %d -> %d for the fp16 "
++                    "tail-pool budget.",
++                    cache_dtype,
++                    scheduler_config.max_num_seqs,
++                    supported,
++                )
++                scheduler_config.max_num_seqs = supported
+ 
+     @classmethod
+     def get_current_memory_usage(
+--- a/platforms/interface.py
++++ b/platforms/interface.py
+@@ -807,6 +807,23 @@
+                 dtype=kv_cache_dtype,
+                 kv_quant_mode=kv_quant_mode,
+             ).page_size_bytes
++        elif cache_config.cache_dtype.startswith("kvarn_"):
++            from vllm.model_executor.layers.quantization.kvarn.config import (
++                KVarNConfig,
++            )
++
++            kvarn_config = KVarNConfig.from_cache_dtype(
++                cache_config.cache_dtype, model_config.get_head_size()
++            )
++            slot_bytes = kvarn_config.tile_bytes_aligned // kvarn_config.group
++            attn_page_size_1_token = FullAttentionSpec(
++                block_size=1,
++                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
++                head_size=model_config.get_head_size(),
++                dtype=kv_cache_dtype,
++                kv_quant_mode=kv_quant_mode,
++                state_content_bytes=slot_bytes,
++            ).page_size_bytes
+         elif cache_config.cache_dtype.startswith("turboquant_"):
+             # TQ has a packed K|V layout; the standard FullAttentionSpec
+             # formula over-sizes it and trips unify_kv_cache_spec_page_size
+--- a/utils/torch_utils.py
++++ b/utils/torch_utils.py
+@@ -49,6 +49,10 @@
+     "turboquant_4bit_nc": torch.uint8,
+     "turboquant_k3v4_nc": torch.uint8,
+     "turboquant_3bit_nc": torch.uint8,
++    "kvarn_k4v2_g128": torch.uint8,
++    "kvarn_k4v4_g128": torch.uint8,
++    "kvarn_k4v2_g64": torch.uint8,
++    "kvarn_k4v4_g64": torch.uint8,
+     "nvfp4": torch.uint8,
+     "nvfp4_4over6": torch.uint8,
+ }
+--- a/v1/attention/backends/registry.py
++++ b/v1/attention/backends/registry.py
+@@ -123,6 +123,7 @@
+     )
+     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
+     CPU_MLA = "vllm.v1.attention.backends.mla.cpu_mla.CPUMLABackend"
++    KVARN = "vllm.v1.attention.backends.kvarn_attn.KVarNAttentionBackend"
+     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
+     # Placeholder for third-party/custom backends - must be registered before use
+     # set to None to avoid alias with other backend, whose value is an empty string
+--- a/v1/kv_cache_interface.py
++++ b/v1/kv_cache_interface.py
+@@ -51,6 +51,7 @@
+     TURBOQUANT_4BIT_NC = 7
+     TURBOQUANT_K3V4_NC = 8
+     TURBOQUANT_3BIT_NC = 9
++    KVARN = 10
+ 
+     @property
+     def is_per_token_head(self) -> bool:
+@@ -75,6 +76,11 @@
+             KVQuantMode.TURBOQUANT_K3V4_NC,
+             KVQuantMode.TURBOQUANT_3BIT_NC,
+         )
++
++    @property
++    def is_kvarn(self) -> bool:
++        """True for KVarN packed KV-cache quantization."""
++        return self == KVQuantMode.KVARN
+ 
+ 
+ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+@@ -89,6 +95,8 @@
+         return KVQuantMode.NVFP4
+     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
+         return KVQuantMode[kv_cache_dtype.upper()]
++    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
++        return KVQuantMode.KVARN
+     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+         return KVQuantMode.FP8_PER_TENSOR
+     return KVQuantMode.NONE
+
+--- a/v1/worker/gpu/attn_utils.py
++++ b/v1/worker/gpu/attn_utils.py
+@@ -305,5 +305,12 @@
+         )
+         dtype_size = get_dtype_size(kv_cache_spec.dtype)
+-        page_stride = kv_cache_spec.page_size_bytes // dtype_size
++        if kv_cache_spec.kv_quant_mode.is_kvarn:
++            # KVarN stores one packed tile per block/head. Hybrid page
++            # unification may publish a larger logical page (including
++            # num_head_slots), but the physical block stride is the packed
++            # backend shape: one tile for every physical KV head.
++            page_stride = prod(kv_cache_shape[1:])
++        else:
++            page_stride = kv_cache_spec.page_size_bytes // dtype_size
+ 
+         num_blocks_dim = inv_order[0]

@@ -1,21 +1,5 @@
-vLLM PR #50021 (open at the time of writing): bound accepted-token state
-lookups in the Gated DeltaNet / Mamba speculative-decode kernels.
-
-The fused_recurrent / fused_sigmoid_gating / causal_conv1d / selective-scan
-kernels index the recurrent-state slot with (num_accepted_tokens - 1) without
-checking it against the row width; stale or oversized counts produce wild GPU
-addresses. Vendored here (kernel hunks only; the mamba_utils.py prefix-caching
-hunks of the PR do not apply to 0.27.1 and are not needed with prefix caching
-off) because we hit illegal-memory-access crashes with several concurrent MTP
-requests. Note: it does NOT fix the k=4 crash described in single-user/README.md.
-
-Apply from the installed vllm package directory:
-  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/vllm-pr50021-gdn-spec-bounds.patch
-
-Source: https://github.com/vllm-project/vllm/pull/50021 (Apache-2.0).
-
 diff --git a/model_executor/layers/mamba/ops/causal_conv1d.py b/model_executor/layers/mamba/ops/causal_conv1d.py
-index 8335c849666d..e7387484cca6 100644
+index 8335c8496..e7387484c 100644
 --- a/model_executor/layers/mamba/ops/causal_conv1d.py
 +++ b/model_executor/layers/mamba/ops/causal_conv1d.py
 @@ -871,9 +871,21 @@ def _causal_conv1d_update_kernel(
@@ -44,7 +28,7 @@ index 8335c849666d..e7387484cca6 100644
          conv_state_token_offset = 0
  
 diff --git a/model_executor/layers/mamba/ops/mamba_ssm.py b/model_executor/layers/mamba/ops/mamba_ssm.py
-index af45467886ea..73c892d67b5d 100644
+index af4546788..73c892d67 100644
 --- a/model_executor/layers/mamba/ops/mamba_ssm.py
 +++ b/model_executor/layers/mamba/ops/mamba_ssm.py
 @@ -333,7 +333,15 @@ def _selective_scan_update_kernel(
@@ -85,7 +69,7 @@ index af45467886ea..73c892d67b5d 100644
          state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
      else:
 diff --git a/third_party/flash_linear_attention/ops/fused_recurrent.py b/third_party/flash_linear_attention/ops/fused_recurrent.py
-index c8004cb57173..02907c44588e 100644
+index e1d0d965f..4888d0389 100644
 --- a/third_party/flash_linear_attention/ops/fused_recurrent.py
 +++ b/third_party/flash_linear_attention/ops/fused_recurrent.py
 @@ -107,11 +107,29 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
@@ -123,7 +107,7 @@ index c8004cb57173..02907c44588e 100644
              p_h0 = h0 + state_idx * stride_init_state_token
          else:
 diff --git a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
-index 7e0c7e05cab1..261befff8f9a 100644
+index 7e0c7e05c..261befff8 100644
 --- a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
 +++ b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
 @@ -106,12 +106,29 @@ def fused_sigmoid_gating_delta_rule_update_kernel(

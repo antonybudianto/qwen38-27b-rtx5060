@@ -15,6 +15,9 @@ Realistic chat prompts (8 mixed English/Danish/code tasks in
 [bench/prompts_real.jsonl](../bench/prompts_real.jsonl), 1,024-token answers),
 `vllm bench serve --dataset-name custom`, RTX 3090 at 250 W:
 
+> These are vLLM 0.27.1 baseline measurements. Re-benchmark on a GPU after the
+> v0.28.0 upgrade before using the figures for capacity planning.
+
 **`CTX=fast` + fast variant (the default; 64k context)**, as reproduced by
 `bash bench/run_benchmarks.sh single`:
 
@@ -50,6 +53,8 @@ With the base requantization and the earlier draft vocabulary, all cohorts:
 Four drafts win up to two concurrent users; from C4 up the three-draft config
 is ahead (rejected drafts cost more when the verify batch is bigger), so for
 a shared box `CTX=long` or `DRAFT_TOKENS=3` is the better single-user config.
+That trade is MTP's; do not carry it into `SPEC=dflash2`, whose concurrency
+behaviour is different and is measured two sections down.
 Batch mode does 45-46 tok/s single-stream on the same prompts, and overtakes
 this mode from C8 up.
 
@@ -75,23 +80,44 @@ per step, which is the stable signal.
 is a 5-layer block drafter that predicts 7 tokens in one non-autoregressive
 pass from the target's layer 5/19/33/47/61 hidden states, plus a path selector
 over 16 candidates per slot. It runs on vLLM's V2 model runner through
-`patches/dflash2-backport.patch` (vLLM PR #52816 backported to 0.27.1) with the
+vLLM 0.28.0's native DFlash2 support plus
+`patches/dflash2-lookup-drafting.patch` and `patches/dflash2-ngram-chains.patch` with the
 drafter requantized to W4A16 by this repo (1.19 GB instead of 3.85 GB —
 `drafter/README.md`): per step it reads ~1 GB of drafter plus an 8-token verify,
 26.5 ms vs MTP's 24.8, and accepts 3.2-3.4 tokens per step at default sampling
-(MTP: 2.8-2.9), so **+10% at C1 at default sampling, +15% greedy**, and the
-decode rate is higher at every cohort. Where it is *not* the better choice:
+(MTP: 2.8-2.9), so **+10% at C1 at default sampling, +15% greedy**, and a higher
+decode rate on every one of these cohorts except C8, where MTP's 407.3 is ahead of
+its 389.9. Read those cohorts as what they are — eight short chat prompts at a
+concurrency limit, not eight long independent sessions; the next bullet is what
+happens when the streams are big. Where it is *not* the better choice:
 
-- **C8 and up**: every request reserves 1+k = 8 recurrent-state slots (≈0.7 GB,
-  vs 5 slots / 0.44 GB for MTP k=4), so only 5-6 long generations are resident
-  and the rest queue (the 5 s TTFT above, `Running: 5 reqs, Waiting: 3`). MTP
-  reads 329 tok/s e2e at C8, DFlash2 252. One GPU, 1-4 users: DFlash2; more:
-  MTP or batch mode.
+- **More than one stream at a time**, and the cohort table above does not show it
+  because those eight prompts are 45-300 tokens each. Every resident request reserves
+  1+k = 8 recurrent-state slots — **15.8% of the 69,758-token pool**, ~0.82 GiB of its
+  pinned 5.20, before it holds one token of context — against 8.2% for MTP k=4. So seven DFlash2
+  requests are resident with 128-token prompts, five with 4k-token ones and two with
+  16k ones; the extras queue, and once the pool is full something has to be preempted
+  and recomputed to make room. Eight MTP requests fit, four of them at 16k. Measured
+  with `bench/conc_ladder.py` on distinct 4k-token prompts (each salted, so nothing is
+  served from the prefix cache), `MAX_SEQS=8`, 250 W:
+
+  | streams | 1 | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | per-stream decode tok/s | 137 | 97 | 46 | 33 |
+  | aggregate decode tok/s | 137 | 225 | 309 | *5 resident, no steady state* |
+  | ms per forward pass | 25.9 | 32.8 | 49.1 | — |
+  | MTP, same run: per-stream / aggregate | 126 / 124 | 103 / 212 | 46 / 280 | 23 / **383** |
+
+  Aggregate throughput keeps climbing and nothing is preempted, so the verify step is
+  batching; what a second user costs is *latency*. Each resident request adds ~7 ms to
+  every forward pass (MTP: ~5 ms), and MTP keeps scaling to 8 streams where DFlash2 has
+  run out of state pages at 5 — which is the whole of MTP's C8 advantage. One GPU:
+  DFlash2 if the card is yours, MTP or batch mode from the second concurrent user.
 - **Long contexts**: the drafter attends to a 2,048-token window. On a 12k /
   36k-token summarization prompt (chat API) it accepts 2.3-2.6 tokens per step
   against MTP's 2.6-3.0, and the drafter's own prefill adds ~15% to TTFT; end to
   end the two are within 5-10% there, MTP ahead. Up to ~8k tokens of context,
-  which is most single-user traffic, DFlash2 wins.
+  which is most single-user traffic, DFlash2 wins — at one request in flight.
 - **Context length**: 64k (69,758 tokens of pool, 8 request slots), or 56k and 4 slots
   in reproduction mode (`DFLASH_TOKENS=15`). Either way the pool is pinned by bytes
   (`KV_MEM`, 5.2 GiB) instead of by `GPU_UTIL`: `patches/hybrid-kv-groups-v2-cudagraph.patch` stops the drafter's
@@ -274,7 +300,7 @@ attempt that did not help).
 
 k=4 is the fastest but not the default: on the FlashInfer attention backend
 (the only one that supports fp8 KV on Ampere, and fp8 KV is what makes 150k
-context fit) vLLM 0.27.1 dies with an illegal memory access as soon as one
+context fit) the vLLM 0.28.0 FlashInfer path dies with an illegal memory access as soon as one
 request finishes while another is mid-generation with 4 drafts (with or
 without our patches; the vendored PR #50021 bounds fix does not cure it;
 club-3090 sees the same "n=4 eventually dies, n=3 stable" on their rigs, and
@@ -363,11 +389,14 @@ included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
 | `DRAFT_TOKENS` | 4 (3 for `CTX=long`/`huge`) | speculative depth; 5 and 6 are slower |
 | `SPEC_ATTN` | 1 (`CTX=fast` only) | split-KV Triton attention for the verify step (`patches/spec-decode-attn.patch`); 0 = FlashAttention-2 |
 | `DRAFT_SAMPLE` | `probabilistic` | `greedy` drafts: same speed at T=0, ~15% slower at T>0 |
-| `MAX_SEQS` | 8 | plenty for a few users; each request holds k+1 recurrent-state slots |
+| `MAX_SEQS` | 8 | how many requests are *admitted*, not how many the pool can hold: each resident request needs k+1 recurrent-state slots (0.88 GiB at DFlash2 k=7 — seven residents with short prompts, five at 4k, two at 16k), and the launcher prints the number at boot |
 | `MAX_LEN` | 65536 (`fast`) / 150000 (`long`) | 150k needs `GPU_UTIL` 0.93 |
 | `GPU_UTIL` | 0.93 | soak-tested with a 100k prompt and 4×6k-token generations; batch mode's 0.972 OOMs in the MTP path (docs/gotchas.md, gotcha 4) |
 | `MTP_DRAFT_VOCAB` | 1 | set 0 to draft with the full lm_head (more acceptance, slower per draft) |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
+| `VISION` | 0 | 1 keeps the vision tower instead of `--language-model-only` (0.858 GiB of BF16 weights on this checkpoint), for a client that sends images: one image per prompt and a 2048-image-token pixel cap, both overridable from `EXTRA_ARGS` |
+| `VISION_OFFLOAD` | 1 | with `VISION=1`, keeps the tower's weights in pinned host RAM and copies each module to the GPU for its own forward (`patches/vision-tower-cpu-offload.patch`). **On 24 GB, `SPEC=dflash2` + `VISION=1` does not boot with this off** — the tower is 0.85 GiB of the ~1.1 GiB transient margin, and graph capture OOMs allocating the 960 MiB split-KV verify buffer with 787 MiB free. With it on, the same config comes up at the full 69,758-token pool and reads images. Costs 296 → 333 ms of encode per 8192-patch image, output bit-exact. 0 only on a card with headroom to spare. `VLLM_VISION_CPU_OFFLOAD_GB` (default 1) is the budget in GiB |
+| `REQ_METRICS` | 0 | 1 = `--enable-per-request-metrics --enable-force-include-usage`: per-request timing fields in every response and `usage` on every request, the fields llama-swap's dashboard reads ([#51](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/51)). `prompt_tokens_details.cached_tokens` is always on. Not compatible with `--disable-log-stats` in `EXTRA_ARGS`; vLLM's per-request spec-decode summary flag is nightly-only, not in 0.27.1 |
 | `PORT` | 18020 | |
 
 ## Switching modes
