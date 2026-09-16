@@ -106,7 +106,7 @@ INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
 [ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
 [ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
 # PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
-# layers during prefill (patches/triton-prefill-attn-int8.patch): 1.27-1.35x FA2 on
+# layers during prefill (patches/prefill-attn-int8.patch): 1.27-1.35x FA2 on
 # the attention itself, worth up to ~+5% end-to-end at 51k on top of INT8_ACT
 # (1,839/1,498 tok/s at 16k/51k with both on). It is a companion to INT8_ACT, not
 # a standalone switch: on its own it moves prefill +0.3/+1.1/+3.3% at 4k/16k/51k
@@ -146,6 +146,12 @@ CTX=${CTX:-fast}
 SPEC=${SPEC:-mtp}
 # SPEC_ATTN=1: split-KV Triton attention for the multi-query verify step
 # (patches/spec-decode-attn.patch); bf16 KV only, so CTX=fast only.
+# Remember whether MAX_LEN came from the caller: the SPEC=dflash2 profiles below pick
+# their own context default per profile, and used to overwrite a caller's MAX_LEN with
+# it, so `MAX_LEN=8192 SPEC=dflash2 ...` booted at 65536 and said so only in the
+# engine's args line (#25, item 13). Precedence on that path is now
+# DFLASH_MAX_LEN > MAX_LEN > the profile default.
+USER_MAX_LEN=${MAX_LEN:-}
 if [ "$CTX" = "fast" ]; then
   MAX_LEN=${MAX_LEN:-65536}
   DRAFT_TOKENS=${DRAFT_TOKENS:-4}
@@ -165,7 +171,7 @@ if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # int8 per-token-head KV on the Triton backend: the same 5.2 GiB pool holds 136,429
   # tokens instead of 69,758, because patches/hybrid-sw-block-promote.patch stops the
   # drafter's 5 sliding-window layers from taking 385 nearly-empty blocks, and
-  # patches/spec-decode-attn-int8.patch lets the split-KV verify kernel read the quantized
+  # patches/spec-decode-int8-kv.patch lets the split-KV verify kernel read the quantized
   # cache (vLLM's own Triton attention will not split KV for a multi-query verify, which
   # is every step here, and costs 7.4 ms per layer at 128k against this kernel's 1.3).
   # Costs prefill: 251 s to load a 112k document against FLASH_ATTN's ~112 s. With
@@ -224,7 +230,10 @@ if [ "$SPEC" = "dflash2" ]; then
   # reference 3090, CTX=fast k=15: 2.66 tok/step and 101.4 tok/s unset against 3.23 and
   # 121.7 set, with 3.19/120.5 on 0.27.1. The boot log says which you got: draft_logits.
   # The mtp branch below has always set it.
-  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
+  # DRAFT_METHOD=dspark runs a DSpark drafter (RadixArk/Qwen3.8-27B-DSpark, seven drafts per
+  # step like the shipped head) through the same profile; it needs
+  # patches/dspark-draft-quant-config.patch and the architecture rename in the README.
+  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
   # The split-KV verify attention (patches/spec-decode-attn.patch) sizes its partial
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.
@@ -325,9 +334,9 @@ if [ "$SPEC" = "dflash2" ]; then
     # fix this and I checked: KV_MEM is pinned, so the pool does not grow when graph
     # memory is accounted differently. 221184 = 1728 x 128 leaves ~2.6% margin (229376 was still 1% short).
     if [ "$DRAFT_TOKENS" -gt 7 ]; then
-      MAX_LEN=${DFLASH_MAX_LEN:-221184}
+      MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-221184}}
     else
-      MAX_LEN=${DFLASH_MAX_LEN:-245760}
+      MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-245760}}
     fi
     KV_MEM=${KV_MEM-5261334938}
     # Above 7 drafts the decode graphs are captured for BOTH block lengths, which is
@@ -346,7 +355,7 @@ if [ "$SPEC" = "dflash2" ]; then
     # (138,696 without), against bf16's 69,758 in the same pinned 5.2 GiB. DFLASH_TOKENS>7
     # at this context is untested -- the graphs and the state pages both grow.
     MAX_SEQS=${MAX_SEQS:-4}
-    MAX_LEN=${DFLASH_MAX_LEN:-131072}
+    MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-131072}}
     KV_MEM=${KV_MEM-5583457484}
     if [ "$DRAFT_TOKENS" -gt 7 ]; then
       export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
@@ -358,18 +367,48 @@ if [ "$SPEC" = "dflash2" ]; then
     # graphs are what the long block costs, and this is where they still fit next to the
     # 5.2 GiB pool (57,669 tokens). DFLASH_TOKENS=7 gets 8 slots and 64k back.
     MAX_SEQS=${MAX_SEQS:-4}
-    MAX_LEN=${DFLASH_MAX_LEN:-57344}
+    MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-57344}}
     KV_MEM=${KV_MEM-5583457484}
     # Decode graphs are captured for both block lengths (the drafter's and the full verify
     # block), or the short step -- the common one -- runs piecewise and costs 8%. That is
     # 1.8 GiB of graphs instead of 1.45.
     export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
   else
-    MAX_LEN=${DFLASH_MAX_LEN:-65536}
+    MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-65536}}
     KV_MEM=${KV_MEM-5583457484}
     # If you tune GPU_UTIL instead, make the V2 runner count its CUDA graphs (~1.2-1.3 GiB
     # at these capture sizes) as well:
     export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
+  fi
+  # The three memory budgets above (the pinned KV_MEM, GPU_UTIL, and the V2 runner's
+  # graph reservation) are sized for the shipped 1.2 GiB W4A16 head with about a
+  # gigabyte to spare on a 24 GiB card, and none of them knows the drafter's size. A bf16
+  # community drafter (3.5 to 4.0 GiB) does not fit them at any context: the floor is the
+  # per-request state, not the token count, and a bigger drafter is charged twice, as
+  # weights and as a larger per-request KV requirement (about 4.97 GiB per 65536-token
+  # request beside the shipped head, derived from a served boot's pool of 68,605 tokens at
+  # the 5.2 GiB pin; 7.05 GiB beside a 3.5 GiB drafter, logged at the refusal). None of
+  # the engine's error messages names the pin, the reservation or DFLASH_MAX_LEN, so say
+  # it here instead of after seven boots (#25, items 13 and 14). Measured to serve both
+  # community drafters on 24 GiB: KV_MEM=3000000000 DFLASH_MAX_LEN=8192 (pinned, 4090), or
+  # GPU_UTIL=0.97 KV_MEM= DFLASH_MAX_LEN=8192 (unpinned, 3090); the pinned profile costs the
+  # shipped head nothing measurable at width 7. Warning, not a refusal: a bigger card has
+  # room where 24 GiB does not.
+  DRAFT_BYTES=$(du -sb "$DRAFT" 2>/dev/null | cut -f1)
+  if [ -n "$DRAFT_BYTES" ] && [ "$DRAFT_BYTES" -gt 2147483648 ]; then
+    DRAFT_GIB=$(( (DRAFT_BYTES + 536870912) / 1073741824 ))
+    if [ -n "$KV_MEM" ] && [ -z "${DFLASH_MAX_LEN:-}" ] && [ -z "$USER_MAX_LEN" ]; then
+      echo "[start_qwen] WARNING: the drafter at $DRAFT is about ${DRAFT_GIB} GiB of weights; the" \
+           "memory defaults (KV_MEM=$KV_MEM pinned, GPU_UTIL=$GPU_UTIL, VLLM_V2_CUDAGRAPH_MEM_MIB=$VLLM_V2_CUDAGRAPH_MEM_MIB," \
+           "MAX_LEN=$MAX_LEN) are sized for the shipped 1.2 GiB head and a 24 GiB card, and a" \
+           "drafter this size does not fit them at any context (the per-request state is the" \
+           "floor, #25 item 13). Measured to serve a 4 GiB bf16 drafter on 24 GiB:" \
+           "KV_MEM=3000000000 DFLASH_MAX_LEN=8192, or GPU_UTIL=0.97 KV_MEM= DFLASH_MAX_LEN=8192." \
+           "On WSL2 an over-committed pin does not fail, it runs 3-6x slower (#25 item 14)." >&2
+    else
+      echo "[start_qwen] note: drafter $DRAFT is about ${DRAFT_GIB} GiB of weights, beside" \
+           "KV_MEM=${KV_MEM:-unpinned} MAX_LEN=$MAX_LEN GPU_UTIL=$GPU_UTIL."
+    fi
   fi
   MAX_SEQS=${MAX_SEQS:-8}
   # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS

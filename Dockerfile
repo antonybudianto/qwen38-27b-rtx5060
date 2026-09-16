@@ -10,7 +10,7 @@
 # that only happens once.
 #
 #   docker compose --profile single up -d      (see docs/docker.md)
-FROM nvidia/cuda:13.0.1-base-ubuntu24.04
+FROM nvidia/cuda:13.0.3-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,12 +25,15 @@ COPY docker/requirements.txt docker/requirements.txt
 RUN venv/bin/pip install -r docker/requirements.txt
 
 COPY . .
+# Patch apply order lives in patches/series: a few patches carry hunk context
+# that an earlier patch adds, so the glob order of patches/*.patch is wrong.
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
-    for p in patches/*.patch; do \
-      case "$p" in \
-        patches/dflash2-backport.patch) echo "== skip $p (DFlash2 is native in vLLM 0.28.0)"; continue ;; \
+    sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series | \
+    while IFS= read -r name; do \
+      case "$name" in \
+        dflash2-backport.patch) echo "== skip $name (DFlash2 is native in vLLM 0.28.0)"; continue ;; \
       esac; \
-      echo "== $p"; patch -p1 -d "$SP" < "$p"; \
+      echo "== $name"; patch -p1 -d "$SP" < "patches/$name"; \
     done; \
     bash kvarn/install.sh; \
     bash verify.sh --install
@@ -38,7 +41,7 @@ RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm
 # HOME is a volume: torch.compile cache (~/.cache/vllm), Triton (~/.triton),
 # FlashInfer JIT (~/.cache/flashinfer), HF hub cache.
 RUN mkdir -p /cache /app/models && chmod 1777 /cache
-ENV HOME=/cache VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 HF_HUB_ENABLE_HF_TRANSFER=1
+ENV HOME=/cache VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 HF_XET_HIGH_PERFORMANCE=1
 VOLUME ["/cache", "/app/models"]
 EXPOSE 18020
 ENTRYPOINT ["bash", "docker/entrypoint.sh"]

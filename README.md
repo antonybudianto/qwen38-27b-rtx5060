@@ -18,9 +18,18 @@ on port 18020. Pick a mode — one GPU serves one at a time:
 ```bash
 git clone https://github.com/syv-ai/qwen38-27b-rtx3090 && cd qwen38-27b-rtx3090
 
+cp .env.example .env                 # Linux / WSL
+# PowerShell: Copy-Item .env.example .env
+
 docker compose --profile single up -d    # one or a few people chatting
 docker compose --profile batch  up -d    # API backend, many concurrent requests
 ```
+
+The example uses the recommended single-user `SPEC=dflash2` profile. If Docker
+Desktop is using WSL2, keep `VLLM_WSL2_ENABLE_PIN_MEMORY=1` enabled in `.env` or
+the V2 runner will abort with `RuntimeError: UVA is not available`. The example
+leaves API-key authentication disabled for local-only use; set `VLLM_API_KEY`
+before exposing the server beyond this machine.
 
 | | `--profile batch` → [batch/](batch/) | `--profile single` → [single-user/](single-user/) |
 |---|---|---|
@@ -214,6 +223,29 @@ anything model-shaped. Those buffers work fine on the paravirt driver. Note the
 name: `VLLM_WSL_PIN_MEMORY` is **not** a vLLM variable and setting it does
 nothing — this README named it for 22 minutes on 2026-08-21 (`589daae`, fixed in
 `27f51fa`), so a tree cloned in that window will have it.
+
+**On WSL2 the usable dedicated memory is about half a gigabyte less than the
+same card on bare metal, and the shipped `SPEC=dflash2` boot sits about 50 MiB
+under it.** Anything larger (a wider verify block, a bigger drafter, a raised
+pin, a boot that recompiles a graph) runs two to six times slower instead of
+failing, and the log does not say so; `nvidia-smi` looks the same either way.
+Gotcha 58 has the counters to read, the four costs that turned out to be this,
+and the profile that gives it room (`KV_MEM=3000000000 DFLASH_MAX_LEN=8192`,
+free for the shipped head at width 7).
+
+**Running a DSpark drafter.** vLLM 0.28.0 can serve RadixArk/Qwen3.8-27B-DSpark
+(bf16, seven drafts per step like the shipped head) once two things are in
+place: `patches/dspark-draft-quant-config.patch` (the loader refuses a bf16
+drafter beside the quantized target without it), and a copy of the checkpoint
+whose `config.json` names the architecture `Qwen3DSparkModel` instead of
+`DSparkDraftModel` (the registry maps the published name to the DeepSeek V4
+class; the weights are unchanged, so hard-link the safetensors). Then
+`DRAFT=/path/to/that/copy DRAFT_METHOD=dspark KV_MEM=3000000000
+DFLASH_MAX_LEN=8192 SPEC=dflash2 CTX=fast bash single-user/start_qwen.sh`. It
+serves, and loses to the shipped head on the same requests: 3.19 against 3.77
+tokens per step (accepted drafts plus the bonus token) and 115 against 160 tok/s on a 4090, 3.37 against 3.83
+and 114 against 150 on a 3090 (issue #25, items 15 and 16). Documented so nobody
+re-derives the two errors, not as a recommendation.
 
 One knob this mode used to set for you, and now sets only for MTP:
 `cudagraph_mode=PIECEWISE`. Prefix caching and a *captured* (FULL) verify step
@@ -725,7 +757,7 @@ venv/bin/pip install vllm==0.28.0 huggingface_hub hf_transfer ninja \
 # vLLM's C extension.
 
 # model, ~19.5 GB
-HF_HUB_ENABLE_HF_TRANSFER=1 venv/bin/hf download \
+HF_XET_HIGH_PERFORMANCE=1 venv/bin/hf download \
   dbirks/Qwen3.8-27B-W4A16-AutoRound \
   --local-dir models/Qwen3.8-27B-W4A16-AutoRound
 
@@ -748,11 +780,16 @@ venv/bin/python prepare/fetch_thirdparty.py
 venv/bin/python prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
 
 # patch vllm (all compatible patches are written against 0.28.0; reapply after upgrades)
-for p in patches/*.patch; do
-  case "$p" in
-    patches/dflash2-backport.patch) echo "skip $p (DFlash2 is native in vLLM 0.28.0)"; continue ;;
+# Order is patches/series, one basename per line: a few patches carry hunk context
+# that an earlier patch adds, so the glob order of the directory is wrong. A new
+# independent patch goes on the last line; one that must apply before an existing
+# patch is listed before it.
+sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series |
+while IFS= read -r name; do
+  case "$name" in
+    dflash2-backport.patch) echo "skip $name (DFlash2 is native in vLLM 0.28.0)"; continue ;;
   esac
-  patch -p1 -d venv/lib/python3.12/site-packages/vllm < "$p"
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < "patches/$name"
 done
 # optional: the KVarN 4/2-bit KV cache for 262k context (docs/long-context.md)
 bash kvarn/install.sh
@@ -789,6 +826,53 @@ Tool calling works over the same endpoint — send `tools` with `tool_choice:
 `--enable-auto-tool-choice --tool-call-parser qwen3_coder`; the parser has to
 read Qwen's XML call format, which is what this model's chat template emits —
 not the JSON that `hermes` reads. `TOOLS=0` turns it off.
+
+### OpenCode (optional)
+
+If you want to point [OpenCode](https://opencode.ai) at this local vLLM server,
+add an `opencode.json` file in the directory where you run it from, or place it
+in `~/.config/opencode/`. The base URL must include `/v1`, and the model name
+must match what the server is serving — `http://127.0.0.1:18020/v1` and
+`qwen3.8-27b` for the default single-user setup shown here.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "qwen-local/qwen3.8-27b",
+  "provider": {
+    "qwen-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen 3.8 27B (local RTX 3090)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18020/v1",
+        "apiKey": "$VLLM_API_KEY"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen 3.8 27B",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+With the server running, install the OpenCode CLI and launch it from the same
+location:
+
+```bash
+opencode
+```
+
+If auth is disabled, any placeholder value works for `apiKey`; if you enabled
+`VLLM_API_KEY`, set the same value here. The `context` value above assumes the
+default `CTX=fast` profile (`65536`); `CTX=long` is `131072`, and `CTX=huge` is
+`245760`. Under-declaring the window can make the client silently truncate
+context.
 
 To check the numbers on your own card: `bash verify.sh` (also probes the live
 server and prints which attention backend and KV pool it came up with), then
