@@ -1,8 +1,12 @@
+
+
+--- exported from cpuchip/vllm 5d5b356fb (vllm-pr50021-gdn-spec-bounds); regenerate with scripts/export-patch.sh, do not edit ---
+
 diff --git a/model_executor/layers/mamba/ops/causal_conv1d.py b/model_executor/layers/mamba/ops/causal_conv1d.py
 index 8335c8496..e7387484c 100644
 --- a/model_executor/layers/mamba/ops/causal_conv1d.py
 +++ b/model_executor/layers/mamba/ops/causal_conv1d.py
-@@ -871,9 +871,21 @@ def _causal_conv1d_update_kernel(
+@@ -871,9 +871,21 @@
          # - accept 1 tokens: [history2, ..., historyM, draft1]
          # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
          # - and so on.
@@ -31,7 +35,7 @@ diff --git a/model_executor/layers/mamba/ops/mamba_ssm.py b/model_executor/layer
 index af4546788..73c892d67 100644
 --- a/model_executor/layers/mamba/ops/mamba_ssm.py
 +++ b/model_executor/layers/mamba/ops/mamba_ssm.py
-@@ -333,7 +333,15 @@ def _selective_scan_update_kernel(
+@@ -333,7 +333,15 @@
      if HAS_STATE_BATCH_INDICES:
          if IS_SPEC_DECODING:
              num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
@@ -47,7 +51,7 @@ index af4546788..73c892d67 100644
          else:
              init_token_idx = 0
  
-@@ -347,9 +355,17 @@ def _selective_scan_update_kernel(
+@@ -347,9 +355,17 @@
                  dst_state_batch_idx * stride_state_batch + pid_h * stride_state_head
              )
  
@@ -72,7 +76,7 @@ diff --git a/third_party/flash_linear_attention/ops/fused_recurrent.py b/third_p
 index e1d0d965f..4888d0389 100644
 --- a/third_party/flash_linear_attention/ops/fused_recurrent.py
 +++ b/third_party/flash_linear_attention/ops/fused_recurrent.py
-@@ -107,11 +107,29 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
+@@ -107,11 +107,29 @@
              else:
                  i_t = 0
              # Load state index and check for invalid entries
@@ -110,7 +114,7 @@ diff --git a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/th
 index 7e0c7e05c..261befff8 100644
 --- a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
 +++ b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
-@@ -106,12 +106,29 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+@@ -106,12 +106,29 @@
                  i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
              else:
                  i_t = 0

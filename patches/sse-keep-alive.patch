@@ -18,8 +18,13 @@ original hunks landed unchanged; paths are relative to the vllm package
     (set in start_qwen.sh)
 
 diff -ruN a/entrypoints/openai/chat_completion/api_router.py b/entrypoints/openai/chat_completion/api_router.py
---- a/entrypoints/openai/chat_completion/api_router.py	2026-09-06 04:04:51.233097079 +0300
-+++ b/entrypoints/openai/chat_completion/api_router.py	2026-09-06 04:04:51.233585309 +0300
+
+--- exported from cpuchip/vllm 5611a50d4 (sse-keep-alive); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/entrypoints/openai/chat_completion/api_router.py b/entrypoints/openai/chat_completion/api_router.py
+index 6f3289ede..30b53678b 100644
+--- a/entrypoints/openai/chat_completion/api_router.py
++++ b/entrypoints/openai/chat_completion/api_router.py
 @@ -15,6 +15,7 @@
  )
  from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
@@ -42,9 +47,10 @@ diff -ruN a/entrypoints/openai/chat_completion/api_router.py b/entrypoints/opena
  
  
  @router.post(
-diff -ruN a/entrypoints/openai/cli_args.py b/entrypoints/openai/cli_args.py
---- a/entrypoints/openai/cli_args.py	2026-09-06 04:04:51.233131303 +0300
-+++ b/entrypoints/openai/cli_args.py	2026-09-06 04:04:51.233614304 +0300
+diff --git a/entrypoints/openai/cli_args.py b/entrypoints/openai/cli_args.py
+index b387fb635..63723558d 100644
+--- a/entrypoints/openai/cli_args.py
++++ b/entrypoints/openai/cli_args.py
 @@ -137,6 +137,13 @@
      """If set to True, enable tracking server_load_metrics in the app state."""
      enable_force_include_usage: bool = False
@@ -73,9 +79,10 @@ diff -ruN a/entrypoints/openai/cli_args.py b/entrypoints/openai/cli_args.py
      if getattr(args, "enable_per_request_metrics", False) and getattr(
          args, "disable_log_stats", False
      ):
-diff -ruN a/entrypoints/openai/completion/api_router.py b/entrypoints/openai/completion/api_router.py
---- a/entrypoints/openai/completion/api_router.py	2026-09-06 04:04:51.233122006 +0300
-+++ b/entrypoints/openai/completion/api_router.py	2026-09-06 04:04:51.233605447 +0300
+diff --git a/entrypoints/openai/completion/api_router.py b/entrypoints/openai/completion/api_router.py
+index 441aef165..d5bef1ebf 100644
+--- a/entrypoints/openai/completion/api_router.py
++++ b/entrypoints/openai/completion/api_router.py
 @@ -13,6 +13,7 @@
  )
  from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
@@ -98,9 +105,11 @@ diff -ruN a/entrypoints/openai/completion/api_router.py b/entrypoints/openai/com
  
  
  def attach_router(app: FastAPI):
-diff -ruN a/entrypoints/openai/sse_keep_alive.py b/entrypoints/openai/sse_keep_alive.py
---- a/entrypoints/openai/sse_keep_alive.py	1970-01-01 03:00:00.000000000 +0300
-+++ b/entrypoints/openai/sse_keep_alive.py	2026-09-06 04:04:51.233622780 +0300
+diff --git a/entrypoints/openai/sse_keep_alive.py b/entrypoints/openai/sse_keep_alive.py
+new file mode 100644
+index 000000000..8ed7a75c6
+--- /dev/null
++++ b/entrypoints/openai/sse_keep_alive.py
 @@ -0,0 +1,65 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -167,4 +176,4 @@ diff -ruN a/entrypoints/openai/sse_keep_alive.py b/entrypoints/openai/sse_keep_a
 +        # Close the upstream generator so its cleanup runs deterministically.
 +        with contextlib.suppress(BaseException):
 +            await generator.aclose()
-\ В конце файла нет новой строки
+\ No newline at end of file

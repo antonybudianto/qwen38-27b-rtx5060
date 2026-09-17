@@ -92,7 +92,10 @@ VERIFICATION
 
 ---
 
+--- exported from cpuchip/vllm 6046544dd (spec-decode-scratch-token-units); regenerate with scripts/export-patch.sh, do not edit ---
+
 diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index fd5469386..6d534c38f 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
 @@ -59,6 +59,10 @@
@@ -227,6 +230,7 @@ diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton
              softmax_segm_output=softmax_segm_output,
              softmax_segm_max=softmax_segm_max,
 diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
+index 0dd51124c..560119971 100644
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
 @@ -13,6 +13,29 @@
@@ -401,6 +405,7 @@ diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per
          softmax_segm_output=softmax_segm_output,
          softmax_segm_max=softmax_segm_max,
 diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
+index e92cc4ced..4e2fa2d26 100644
 --- a/v1/attention/ops/triton_unified_attention.py
 +++ b/v1/attention/ops/triton_unified_attention.py
 @@ -838,6 +838,8 @@

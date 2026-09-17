@@ -63,6 +63,10 @@ int4_per_token_head.py are untouched. Pool logic: bench/mq3d_scratch_pool_test.p
 (CPU tensors, runs inside the image). Measurements and the reading:
 docs/spec-decode-scratch-token-units.md, "Follow-up".
 
+--- exported from cpuchip/vllm 289bd88c5 (spec-decode-scratch-within-budget); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index 6d534c38f..0c24c7a39 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
 @@ -9,7 +9,7 @@
@@ -250,7 +254,7 @@ docs/spec-decode-scratch-token-units.md, "Follow-up".
  @dataclass
  class TritonAttentionMetadata:
      # NOTE(sang): Definition of context_len, query_len, and seq_len.
-@@ -141,30 +310,7 @@
+@@ -143,30 +312,7 @@
              )
          )
  
@@ -281,7 +285,7 @@ docs/spec-decode-scratch-token-units.md, "Follow-up".
          # ---- UNIT SPLIT ------------------------------------------------------------
          # These three quantities were one variable, in three different units. The
          # scratch buffers are indexed by QUERY TOKEN, but were sized by
-@@ -185,57 +331,29 @@
+@@ -187,57 +333,29 @@
          # requires num_seqs <= seq_threshold_3D, and no batch can carry more query
          # tokens than the scheduler will place in one, so this is the smallest
          # capacity that can hold every policy-eligible batch.
@@ -290,7 +294,16 @@ docs/spec-decode-scratch-token-units.md, "Follow-up".
 -        self.scratch_token_capacity_3d = min(
 -            _sched.max_num_batched_tokens,
 -            min(_sched.max_num_seqs, self.seq_threshold_3D) * self.max_query_len_3d,
--        )
++        plan = mq3d_scratch_plan(self.vllm_config, self.num_heads_q)
++        assert (plan.num_heads_kv, plan.headdim_padded) == (
++            self.num_heads_kv, next_power_of_2(self.headdim)
++        ), "int4 3D scratch plan geometry disagrees with the builder's"
++        self.seq_threshold_3D = plan.seq_threshold_3D
++        self.max_query_len_3d = plan.max_query_len_3d
++        scratch = mq3d_scratch_acquire(
++            plan, device, "metadata builder",
++            exclusive=bool(getattr(self.vllm_config.parallel_config, "use_ubatching", False)),
+         )
 -
 -        _rows = self.scratch_token_capacity_3d
 -        _row_bytes = 4 * (
@@ -331,16 +344,6 @@ docs/spec-decode-scratch-token-units.md, "Follow-up".
 -        # All three buffers must agree with the DECLARED capacity. One oversized
 -        # buffer can otherwise mask another undersized one until a different reducer
 -        # path is taken.
-+        plan = mq3d_scratch_plan(self.vllm_config, self.num_heads_q)
-+        assert (plan.num_heads_kv, plan.headdim_padded) == (
-+            self.num_heads_kv, next_power_of_2(self.headdim)
-+        ), "int4 3D scratch plan geometry disagrees with the builder's"
-+        self.seq_threshold_3D = plan.seq_threshold_3D
-+        self.max_query_len_3d = plan.max_query_len_3d
-+        scratch = mq3d_scratch_acquire(
-+            plan, device, "metadata builder",
-+            exclusive=bool(getattr(self.vllm_config.parallel_config, "use_ubatching", False)),
-+        )
 +        self.softmax_segm_output = scratch.output
 +        self.softmax_segm_max = scratch.max
 +        self.softmax_segm_expsum = scratch.expsum
@@ -357,7 +360,7 @@ docs/spec-decode-scratch-token-units.md, "Follow-up".
          ), "int4 3D scratch buffers disagree with the declared token capacity"
          self.rswa_window = model_config.rswa_window
          self.persistent_rswa_prefix_lens: torch.Tensor | None = None
-@@ -643,6 +761,20 @@
+@@ -662,6 +780,20 @@
          else:
              self.use_td = td_override
  

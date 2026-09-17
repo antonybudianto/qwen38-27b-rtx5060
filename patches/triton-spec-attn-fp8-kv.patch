@@ -50,10 +50,16 @@ this patch's last hunks (after speed-knobs-envs.patch, whose lines are the conte
 it sits in vLLM's registry and the torch.compile cache key rather than in a bare
 os.environ read (review of #90).
 
+Env knobs this patch reads go through vllm.envs and are registered there (2026-09-15, the 0.28 hygiene pass; the
+registry mirrors the raw defaults, and registration puts them in the torch.compile cache key): (none; read moved to the registry)
+
+--- exported from cpuchip/vllm ec0dc98ec (triton-spec-attn-fp8-kv); regenerate with scripts/export-patch.sh, do not edit ---
+
 diff --git a/envs.py b/envs.py
+index d809ed21c..a86203d00 100755
 --- a/envs.py
 +++ b/envs.py
-@@ -199,6 +199,8 @@
+@@ -236,6 +236,8 @@
      # syv patch: int4 multi-query 3D verify switch and its debug print (same reason)
      VLLM_INT4_MQ_3D: bool = False
      VLLM_INT4_MQ_3D_DEBUG: bool = False
@@ -62,8 +68,8 @@ diff --git a/envs.py b/envs.py
      # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
      VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
      VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
-@@ -1552,6 +1554,7 @@
-     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+@@ -1621,6 +1623,7 @@
+     "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
      "VLLM_INT4_MQ_3D": lambda: os.environ.get("VLLM_INT4_MQ_3D", "0") == "1",
      "VLLM_INT4_MQ_3D_DEBUG": lambda: os.environ.get("VLLM_INT4_MQ_3D_DEBUG", "0") == "1",
 +    "VLLM_SPEC_ATTN_DEBUG": lambda: os.environ.get("VLLM_SPEC_ATTN_DEBUG", "0") == "1",
@@ -71,9 +77,10 @@ diff --git a/envs.py b/envs.py
          os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
      ),
 diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
+index 791f7af75..466f418cb 100755
 --- a/v1/attention/backends/flash_attn.py
 +++ b/v1/attention/backends/flash_attn.py
-@@ -1925,3 +1925,31 @@
+@@ -1920,3 +1920,31 @@
      att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
              cu_seqlens_q.shape[0] - 1, max_seqlen_q,
              k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
@@ -106,6 +113,7 @@ diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_a
 +            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
 +            k_descale=k_descale, v_descale=v_descale, q_descale=q_descale)
 diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index 0c24c7a39..254a5e8e5 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
 @@ -45,6 +45,7 @@
@@ -177,17 +185,10 @@ diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton
                  self,
                  query[:num_actual_tokens],
 diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
+index 76b7ef36e..becde513f 100644
 --- a/v1/attention/ops/spec_decode_attn.py
 +++ b/v1/attention/ops/spec_decode_attn.py
-@@ -41,6 +41,7 @@
- window / softcap / alibi.
- """
- import os
-+import vllm.envs as envs
- 
- import torch
- import triton
-@@ -56,7 +57,7 @@
+@@ -57,7 +57,7 @@
  def _spec_attn_partial(
      q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr,
      part_o_ptr, part_m_ptr, part_l_ptr,
@@ -196,7 +197,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
      scale,
      stride_qt, stride_qh,
      stride_kb, stride_ks, stride_kh,
-@@ -66,7 +67,7 @@
+@@ -67,7 +67,7 @@
      stride_vsb, stride_vss, stride_vsh,
      G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
      BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
@@ -205,7 +206,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
  ):
      pid = tl.program_id(0)
      req = pid // NTILE
-@@ -87,6 +88,9 @@
+@@ -88,6 +88,9 @@
      d = tl.arange(0, D)
      q_ptrs = q_ptr + (q_start + ri)[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
      q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
@@ -215,7 +216,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
  
      # this segment's key range
      tiles_total = (kv_len + TILE - 1) // TILE
-@@ -98,6 +102,12 @@
+@@ -99,6 +102,12 @@
      l_i = tl.zeros([BLOCK_M], tl.float32)
      acc = tl.zeros([BLOCK_M, D], tl.float32)
      qs = (q * scale).to(tl.bfloat16)
@@ -228,7 +229,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
  
      for t in range(t0, t1):
          pos = t * TILE + tl.arange(0, TILE)
-@@ -120,6 +130,10 @@
+@@ -121,6 +130,10 @@
              v_sc = tl.load(vs_ptr + blk * stride_vsb + slot * stride_vss + kvh * stride_vsh,
                             mask=k_ok, other=0.0)
              s = tl.dot(qs, tl.trans(k)).to(tl.float32) * k_sc[None, :]
@@ -239,7 +240,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
          else:
              s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
          allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
-@@ -131,6 +145,8 @@
+@@ -132,6 +145,8 @@
          l_i = l_i * alpha + tl.sum(p, 1)
          if QUANT:
              acc = acc * alpha[:, None] + tl.dot((p * v_sc[None, :]).to(tl.bfloat16), v).to(tl.float32)
@@ -248,7 +249,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
          else:
              acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v).to(tl.float32)
          m_i = m_new
-@@ -207,23 +223,43 @@
+@@ -208,23 +223,43 @@
          return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
  
      def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale,
@@ -295,7 +296,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
              scale,
              q.stride(0), q.stride(1),
              key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-@@ -232,7 +268,7 @@
+@@ -233,7 +268,7 @@
              *(k_scale_cache.stride() if quant else (0, 0, 0)),
              *(v_scale_cache.stride() if quant else (0, 0, 0)),
              G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
@@ -304,7 +305,7 @@ diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode
              num_warps=warps, num_stages=1,
          )
          _spec_attn_combine[(num_reqs, Hq, max_query_len)](
-@@ -240,4 +276,8 @@
+@@ -241,4 +276,8 @@
              out.stride(0), out.stride(1),
              Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
          )

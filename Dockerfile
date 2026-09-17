@@ -33,7 +33,7 @@ RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm
       case "$name" in \
         dflash2-backport.patch) echo "== skip $name (DFlash2 is native in vLLM 0.28.0)"; continue ;; \
       esac; \
-      echo "== $name"; patch -p1 -d "$SP" < "patches/$name"; \
+      echo "== $name"; patch -p1 --fuzz 0 --no-backup-if-mismatch -d "$SP" < "patches/$name"; \
     done; \
     bash kvarn/install.sh; \
     bash verify.sh --install

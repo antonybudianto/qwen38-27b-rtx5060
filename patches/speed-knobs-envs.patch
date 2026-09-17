@@ -9,9 +9,16 @@ this a cached graph from a run without the flag fails with
 "assert_size_stride ... expected size 328==82". Independent of marlin-int8-layer-select.patch (same file, disjoint hunks):
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/speed-knobs-envs.patch
 
---- a/envs.py	2026-08-18 17:39:49.533320659 +0200
-+++ b/envs.py	2026-08-18 17:39:49.545078727 +0200
-@@ -182,6 +182,12 @@
+Env knobs this patch reads go through vllm.envs and are registered there (2026-09-15, the 0.28 hygiene pass; the
+registry mirrors the raw defaults, and registration puts them in the torch.compile cache key): (none; read moved to the registry)
+
+--- exported from cpuchip/vllm 323590212 (speed-knobs-envs); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index ea63c8ff7..13229228e 100755
+--- a/envs.py
++++ b/envs.py
+@@ -199,6 +199,10 @@
      VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
      VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
      VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -19,20 +26,16 @@ this a cached graph from a run without the flag fails with
 +    # torch.compile cache key; VLLM_MARLIN_TUNE changes the Marlin workspace shape)
 +    VLLM_MARLIN_TUNE: bool = False
 +    VLLM_MARLIN_TUNE_DIR: str = ""
-+    VLLM_SPEC_DECODE_ATTN: bool = False
-+    VLLM_DRAFT_TOPK_TOPP: bool = True
      VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
      VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
      VLLM_V1_USE_OUTLINES_CACHE: bool = False
-@@ -1469,6 +1475,11 @@
+@@ -1545,6 +1549,9 @@
      "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
          os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
      ),
 +    # syv patch: single-user speed knobs
 +    "VLLM_MARLIN_TUNE": lambda: os.environ.get("VLLM_MARLIN_TUNE", "0") == "1",
 +    "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
-+    "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
-+    "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
      # The activation dtype config for humming kernel
      "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
          os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)

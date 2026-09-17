@@ -1,5 +1,11 @@
---- a/v1/worker/gpu/spec_decode/dflash/speculator.py	2026-09-05 00:21:38.703248441 +0000
-+++ b/v1/worker/gpu/spec_decode/dflash/speculator.py	2026-09-05 00:21:38.735250379 +0000
+
+
+--- exported from cpuchip/vllm 6dff5138b (dflash2-z-adaptive-emitted); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/spec_decode/dflash/speculator.py b/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 7b4e0edc8..8aaf9f3c1 100644
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -358,11 +358,12 @@
          is_profile: bool = False,
      ) -> torch.Tensor:
@@ -18,9 +24,11 @@
          num_target_tokens = input_batch.num_tokens
          num_query_tokens = num_reqs * self.num_query_per_req
          max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
---- a/v1/worker/gpu/spec_decode/dflash2/speculator.py	2026-09-05 00:21:38.707248685 +0000
-+++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py	2026-09-05 00:21:38.735250379 +0000
-@@ -519,9 +519,7 @@
+diff --git a/v1/worker/gpu/spec_decode/dflash2/speculator.py b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 1572ac717..f067ff16d 100644
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -510,9 +510,7 @@
          self.draft_max_seq_len = min(
              max_seq_len + self.num_query_per_req, self.max_model_len
          )

@@ -18,6 +18,10 @@ Upstream's other test file exercises PR #53017 (draft logits cache column stride
 well, which this tree does not carry; that one test is the only failure left and is
 unrelated to this patch.
 
+--- exported from cpuchip/vllm a724ea427 (vllm-pr54282-draft-gumbel-salt); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/sample/gumbel.py b/v1/worker/gpu/sample/gumbel.py
+index 28c6e0f40..9b74c9f65 100644
 --- a/v1/worker/gpu/sample/gumbel.py
 +++ b/v1/worker/gpu/sample/gumbel.py
 @@ -13,6 +13,12 @@
@@ -98,6 +102,8 @@ unrelated to this patch.
          APPLY_TEMPERATURE=apply_temperature,
          USE_FP64=use_fp64,
          PER_TOKEN_COL=per_token_col,
+diff --git a/v1/worker/gpu/sample/sampler.py b/v1/worker/gpu/sample/sampler.py
+index 26371f014..be95bf366 100644
 --- a/v1/worker/gpu/sample/sampler.py
 +++ b/v1/worker/gpu/sample/sampler.py
 @@ -291,6 +291,7 @@
@@ -108,6 +114,8 @@ unrelated to this patch.
                  use_fp64=self.use_fp64_gumbel,
              )
          return sampled, processed_logits
+diff --git a/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 57430529f..c080420db 100644
 --- a/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -37,6 +37,9 @@
@@ -270,6 +278,8 @@ unrelated to this patch.
          input_buffers.seq_lens,
          draft_tokens,
          current_draft_step,
+diff --git a/v1/worker/gpu/spec_decode/dflash/speculator.py b/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 8aaf9f3c1..4ef2a6f1f 100644
 --- a/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -289,11 +289,11 @@
@@ -287,6 +297,8 @@ unrelated to this patch.
              self.sample_idx_mapping[:num_sample],
              self.temperature,
              self.seeds,
+diff --git a/v1/worker/gpu/spec_decode/dflash2/speculator.py b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index f067ff16d..3d532f105 100644
 --- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
 +++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
 @@ -84,14 +84,17 @@
@@ -308,7 +320,9 @@ unrelated to this patch.
 +            IS_DRAFTING=True,
              USE_FP64=USE_FP64,
          )
-         # A degenerate distribution can produce NaN scores. Keep the walk in
+         # vLLM 0.28.0's rejection sampler expects pre-temperature logits. With TRUNCATE
+diff --git a/v1/worker/gpu/spec_decode/dspark/speculator.py b/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 19fc45201..e9eca550c 100644
 --- a/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -135,8 +135,8 @@
@@ -330,6 +344,8 @@ unrelated to this patch.
              logits_cache=self.draft_logits,
              logits_cache_col=self._step_cols[step],
              use_fp64=self.use_fp64_gumbel,
+diff --git a/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index fc147b3f4..fed009159 100644
 --- a/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
 +++ b/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
 @@ -375,7 +375,11 @@
@@ -364,6 +380,8 @@ unrelated to this patch.
  
  
  @triton.jit
+diff --git a/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 3ea9f35ee..bc0cc304d 100644
 --- a/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 +++ b/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 @@ -836,6 +836,7 @@
@@ -374,6 +392,8 @@ unrelated to this patch.
          APPLY_TEMPERATURE=False,
          USE_FP64=USE_FP64,
      )
+diff --git a/v1/worker/gpu/spec_decode/speculator.py b/v1/worker/gpu/spec_decode/speculator.py
+index fc4f78a81..2170be4d1 100644
 --- a/v1/worker/gpu/spec_decode/speculator.py
 +++ b/v1/worker/gpu/spec_decode/speculator.py
 @@ -326,7 +326,7 @@

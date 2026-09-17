@@ -14,7 +14,7 @@ configured as a runtime. The 250 W power limit is a host setting
 (`sudo nvidia-smi -pl 250`), the container cannot set it.
 
 ```bash
-git clone https://github.com/syv-ai/qwen38-27b-rtx3090 && cd qwen38-27b-rtx3090
+git clone https://github.com/syv-ai/HyperQwen && cd HyperQwen
 cp .env.example .env                              # all knobs live in .env (gitignored)
 # PowerShell: Copy-Item .env.example .env
 echo "VLLM_API_KEY=$(openssl rand -hex 24)" >> .env   # skip only if the port stays on this machine
@@ -28,12 +28,12 @@ required by the V2 runner before model loading begins. The detailed failure
 signature and other WSL2 workarounds are below.
 
 **The image is prebuilt**: every push to `main` builds and pushes
-`ghcr.io/syv-ai/qwen38-27b-rtx3090:latest` (plus an immutable `sha-<7>` tag
+`ghcr.io/syv-ai/hyperqwen:latest` (plus an immutable `sha-<7>` tag
 per commit) from CI, with the Dockerfile's own patch application and
 `verify.sh --install` as the gate — a patch that stops applying fails the
 build and nothing is pushed. The first `up` pulls it (~9.5 GB,
 `pull_policy: missing`); to pin a known
-build, set `image: ghcr.io/syv-ai/qwen38-27b-rtx3090:sha-<7>` in a compose
+build, set `image: ghcr.io/syv-ai/hyperqwen:sha-<7>` in a compose
 override. Building locally instead still works — `docker compose build` (or
 `up --build`) produces the identical image (~20 minutes) — and the `prepare` service downloads
 the model into `./models` and runs the same requantization scripts as above
@@ -72,8 +72,8 @@ difference is gotcha 16 below.
   benchmarking or trimming `MAX_LEN` on a TP box — the launcher skips the
   single-card pin under TP>1, and an unpinned pool moves with compile-cache
   state (README, "More than one GPU"; issues
-  [#68](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/68),
-  [#104](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/104)).
+  [#68](https://github.com/syv-ai/HyperQwen/issues/68),
+  [#104](https://github.com/syv-ai/HyperQwen/issues/104)).
 - Files that `prepare` writes to `./models` are root-owned: the container runs
   as root, like vLLM's own image.
 - The image carries an nvcc (CUDA "base" + `cuda-nvcc`, not the 8 GB "devel"
@@ -92,7 +92,7 @@ command, no checkout:
 ```bash
 docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
   -v qwen-models:/app/models -v qwen-cache:/cache \
-  --restart unless-stopped ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
+  --restart unless-stopped ghcr.io/syv-ai/hyperqwen:latest
 ```
 
 - The entrypoint runs the same idempotent `prepare` before serving, so the
@@ -116,7 +116,7 @@ An independent WSL2 reproduction at `e81fa39` used kernel
 Docker Engine 29.2.0 / Compose 5.0.2, and one RTX 3090 exposed to the
 container. All six launch configurations passed authenticated API/chat and
 GPU-isolation checks with zero failed benchmark requests. The full failure
-signatures and earlier five-profile matrix are in [issue #1](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/1).
+signatures and earlier five-profile matrix are in [issue #1](https://github.com/syv-ai/HyperQwen/issues/1).
 
 | profile | measured cache | representative output throughput |
 |---|---:|---:|
@@ -138,7 +138,7 @@ hard abort rather than a tuning question:
    fine on the paravirt driver. Check the spelling — `VLLM_WSL_PIN_MEMORY` is not
    a vLLM variable and reads as a silent no-op; a venv that survived an upgrade on
    hand-applied patches can hide this until it is rebuilt from a stock wheel
-   ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25)).
+   ([#25](https://github.com/syv-ai/HyperQwen/issues/25)).
 2. **The ordinary batch default may fail vLLM's startup free-memory gate.**
    On an otherwise clean card, WSL reported 22.75/24.0 GiB free, less than
    the 23.33 GiB requested by `GPU_UTIL=0.972`. Launching with
@@ -163,8 +163,8 @@ hard abort rather than a tuning question:
    in `.env` (Docker) or the environment (venv) to override either way.
 
    This is the most reported failure on Windows
-   ([#2](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/2),
-   [#26](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/26)), and it is worth
+   ([#2](https://github.com/syv-ai/HyperQwen/issues/2),
+   [#26](https://github.com/syv-ai/HyperQwen/issues/26)), and it is worth
    knowing all of its faces, because none of them says "allocator". Same CUDA VMM
    rejection inside `process_weights_after_loading` / `gptq_marlin_repack`, four
    different messages:
@@ -182,7 +182,7 @@ hard abort rather than a tuning question:
 
 5. **Two more things the venv path needs on WSL2 that the container does not.**
    Both from @willy92wins in
-   [#2](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/2):
+   [#2](https://github.com/syv-ai/HyperQwen/issues/2):
 
    - **`nvcc` is not on `PATH`, and the error blames permissions.** Inductor
      shells out to a bare `nvcc` and dies with

@@ -2,29 +2,33 @@ Keep the Qwen3 Vision tower's bulk weights in host RAM on vLLM 0.28.0.
 
 VLLM_VISION_CPU_OFFLOAD_GB is a dedicated tower-only budget. It uses UVAOffloader's bulk-copy path so the language-model offload budget remains independent.
 
---- generated against the v0.28.0 tree after the repo's active patches ---
+--- exported from cpuchip/vllm 13299b528 (vision-tower-cpu-offload); regenerate with scripts/export-patch.sh, do not edit ---
 
+diff --git a/envs.py b/envs.py
+index 08072cfbd..51cb3aed6 100755
 --- a/envs.py
 +++ b/envs.py
-@@ -195,6 +195,8 @@
+@@ -220,6 +220,8 @@
+     # torch.compile cache key; VLLM_MARLIN_TUNE changes the Marlin workspace shape)
+     VLLM_MARLIN_TUNE: bool = False
      VLLM_MARLIN_TUNE_DIR: str = ""
-     VLLM_SPEC_DECODE_ATTN: bool = False
-     VLLM_DRAFT_TOPK_TOPP: bool = True
 +    # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
 +    VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
      VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
      VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
      VLLM_V1_USE_OUTLINES_CACHE: bool = False
-@@ -1539,6 +1541,9 @@
+@@ -1585,6 +1587,9 @@
+     # syv patch: single-user speed knobs
+     "VLLM_MARLIN_TUNE": lambda: os.environ.get("VLLM_MARLIN_TUNE", "0") == "1",
      "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
-     "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
-     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
 +    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
 +        os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
 +    ),
      # The activation dtype config for humming kernel
      "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
          os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
+diff --git a/model_executor/models/qwen3_vl.py b/model_executor/models/qwen3_vl.py
+index 3f383b9bd..569cf52e2 100644
 --- a/model_executor/models/qwen3_vl.py
 +++ b/model_executor/models/qwen3_vl.py
 @@ -48,6 +48,7 @@
@@ -35,11 +39,10 @@ VLLM_VISION_CPU_OFFLOAD_GB is a dedicated tower-only budget. It uses UVAOffloade
  from vllm.compilation.decorators import (
      should_torch_compile_mm_encoder,
      support_torch_compile,
-@@ -619,6 +620,17 @@
-             is_neox_style=True,
+@@ -620,6 +621,17 @@
              rope_parameters={"partial_rotary_factor": 0.5},
          )
-+
+ 
 +        vision_offloader = None
 +        if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0:
 +            from vllm.model_executor.offloader.uva import UVAOffloader
@@ -50,9 +53,10 @@ VLLM_VISION_CPU_OFFLOAD_GB is a dedicated tower-only budget. It uses UVAOffloade
 +            # Bulk-copy each module for its forward. UVA zero-copy makes every
 +            # GEMM reread operand tiles over PCIe and is much slower here.
 +            vision_offloader.uva_offloading = False
- 
++
          self.merger = Qwen3_VisionPatchMerger(
              d_model=vision_config.out_hidden_size,
+             context_dim=self.hidden_size,
 @@ -628,6 +640,8 @@
              quant_config=quant_config,
              prefix=f"{prefix}.merger",
@@ -95,4 +99,5 @@ VLLM_VISION_CPU_OFFLOAD_GB is a dedicated tower-only budget. It uses UVAOffloade
 +            if vision_offloader is not None
 +            else list(blocks_iter)
          )
+ 
      @property

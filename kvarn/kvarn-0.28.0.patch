@@ -2,8 +2,10 @@ KVarN dense KV-cache integration for vLLM 0.28.0.
 
 The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_content_bytes rather than the old TQFullAttentionSpec/tq_slot_size representation. This port preserves the packed KVarN tile layout and tail-pool budgeting on the new interfaces.
 
---- generated against the v0.28.0 tree after the active repo patches ---
+--- exported from cpuchip/vllm 05c23bab2 (kvarn-0.28.0); regenerate with scripts/export-patch.sh, do not edit ---
 
+diff --git a/config/cache.py b/config/cache.py
+index 654e9a535..777e59c37 100644
 --- a/config/cache.py
 +++ b/config/cache.py
 @@ -29,6 +29,10 @@
@@ -17,6 +19,8 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
      "int4_per_token_head",
      "int8_per_token_head",
      "fp8_per_token_head",
+diff --git a/model_executor/layers/attention/attention.py b/model_executor/layers/attention/attention.py
+index ff0c7a33a..246d99893 100644
 --- a/model_executor/layers/attention/attention.py
 +++ b/model_executor/layers/attention/attention.py
 @@ -645,6 +645,26 @@
@@ -46,6 +50,8 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
              return FullAttentionSpec(
                  block_size=block_size,
                  num_kv_heads=self.num_kv_heads,
+diff --git a/platforms/cuda.py b/platforms/cuda.py
+index bfe08a577..edc441cfa 100644
 --- a/platforms/cuda.py
 +++ b/platforms/cuda.py
 @@ -151,6 +151,7 @@
@@ -64,12 +70,10 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
                  AttentionBackendEnum.TURBOQUANT,
              ]
  
-@@ -349,7 +351,71 @@
-                 "To raise the WSL2 VM memory ceiling, increase the `memory` "
-                 "setting in %%USERPROFILE%%\\.wslconfig and run "
+@@ -351,6 +353,70 @@
                  "`wsl --shutdown`."
-+            )
-+
+             )
+ 
 +        # KVarN keeps a fixed-size fp16 tail pool for each active request.
 +        # Bound scheduler concurrency to the pool budget before worker startup;
 +        # the backend itself cannot safely grow this allocation after CUDA graph
@@ -123,7 +127,7 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
 +                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
 +                gpu_memory_utilization=cache_config.gpu_memory_utilization,
 +                weight_bytes=weight_bytes,
-             )
++            )
 +            if scheduler_config.max_num_seqs > supported:
 +                logger.warning(
 +                    "KVarN (%s): capping max_num_seqs %d -> %d for the fp16 "
@@ -133,9 +137,12 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
 +                    supported,
 +                )
 +                scheduler_config.max_num_seqs = supported
- 
++
      @classmethod
      def get_current_memory_usage(
+         cls, device: torch.types.Device | None = None
+diff --git a/platforms/interface.py b/platforms/interface.py
+index 5c041f163..59cca9a9c 100644
 --- a/platforms/interface.py
 +++ b/platforms/interface.py
 @@ -807,6 +807,23 @@
@@ -162,6 +169,8 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
          elif cache_config.cache_dtype.startswith("turboquant_"):
              # TQ has a packed K|V layout; the standard FullAttentionSpec
              # formula over-sizes it and trips unify_kv_cache_spec_page_size
+diff --git a/utils/torch_utils.py b/utils/torch_utils.py
+index 0e133a377..599fa11e3 100644
 --- a/utils/torch_utils.py
 +++ b/utils/torch_utils.py
 @@ -49,6 +49,10 @@
@@ -175,6 +184,8 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
      "nvfp4": torch.uint8,
      "nvfp4_4over6": torch.uint8,
  }
+diff --git a/v1/attention/backends/registry.py b/v1/attention/backends/registry.py
+index 646227cc4..8917439a4 100644
 --- a/v1/attention/backends/registry.py
 +++ b/v1/attention/backends/registry.py
 @@ -123,6 +123,7 @@
@@ -185,6 +196,8 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
      TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
      # Placeholder for third-party/custom backends - must be registered before use
      # set to None to avoid alias with other backend, whose value is an empty string
+diff --git a/v1/kv_cache_interface.py b/v1/kv_cache_interface.py
+index 90391f6ef..3e0770399 100644
 --- a/v1/kv_cache_interface.py
 +++ b/v1/kv_cache_interface.py
 @@ -51,6 +51,7 @@
@@ -195,18 +208,18 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
  
      @property
      def is_per_token_head(self) -> bool:
-@@ -75,6 +76,11 @@
-             KVQuantMode.TURBOQUANT_K3V4_NC,
+@@ -76,6 +77,11 @@
              KVQuantMode.TURBOQUANT_3BIT_NC,
          )
-+
+ 
 +    @property
 +    def is_kvarn(self) -> bool:
 +        """True for KVarN packed KV-cache quantization."""
 +        return self == KVQuantMode.KVARN
- 
++
  
  def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
 @@ -89,6 +95,8 @@
          return KVQuantMode.NVFP4
      if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
@@ -216,10 +229,12 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
      if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
          return KVQuantMode.FP8_PER_TENSOR
      return KVQuantMode.NONE
-
+diff --git a/v1/worker/gpu/attn_utils.py b/v1/worker/gpu/attn_utils.py
+index 9a6352150..c9bc6fb01 100644
 --- a/v1/worker/gpu/attn_utils.py
 +++ b/v1/worker/gpu/attn_utils.py
-@@ -305,5 +305,12 @@
+@@ -307,7 +307,14 @@
+             "kv-first layouts are not supported."
          )
          dtype_size = get_dtype_size(kv_cache_spec.dtype)
 -        page_stride = kv_cache_spec.page_size_bytes // dtype_size
@@ -233,3 +248,4 @@ The 0.28 KV cache API uses KVQuantMode values and FullAttentionSpec.state_conten
 +            page_stride = kv_cache_spec.page_size_bytes // dtype_size
  
          num_blocks_dim = inv_order[0]
+         strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())

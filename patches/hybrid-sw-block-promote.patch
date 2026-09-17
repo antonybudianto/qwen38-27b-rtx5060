@@ -64,10 +64,14 @@ Apply from the repo root, after hybrid-kv-groups-v2-cudagraph.patch:
 
 Validated against vLLM 0.28.0. Reapply after upgrades.
 
+--- exported from cpuchip/vllm dd7698f00 (hybrid-sw-block-promote); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/core/kv_cache_utils.py b/v1/core/kv_cache_utils.py
+index e9a2bf6ae..a46c38df5 100644
 --- a/v1/core/kv_cache_utils.py
 +++ b/v1/core/kv_cache_utils.py
-@@ -1067,6 +1067,135 @@
-     return len(page_sizes) == 1
+@@ -1033,6 +1033,135 @@
+     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
  
  
 +def _promote_indivisible_block_sizes(
@@ -202,7 +206,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
  def unify_kv_cache_spec_page_size(
      kv_cache_spec: dict[str, KVCacheSpec],
  ) -> dict[str, KVCacheSpec]:
-@@ -1094,6 +1223,12 @@
+@@ -1060,6 +1189,12 @@
          return kv_cache_spec
  
      max_page_size = max(page_sizes)

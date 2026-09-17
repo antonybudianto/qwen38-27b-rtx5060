@@ -13,10 +13,14 @@ far retirement has reached so the prefix is not rescanned. States are
 returned at request end either way; the cost is peak pool pressure during
 long prefills, not a permanent leak.
 Applies on top of mamba-align-checkpoint-order.patch.
---- generated hunks below ---
+
+--- exported from cpuchip/vllm e329c903b (mamba-align-retire-null-gaps); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/core/single_type_kv_cache_manager.py b/v1/core/single_type_kv_cache_manager.py
+index 0fdf2b415..890e21417 100644
 --- a/v1/core/single_type_kv_cache_manager.py
 +++ b/v1/core/single_type_kv_cache_manager.py
-@@ -1317,6 +1317,7 @@
+@@ -1293,6 +1293,7 @@
              # Mapping from request ID to the index of the block
              # allocated in the previous step
              self.last_state_block_idx: dict[str, int] = {}
@@ -24,7 +28,7 @@ Applies on top of mamba-align-checkpoint-order.patch.
              # The set of the requests that have been allocated blocks
              self._allocated_block_reqs: set[str] = set()
              # Requests that registered their own last-prompt-boundary partial
-@@ -1469,6 +1470,27 @@
+@@ -1445,6 +1446,27 @@
  
          return mask
  
@@ -52,7 +56,7 @@ Applies on top of mamba-align-checkpoint-order.patch.
      def remove_skipped_blocks(
          self,
          request_id: str,
-@@ -1772,6 +1794,7 @@
+@@ -1748,6 +1770,7 @@
          if self.mamba_cache_mode == "align":
              self._allocated_block_reqs.discard(request_id)
              self.last_state_block_idx.pop(request_id, None)

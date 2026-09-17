@@ -1,4 +1,9 @@
+
+
+--- exported from cpuchip/vllm 9f8d88dc8 (spec-decode-int4-kv-mq3d); regenerate with scripts/export-patch.sh, do not edit ---
+
 diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
+index 6e8de7295..0dd51124c 100644
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
 @@ -12,6 +12,7 @@
@@ -53,6 +58,7 @@ diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per
      # 3D never reads ``output_ptr`` and 2D never reads the segm tensors,
      # but Triton needs a non-null pointer everywhere; reuse ``out`` as
 diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
+index f4d9ba95f..e92cc4ced 100644
 --- a/v1/attention/ops/triton_unified_attention.py
 +++ b/v1/attention/ops/triton_unified_attention.py
 @@ -715,6 +715,27 @@

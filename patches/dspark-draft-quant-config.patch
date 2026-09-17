@@ -19,8 +19,12 @@ Apply from the installed vllm package directory:
 
 Validated against vLLM 0.28.0 (issue #25, item 15). Reapply after upgrades.
 
---- a/model_executor/models/utils.py	2026-09-05 17:22:45.731599800 -0500
-+++ b/model_executor/models/utils.py	2026-09-05 17:22:46.075505600 -0500
+--- exported from cpuchip/vllm d9efedb86 (dspark-draft-quant-config); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/model_executor/models/utils.py b/model_executor/models/utils.py
+index 5e1236a7e..f01b939dc 100644
+--- a/model_executor/models/utils.py
++++ b/model_executor/models/utils.py
 @@ -897,7 +897,7 @@
  
      return (

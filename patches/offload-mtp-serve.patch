@@ -35,7 +35,10 @@ those tokens loaded the unwritten slot. Clamp the finished watermark to num_toke
 clamps to the prompt first. Upstream wrote #52771 against a tree that already had this
 fix, and its EAGLE trailing-block tests fail without it.
 
---- generated hunks below ---
+--- exported from cpuchip/vllm 05f30f521 (offload-mtp-serve); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 4e0bde520..2ec503338 100644
 --- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 +++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 @@ -240,7 +240,19 @@
