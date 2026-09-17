@@ -92,6 +92,7 @@ VERIFICATION
 
 ---
 
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
 @@ -59,6 +59,10 @@
@@ -116,7 +117,7 @@ VERIFICATION
      num_par_softmax_segments: int
      softmax_segm_output: torch.Tensor
      softmax_segm_max: torch.Tensor
-@@ -158,9 +164,53 @@
+@@ -160,9 +166,53 @@
  
          self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
          headdim_padded = next_power_of_2(self.headdim)
@@ -171,7 +172,7 @@ VERIFICATION
                  self.num_heads_q,
                  self.num_par_softmax_segments,
                  headdim_padded,
-@@ -169,15 +219,24 @@
+@@ -171,15 +221,24 @@
              device=device,
          )
          self.softmax_segm_max = torch.empty(
@@ -198,7 +199,7 @@ VERIFICATION
          self.rswa_window = model_config.rswa_window
          self.persistent_rswa_prefix_lens: torch.Tensor | None = None
          if self.rswa_window is not None:
-@@ -246,6 +305,8 @@
+@@ -248,6 +307,8 @@
              suffix_kv_lens=suffix_kv_lens,
              prefix_scheduler_metadata=prefix_scheduler_metadata,
              seq_threshold_3D=self.seq_threshold_3D,
@@ -207,7 +208,7 @@ VERIFICATION
              num_par_softmax_segments=self.num_par_softmax_segments,
              softmax_segm_output=self.softmax_segm_output,
              softmax_segm_max=self.softmax_segm_max,
-@@ -686,6 +747,8 @@
+@@ -705,6 +766,8 @@
          block_table = attn_metadata.block_table
  
          seq_threshold_3D = attn_metadata.seq_threshold_3D
@@ -216,7 +217,7 @@ VERIFICATION
          num_par_softmax_segments = attn_metadata.num_par_softmax_segments
          softmax_segm_output = attn_metadata.softmax_segm_output
          softmax_segm_max = attn_metadata.softmax_segm_max
-@@ -751,6 +814,8 @@
+@@ -770,6 +833,8 @@
              k_descale=k_descale,
              v_descale=v_descale,
              seq_threshold_3D=seq_threshold_3D,
@@ -225,6 +226,7 @@ VERIFICATION
              num_par_softmax_segments=num_par_softmax_segments,
              softmax_segm_output=softmax_segm_output,
              softmax_segm_max=softmax_segm_max,
+diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
 @@ -13,6 +13,29 @@
@@ -269,7 +271,7 @@ VERIFICATION
 @@ -752,10 +777,33 @@
      # buffers directly. Opt-in via VLLM_INT4_MQ_3D=1 (promotion gates open).
      _mq = max_seqlen_q > 1
-     _mq_3d_enabled = os.environ.get("VLLM_INT4_MQ_3D", "0") == "1"
+     _mq_3d_enabled = envs.VLLM_INT4_MQ_3D
 -    _capacity_ok = (
 +
 +    # The eligibility bound and the allocation bound now come from ONE source (see
@@ -349,7 +351,7 @@ VERIFICATION
 +    # The reason bit: which predicate said no. Kept because "it fell back" was the whole
 +    # defect -- the seq-vs-token bug was invisible for as long as the fallback had no
 +    # stated cause. Off unless explicitly enabled.
-     if os.environ.get("VLLM_INT4_MQ_3D_DEBUG") == "1":
+     if envs.VLLM_INT4_MQ_3D_DEBUG:
 +        _why = []
 +        if seq_threshold_3D is None: _why.append("no_seq_threshold")
 +        if num_par_softmax_segments is None: _why.append("no_segments")
@@ -398,6 +400,7 @@ VERIFICATION
          num_par_softmax_segments=num_par_softmax_segments,
          softmax_segm_output=softmax_segm_output,
          softmax_segm_max=softmax_segm_max,
+diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
 --- a/v1/attention/ops/triton_unified_attention.py
 +++ b/v1/attention/ops/triton_unified_attention.py
 @@ -838,6 +838,8 @@

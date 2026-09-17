@@ -344,3 +344,40 @@ short bench per boot:
 - Quality (thinking off): stock, judgment 8/8, mission 14/18 twice; 3D path off, judgment 6/8, mission
   15/18 twice; this patch, judgment 6/8, mission 16/18. No repetition or truncation in any row; the
   judgment bench moves two decisions between boots of the same configuration, so those are noise-shaped.
+
+### Captured-path A/B on the native 3090 (maintainer's rows, review of #93, 2026-09-13)
+
+One 3090 at 250 W, production stopped, `MAX_LEN=98304 GPU_UTIL=0.93 PREFIX_CACHE=0 MAX_SEQS=1`, `SPEC=dflash2` k=7,
+torch.compile cache wiped before each boot, all three boots on the same pool (185,373 tokens, concurrency 1.89x).
+Wiring verified from `/proc/<pid>/environ`: arm A `VLLM_INT4_MQ_3D=0`, arm B (nothing set) `VLLM_INT4_MQ_3D=1`.
+This is the captured-graph path (`max_cudagraph_capture_size=8`, k=7), the row `bench/mq3d_layer2_oracle.py` does
+not cover (its own config line says `cudagraph: NONE (eager)`).
+
+Quality, `bench/quality_battery.py`, 200 GSM8K rows, greedy, thinking off:
+
+```
+2D  PPL all 8.2079   GSM8K n=200 acc=0.945  mean_tokens=381
+3D  PPL all 8.2087   GSM8K n=200 acc=0.955  mean_tokens=375
+```
+
+Perplexity agrees to four significant figures on every split (en -0.05%, da +0.02%, code +0.08%, all +0.010%);
+GSM8K is 1.0 absolute point apart, two questions, which n=200 cannot resolve as signal or noise.
+
+Decode, isolated as `255/(t_256 - t_1tok)` on a prefix-cached prompt so prefill is excluded:
+
+```
+degenerate repeat prompt        2D      3D
+  24k   decode tok/s         119.09  205.34   1.72x
+  49k                         75.21  159.79   2.12x
+  88k                         19.04   46.06   2.42x
+
+wikitext-2 prose
+  24k                         44.17   78.80   1.78x
+  49k                         35.12   46.83   1.33x
+  88k                         15.18   38.02   2.50x
+```
+
+Prefill is untouched at every depth in both prompt sets (worst gap 1.35%, prompt_tokens identical per depth). The
+range on this card is 1.3x to 2.5x; the larger multiple quoted earlier in this repo's history is the WSL2 4090 row at 88k
+and does not reproduce in magnitude here. The arms diverge at T=0 on the long prose prompts (49k and 88k; 24k
+identical): the 3D reducer is a different reduction order, so bit-for-bit equal text between the two arms is not a claim this flip makes.

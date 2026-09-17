@@ -21,6 +21,26 @@
 # PORT and MODELS_DIR are read here: models live in ./models by default
 # (the same layout as the venv install, so both can share one download).
 # One GPU: run either "single" or "batch", not both.
+#
+# More than one GPU (issues #68, #104) — no hand-edit of this file needed:
+#
+#   GPU_COUNT=2                                  # cards handed to the container
+#   EXTRA_ARGS="--tensor-parallel-size 2"        # cards the engine actually uses
+#
+# GPU_COUNT defaults to 1, which means "the first GPU the runtime enumerates",
+# i.e. GPU 0 — not the card you meant if the box has mixed hardware. To choose
+# *which* cards, expose them all and pin inside the container:
+#
+#   GPU_COUNT=all
+#   CUDA_VISIBLE_DEVICES=1,2
+#
+# The device reservation below decides which cards are visible, so setting
+# NVIDIA_VISIBLE_DEVICES in .env alone was not enough (#68); CUDA_VISIBLE_DEVICES
+# is read inside the container and is what docs/gotchas.md 53 recommends.
+# Pin the KV pool before you benchmark or trim context on a multi-GPU box: the
+# launcher skips the single-card KV_MEM pin under --tensor-parallel-size > 1,
+# so the pool is sized from GPU_UTIL and moves with compile-cache state
+# (README, "More than one GPU"; docs/gotchas.md 48).
 
 x-qwen: &qwen
   # Prebuilt on every main push by .github/workflows/docker-image.yml; the
@@ -53,7 +73,9 @@ x-serve: &serve
       reservations:
         devices:
           - driver: nvidia
-            count: 2
+            # 1 by default (= GPU 0). GPU_COUNT=2 / GPU_COUNT=all for TP; see
+            # the multi-GPU note in the header for picking specific cards.
+            count: ${GPU_COUNT:-1}
             capabilities: [gpu]
   restart: unless-stopped
   stop_grace_period: 30s

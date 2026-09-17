@@ -22,9 +22,12 @@ What it carries:
 2. **A one flag fix for prefix caching going dead** on int4 KV + DFlash2
    (`--prefix-match-unit 848`), with the analysis of why it dies.
 3. **An int4 attention kernel for speculative decoding**
-   (`patches/spec-decode-int4-kv-mq3d.patch`), opt in via `VLLM_INT4_MQ_3D=1`.
-   About 3.3x end to end on deep int4 spec decode. It defaults off, and section
-   3 lists the tests it still owes before it earns default on.
+   (`patches/spec-decode-int4-kv-mq3d.patch`), on by default in
+   `single-user/alternative.sh` (`INT4_MQ_3D=0` restores the 2D verify).
+   1.3x to 2.5x decode on a native 3090 at 24k to 88k; the ~3.3x end to end
+   figure elsewhere in this document is a 4090/WSL2 row and does not reproduce
+   in magnitude on the 3090. Section 3 carries the check ledger and the one
+   item still open.
 4. **A measurement correction** that matters to anyone benchmarking this stack
    over SSE. It reversed one of our own early conclusions.
 5. **Operating notes**: what actually stays cached at depth, which settings
@@ -67,12 +70,21 @@ query rows in one 3D launch with a reducer guard (33 lines) restores split-KV
 for the verify batch: 8.14 to 25.2 steps/s, which is 22.3 to ~73 tok/s end to
 end (~3.3x).
 
-It ships opt in (`VLLM_INT4_MQ_3D=1`, default off) because six checks are still
-owed before anyone should trust it as a default: a 72k operator/logit oracle,
-full length exactness, per position logit comparison, eager+captured+q=9
-parity, a shallow crossover floor (shallow currently reads -16%), and capture
-aware dual variant switching. It is its own commit, so it drops cleanly if you
-want the rest without it.
+It shipped opt in (`VLLM_INT4_MQ_3D=1`, default off) until six checks were
+discharged; `single-user/alternative.sh` now defaults it on, and the ledger is:
+the 72k operator/logit oracle and the per position logit comparison are
+`bench/mq3d_layer2_oracle.py` (fp32 reference over its own dequantisation,
+production dispatch call-counted; verdicts in docs/spec-decode-scratch-token-units.md);
+full length exactness is the same oracle's full-length legs; the shallow
+crossover floor moved from -16% to -1% (default sampling) / -3% (greedy) on
+`bench/real_rep.sh`, a short-prompt cost bought with a deep-prompt decode gain of 1.3x to 2.5x on the native 3090 at 24k to 88k (the WSL2 4090 row at 88k read a larger multiple that does not reproduce in magnitude on the 3090);
+eager+captured+q=9 parity has its captured-path quality row (INT4_MQ_3D=0 vs 1,
+same 200 GSM8K rows at T=0, cold compile cache per arm: accuracy 0.950 both,
+perplexity 10.8102 vs 10.8135); and capture aware dual variant switching is
+moot at the launcher's k=7, where every decode verify is 8 wide and graph
+resident on the 3D path (the k>7 lookup regime is a separate, measured
+setting). Still open: a native sm89 row (every 4090 number is WSL2). It is its
+own commit, so it drops cleanly if you want the rest without it.
 
 ## 4. Prefix cache zero reuse on int4 + DFlash2: the one flag fix
 

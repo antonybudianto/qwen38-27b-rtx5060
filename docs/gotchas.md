@@ -147,7 +147,14 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     KV only) is a 180-line Triton fix. Watch its query cap: the kernel used to
     handle at most `BLOCK_M / (heads per kv head)` = 10 query tokens and fall
     back silently past that, which doubled the step at 25k context the moment
-    the verify block grew to 16. It now tiles the query rows instead.
+    the verify block grew to 16. It now tiles the query rows instead. And
+    watch the pool size: until #91 the kernel multiplied the block id by the
+    cache stride in int32, so a pool of more than about 2,383 blocks (bf16,
+    block 880) was silently reading the wrong memory for any request placed
+    above that id (issue #86, a 64 GB card; a 24 GB card never gets there).
+    The one `blk.to(tl.int64)` cast fixes it, `bench/test_spec_decode_bigpool.py`
+    forces the shape on any card. The int8 prefill kernel carries the same
+    pattern; its cast and test are pending in #109.
 13. **Greedy is not deterministic across drafter configs.** The target rounds
     differently when it verifies 5 tokens vs 1, so a different drafter changes
     the generated text at near-ties and the 8-prompt acceptance numbers move
@@ -613,9 +620,47 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     from store while decoding; with dflash the flag now lands on the
     drafter's sliding-window group alone. Also: on bare-metal Linux the
     connector refuses this stack's default allocator
-    (`expandable_segments:True`) at config validation — run it with
-    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` (or the cumem
-    allocator), which the WSL2 branch of the launchers already defaults to.
+    (`expandable_segments:True`) at config validation. All three launchers
+    now default `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` whenever
+    `EXTRA_ARGS` carries `--kv-offloading-size` or `--kv-transfer-config`
+    (and print a line saying so); an explicit `PYTORCH_CUDA_ALLOC_CONF` in
+    the environment still wins, so setting it to `True` by hand reproduces
+    the refusal. The MTP/EAGLE serve fixes are in the series as
+    `offload-mtp-serve.patch` (upstream #52771 and #52807 plus the
+    finished-request store watermark clamp, #54288): with it the tier serves
+    stored hits under `SPEC=mtp` and the cached count on a replay lands on the
+    same block formula as the GPU path, one 832-token block more than before.
+    **Sizing the tier, and why a default boot can show it doing nothing.**
+    Residency has no gauge in 0.28.0: both `kv_offload_cpu_cache_usage_perc`
+    and its read twin count in-flight transfer pins (`num_used = allocated -
+    free - evictable`, and `complete_store()` marks a block evictable the
+    moment it lands), so a full tier reads 0.0 between transfers and a 0%
+    reading is not an idle tier — read `vllm:kv_offload_total_bytes_total`
+    and the external-prefix-cache hit counter instead. Size the tier from
+    blocks x tokens-per-block for YOUR arm, never from a GiB constant:
+    `blocks` = mmap bytes / bytes-per-block (the usage gauge quantises at
+    1/blocks, e.g. 0.02252... = 10/444), and `tokens-per-block` = distinct
+    tokens stored / `kv_offload_cpu_allocation_size_sum`. Measured on the
+    3090, `CTX=long` (fp8, MTP) at `--kv-offloading-size 12`: mmap
+    12,861,308,928 B over 444 blocks = 28,966,912 B per block; 367 blocks for
+    123,148 distinct tokens = ~336 tok/block; 444 x ~336 ~= **149k tokens**,
+    i.e. about ONE 150k session, not three. `CTX=huge` (KVarN) at the same
+    12 GiB is 110 x 2048 ~= 225k. Then read the GPU side off the SAME boot
+    log (`GPU KV cache size: N tokens`) and compare in TOKENS, not bytes: a
+    tier several times the pool in bytes can be smaller in tokens (86.2 KB
+    per tier token against 37.9 KB per pool token here, a 2.3x ratio), and a
+    tier smaller in tokens than the GPU prefix cache can never hold anything
+    the GPU cache has already dropped — which is the real reason a
+    default-pool 3x150k workload can show the tier doing nothing useful.
+    Capacity, not a scheduler veto. Both numbers must come from the same
+    boot: the pool is profiled per boot and moves ~1 GiB between a cold and a
+    warm compile cache (item 12), enough that a default `CTX=long` boot which
+    fits beside a tier one day refuses at KV sizing the next. Sized right,
+    the tier behaves as a high-churn working set rather than a resident
+    store: the reporter in
+    [#95](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/95) measured
+    658 GiB CPU->GPU, 541 GiB GPU->CPU and 15.95M external prefix hits
+    through a 12 GiB tier in ~3 h (dfein38347g).
     And when eviction probing, keep the resend prompt BYTE-identical: a
     two-token label difference shifts every block hash and manufactures a
     convincing, fake "per-request hash instability" (ask how we know).
@@ -633,12 +678,58 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
        field; this is the equivalent.) Server-side,
        `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` on `/metrics`
        give the same as counters.
-    2. **Know the floor.** Hits are counted in whole hash units and the
-       recurrent state resumes only at aligned boundaries
-       (`--mamba-cache-mode align`), so the hit length truncates DOWN to a
-       multiple of the unit — a prompt shorter than one unit can never hit,
-       and a shared prefix pays up to one unit of recompute past the match.
-       This is a fixed tax, not the 100%-miss failure mode.
+    2. **Know the floor, and it has a closed form.** Hits are counted in
+       whole hash units and the recurrent state resumes only at aligned
+       boundaries (`--mamba-cache-mode align`), so the hit length truncates
+       DOWN to a multiple of the hybrid attention block `B` — and the final
+       block of a cached request is never served, because its recurrent
+       state was never checkpointed at that boundary. Measured on the box
+       over two block sizes ([#102](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/102)):
+
+           cached_tokens = max(0, floor(n_prefix / B) - 1) * B
+
+       where `n_prefix` is the length of the EARLIER, cached request — not
+       the replay's own `prompt_tokens`. Round lengths cannot tell those two
+       apart; straddle lengths can. At B=480, a 958-token prompt replayed at
+       961 tokens gives `cached_tokens` **0**, where `floor(961/480)-1`
+       would predict 480; 1438 replayed at 1441 gives 480, not 960. So a
+       prompt shorter than 2B can never hit at all, and a shared prefix pays
+       up to two blocks of recompute past the match. This is a fixed tax,
+       not the 100%-miss failure mode.
+
+       **`B` is not a constant — read it from the boot log.** Every launch
+       prints it:
+
+           INFO [interface.py:928] Setting attention block size to 480 tokens
+                to ensure that attention page size is >= mamba page size.
+           INFO [interface.py:952] Padding mamba page size by 1.27% to ensure
+                that mamba page size and attention page size are exactly equal.
+
+       `B` is whatever makes one attention page cover one mamba page:
+       `B = 16 * ceil(mamba_page / (16 * attn_page_1_token))`. On this model
+       `attn_page_1_token` is 4096 B at bf16 KV, 2080 B at
+       `int8_per_token_head` and 2048 B at fp8, and — the part that surprises
+       people — `mamba_page` includes the speculative drafter's state, so it
+       grows with the number of draft tokens: 1,634,304 B with no drafter
+       plus 20,480 B per draft token. That makes `B` a function of
+       `DFLASH_TOKENS`, not of the machine. Measured and reproduced pairs:
+
+       | profile | KV dtype | drafts | B | mamba padding |
+       |---|---|---|---|---|
+       | CTX=fast (production) | bf16 | 15 | 480 | 1.27% |
+       | CTX=fast | bf16 | 7 | 448 | 3.23% |
+       | SPEC=dflash2 CTX=long | int8_per_token_head | 7 | 864 | 1.09% |
+       | SPEC=mtp CTX=long | fp8 | 3 | 832 | 0.48% |
+
+       Rows 1 and 3 are boot lines from this box; rows 2 and 4 are the same
+       formula evaluated against this box's own config (no boot) and they
+       reproduce a contributor's boot lines on other 3090s to the last digit,
+       padding percentage included. That is the point: two boxes running the
+       "same" profile print different `B` purely because their
+       `DFLASH_TOKENS` differ (480 here at 15, 448 there at 7) — nothing
+       about the silicon, the build or the int8 prefill path is involved.
+       The contributor reports 448 and 832 stable from 0.28 to 0.29. Never
+       hard-code `B` into a client's cache arithmetic — read the boot line.
     3. **Byte-identity is over the RENDERED prompt.** What the cache hashes
        is the chat-templated token stream: system prompt + tool definitions +
        every message, in order. One changed byte at position P invalidates
@@ -678,10 +769,57 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend=TRITON_ATTN
     --kv-cache-dtype=int8_per_token_head"`. Measured cost on the reference
     box: 17.9k in + 256 out takes 23.7 s against fp8/FlashInfer's 18.9
-    (~25% wall at that depth, mostly Triton prefill); in exchange the same
-    pinned pool holds more tokens at int8's geometry. The default stays
-    fp8/FlashInfer: two faults on one box do not justify a 25% tax on every
+    (~25% wall at that depth, mostly Triton prefill). The default stays
+    fp8/FlashInfer: two faults on one box do not justify that tax on every
     other box, but you should know which combination you are running.
+
+    **What the escape actually buys and costs, measured** (reference 3090,
+    250 W, vLLM 0.28.0, `SPEC=mtp CTX=long PREFIX_CACHE=1 GPU_UTIL=0.93
+    MAX_SEQS=4 MAX_LEN=120000`, warm medians of 3 on `bench/real_rep.sh`,
+    C1 = 8 realistic prompts x 1024 out, concurrency 1):
+
+    | arm | decode tok/s | ms/step | tok/step | KV pool | GSM8K n=200 | PPL all |
+    |---|---|---|---|---|---|---|
+    | stock fp8 / FlashInfer / PIECEWISE | 101.1 | 27.2 | 2.68 | 172,500 | 0.960 | 8.2362 |
+    | int8 / TRITON_ATTN / FULL graphs | 103.7 | 25.4 | 2.57 | 145,030 | 0.965 | 8.2375 |
+
+    Three things to take from that. (a) The win at chat length is **+2.5%
+    end-to-end**, not the +6% a step-time number alone suggests: dropping the
+    spec-decode CUDA-graph downgrade really is worth −6.6% step time
+    (27.2 → 25.4 ms), but int8 KV gives ~4% of it straight back in MTP
+    acceptance (2.68 → 2.57 tok/step). Quote step time as step time.
+    (b) It is **quality-neutral** — GSM8K 96.5 vs 96.0 (n=200, SE ≈ 1.3 pt,
+    i.e. indistinguishable) and PPL +0.02%. Unlike int8 *activations*, int8
+    KV costs no accuracy here. (c) It **costs pool, it does not save it**:
+    145,030 vs 172,500 tokens, −15.9% at this geometry (per-token-head
+    scales plus the FULL-decode-graph capture), the opposite sign of what an
+    earlier version of this entry claimed.
+
+    **Do not reach for it as the fast path.** The same C1 row under
+    `SPEC=dflash2 CTX=fast` (FLASH_ATTN, bf16 KV, FULL graphs, 68,605-token
+    pool) reads 135.5 decode tok/s / 3.49 tok/step at the same 26.6 ms/step
+    — **+31% over the int8 escape**, all of it acceptance. If your work fits
+    64k, that is the answer; the int8 tier is the #34 fallback and the
+    `SPEC=mtp` + depth route, not a performance recommendation.
+
+    **And it decays with depth.** Salted prompts (`cached_tokens = 0`), 256
+    out, greedy, stock vs int8 escape: equal at 8K (81.7 / 82.9 decode),
+    −22% decode at 25K (80.3 / 62.7), −34% decode and −44% fresh prefill at
+    60K (70.7 / 46.7 and 872 / 490 tok/s), with TTFT 68.9 → 122.6 s at 60K.
+    A WSL2 3090 contributor carried the same curve to 90K (stock ~80 decode
+    / 878 prefill, escape 46.3 / 355) while stock stayed flat from 25K out.
+    So: **stock fp8 FlashInfer for depth, the int8 escape only for
+    short-context decode-heavy work or when #34 forces it.**
+
+    **On sm89+ you do not have to give up the fp8 pool.** 0.28's
+    `_create_draft_vllm_config` deliberately does not inherit the target's
+    attention backend into the proposer, so the knob is the *speculative
+    config's own* `attention_backend` field — put TRITON_ATTN there, leave
+    the target on fp8/FlashInfer, and the downgrade goes away with the pool
+    intact. Unreachable on sm86: Triton refuses fp8 KV below SM89
+    ("native FP8 (fp8e4nv) requires SM89+"), so int8 is the only
+    flashinfer-free option on a 3090. Reported and verified on a 4090 by a
+    contributor ([#87](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/87)).
 41. **On a low-RAM host, don't let the stock loader race page-cache eviction —
     stream the weights.** A 16 GB host (~10 GiB actually free) died loading the
     15.9 GiB checkpoint at shard 5/8
@@ -781,7 +919,27 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     lands on the conversation's own attention tail instead, which breaks
     the same hit from the other side. If between-turn traffic exceeds the
     whole free pool, nothing survives by policy; that regime needs a
-    bigger `KV_MEM`, not a smarter queue.
+    bigger `KV_MEM`, not a smarter queue. A second align-mode cost, fixed
+    since #101 (`patches/mamba-align-retire-null-gaps.patch`, upstream
+    #55450): a long prefill leaves null gaps between the state snapshots
+    awaiting retirement, and the base block remover stopped at the first
+    gap, so every older state stayed allocated until the request ended. The
+    maintainer's per-request counter of live non-null state blocks (inside
+    `remove_skipped_blocks`, on the repo's reference 3090, #101 review) read
+    up to 16 before the patch and 5 with it on every request; on that box
+    peak pool usage during a fresh 20k-token prefill fell 40 percent on
+    `SPEC=mtp CTX=long` and 21 to 23 percent where a large cached prefix
+    dominated the pool. On a second native 3090 and a WSL2 box, with the
+    pool pinned identical across arms, the peak fell 30 to 50 percent across
+    14k to 56k-token prefills at 0.28 and 0.29 (the reduction grows with
+    depth and is smaller on 0.29, which leaks less before the fix). No gap
+    forms on `CTX=fast` with DFlash2, so the fix is inert there: on the
+    maintainer's production profile the sampled peak agreed to four decimals
+    across 20 requests with and without it (#101 review). The win is
+    mtp/long shaped. One note for anyone
+    editing that patch file: it carries blank context lines that are a single
+    space, and a trailing-whitespace trim turns it into a malformed patch that
+    `git apply --check` rejects.
 45. **First-request Triton compiles on a fresh boot came from four separate
     warmup gaps, and the last one is invisible without logging what Triton
     specialises on.** Issue #48's fingerprint — a stall in the first large
@@ -1059,3 +1217,63 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     cleanup verifies green. The general rule is that a patch which creates a
     file makes that file part of what verification demands, so a patch should
     only create files it means to own.
+
+55. **A streaming response sends nothing during prefill, and a proxy in front
+    of the server closes the connection before the first token.** vLLM's SSE
+    stream is silent from the moment the request is accepted until the first
+    output token, so a long prefill looks like a dead socket to anything with
+    an idle read timeout — Bifrost's default is 120 s, and a cold 90K-token
+    prompt on this card prefills for ~105 s. The client sees a dropped
+    connection, not an error. `patches/sse-keep-alive.patch` (upstream vLLM
+    [#51034](https://github.com/vllm-project/vllm/pull/51034), backported to
+    0.28.0) adds `--sse-keep-alive-interval`, which emits a `: keep-alive`
+    comment line while the stream is idle; comment lines are part of SSE and
+    every conforming client ignores them.
+
+    `single-user/start_qwen.sh` sets it from `SSE_KEEP_ALIVE`, default 30 s —
+    **so every stream now carries a comment line every 30 seconds by default.**
+    That is deliberate (4x margin against a 120 s timeout) but it is not
+    nothing if you log raw SSE frames: measured on the reference 3090, an
+    18.2 s request emitted 18 comment lines at an interval of 1, and would
+    emit none at all at 30.
+    Set `SSE_KEEP_ALIVE=0` to turn the emission off, or `SSE_KEEP_ALIVE=`
+    (empty) to drop the flag entirely — which is also what you need if the
+    launcher is pointed at a vLLM tree that has not had the series applied,
+    since the flag only exists because the patch is in it.
+
+56. **Registering an env var in vLLM's `envs.py` puts it in the torch.compile
+    cache key, so `VLLM_INT4_MQ_3D_DEBUG=1` now recompiles from cold.**
+    `patches/int4-mq3d-envs.patch`
+    ([#93](https://github.com/syv-ai/qwen38-27b-rtx3090/pull/93)) registers
+    `VLLM_INT4_MQ_3D` and `VLLM_INT4_MQ_3D_DEBUG`. That is not cosmetic:
+    `vllm/envs.py:compile_factors()` starts from every known vLLM env var,
+    drops only the names in its `ignored_factors` set, and hashes the rest;
+    `vllm/compilation/backends.py:1031-1066` folds that hash into the compile
+    cache directory key. Neither new knob is in `ignored_factors`, so each
+    value now selects its own compile cache.
+
+    Two consequences. The good one: an A/B of `INT4_MQ_3D=0` against `=1` on a
+    warm cache is no longer a stale-graph trap, and the per-arm
+    `rm -rf ~/.cache/vllm/torch_compile_cache` that the #93 review had to do by
+    hand is no longer required. The one to watch: a boot with
+    `VLLM_INT4_MQ_3D_DEBUG=1` has a different cache key from production, so it
+    compiles cold and must never be timed against a warm production boot.
+    "Never time an instrumented boot" arrives here by a new route: the
+    instrumentation does not have to be in the hot path to cost you the
+    startup, it only has to be registered.
+
+57. **The fp8 split-KV verify route is sm89 and up, and `INT8_ACT=int8` does not
+    stack on it.** `patches/triton-spec-attn-fp8-kv.patch` lets the split-KV
+    verify kernel read vLLM's per-tensor fp8 cache, so `--kv-cache-dtype fp8`
+    can run with `TRITON_ATTN` on both the target and the drafter and keep FULL
+    CUDA graphs (the launch line, verbatim, is in `docs/long-context.md`; the
+    `"attention_backend":"TRITON_ATTN"` inside the speculative config is the
+    part that is easy to drop, and dropping it silently costs the FULL graphs).
+    Two limits. Triton has no fp8e4nv conversion on sm86, so on a 3090 the
+    route does not exist: the compiler refuses the kernel outright (gotcha 40
+    has the backend map), and `bench/test_spec_decode_fp8.py` skips there by
+    design rather than dying. And `INT8_ACT=int8` on the fp8 route is slow with
+    or without this patch (a Marlin variant choice, tracked separately), so do
+    not stack the two until the memory-pressure question behind it is
+    understood; the measured rows in `docs/long-context.md` are fp8 KV with
+    bf16 activations.

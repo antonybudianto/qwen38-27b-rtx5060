@@ -30,10 +30,14 @@
 #   both measured -- so this tier runs FlashInfer with no A/B possible, and
 #   issue #34 tracks a deterministic Xid-31 MMU write-fault seen twice on one
 #   3090 under fp8+MTP+prefix caching at ~28-34k context. The flashinfer-free
-#   fallback is the int8 tier (gotcha 44): what SPEC=dflash2 CTX=long already
+#   fallback is the int8 tier (gotcha 40): what SPEC=dflash2 CTX=long already
 #   ships, or for mtp: VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend
 #   =TRITON_ATTN --kv-cache-dtype=int8_per_token_head" at ~25% wall cost at
-#   depth (23.7 vs 18.9 s for 17.9k in + 256 out, measured).
+#   depth (23.7 vs 18.9 s for 17.9k in + 256 out, measured). At chat length
+#   that escape is +2.5% end-to-end and quality-neutral, but it costs 16% of
+#   the KV pool and decays hard past 25k (-34% decode / -44% prefill at 60k);
+#   SPEC=dflash2 CTX=fast is +31% over it at C1. Use it as the #34 fallback,
+#   not as the fast path. Numbers in gotcha 40.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
 #
@@ -75,6 +79,13 @@ fi
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
 PORT=${PORT:-18020}
 MAX_SEQS=${MAX_SEQS:-}
+# Seconds between SSE ': keep-alive' comment lines on a streaming response, so
+# an idle stream survives a proxy's idle timeout during a long prefill (Bifrost
+# defaults to 120 s; 30 s clears it with a 4x margin). SSE_KEEP_ALIVE=0 passes
+# the flag with the interval vLLM reads as off; SSE_KEEP_ALIVE= (empty) drops
+# the flag entirely, which is what a vLLM tree WITHOUT patches/sse-keep-alive.patch
+# applied needs — the flag does not exist there, and the deploy tree drifts.
+SSE_KEEP_ALIVE=${SSE_KEEP_ALIVE-30}   # no colon: SSE_KEEP_ALIVE= keeps the empty value
 # INT8_ACT=int8 turns on the W4A8 Marlin path (weights stay int4, activations
 # quantized per token to int8, int8 tensor cores) for the layers INT8_LAYERS
 # selects — the same knob batch mode ships on by default. At batch size 1 it
@@ -699,6 +710,15 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DIST
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi
+# The CPU offload tier (--kv-offloading-size in EXTRA_ARGS, or any --kv-transfer-config) is a KV connector, and
+# vLLM 0.28 refuses every KV connector under expandable_segments:True unless the cumem allocator is on: the VMM
+# allocator can move KV pages out from under the connector's pinned copies. On WSL2 the default above already
+# avoids it; on native it is the default, so the tier could not boot with the launcher's defaults (#95).
+case " ${EXTRA_ARGS:-} " in
+  *"--kv-offloading-size"*|*"--kv-transfer-config"*)
+    [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
+    ALLOC_DEFAULT=expandable_segments:False ;;
+esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
@@ -724,4 +744,5 @@ exec venv/bin/vllm serve "$MODEL" \
   --enable-prompt-tokens-details \
   "${METRICS_ARGS[@]}" \
   "${TOOL_ARGS[@]}" \
-  ${EXTRA_ARGS}
+  ${EXTRA_ARGS} \
+  ${SSE_KEEP_ALIVE:+--sse-keep-alive-interval $SSE_KEEP_ALIVE}

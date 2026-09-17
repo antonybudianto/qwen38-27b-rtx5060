@@ -44,7 +44,7 @@ Written against vLLM 0.27.1.
 
 --- /dev/null
 +++ b/v1/attention/backends/prefill_attn_hd256.py
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,242 @@
 +"""Prefill attention for head_dim 256 on sm86: GQA-packed, paged-KV, causal,
 +with an int8-QK^T mode (SageAttention-style) that runs the score GEMM on int8
 +tensor cores at 2x the fp16 rate.
@@ -85,6 +85,7 @@ Written against vLLM 0.27.1.
 +        pos = start + tl.arange(0, CHUNK)
 +        ok = pos < kv_len
 +        blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=ok, other=0)
++        blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +        slot = pos % BLOCK_SIZE
 +        ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks \
 +            + kvh * stride_kh + d[None, :]
@@ -110,6 +111,7 @@ Written against vLLM 0.27.1.
 +    ok = pos < kv_len
 +    d = tl.arange(0, D)
 +    blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=ok, other=0)
++    blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +    slot = pos % BLOCK_SIZE
 +    ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks \
 +        + kvh * stride_kh + d[None, :]
@@ -177,6 +179,7 @@ Written against vLLM 0.27.1.
 +        pos = start + tl.arange(0, BLOCK_N)
 +        k_ok = pos < kv_len
 +        blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=k_ok, other=0)
++        blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +        slot = pos % BLOCK_SIZE
 +
 +        if INT8_QK:

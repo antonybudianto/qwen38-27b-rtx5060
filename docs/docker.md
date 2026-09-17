@@ -61,6 +61,19 @@ difference is gotcha 16 below.
   `verify.sh --no-server` before every start — so a missing or half-prepared
   model heals itself, and a real FAIL refuses to serve (`PREPARE=0` / `VERIFY=0`
   skip the two steps).
+- **More than one GPU:** `GPU_COUNT` in `.env` sets how many cards the
+  container gets (default 1, which is whichever card the runtime enumerates
+  first — GPU 0), and `EXTRA_ARGS="--tensor-parallel-size 2"` sets how many the
+  engine uses. To pick *specific* cards on a mixed box, use `GPU_COUNT=all`
+  plus `CUDA_VISIBLE_DEVICES=1,2`: the compose device reservation decides what
+  is visible, so `NVIDIA_VISIBLE_DEVICES` in `.env` alone was not enough (#68),
+  while `CUDA_VISIBLE_DEVICES` is read inside the container (gotcha 53
+  recommends it for the same reason). Pin `KV_MEM` before
+  benchmarking or trimming `MAX_LEN` on a TP box — the launcher skips the
+  single-card pin under TP>1, and an unpinned pool moves with compile-cache
+  state (README, "More than one GPU"; issues
+  [#68](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/68),
+  [#104](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/104)).
 - Files that `prepare` writes to `./models` are root-owned: the container runs
   as root, like vLLM's own image.
 - The image carries an nvcc (CUDA "base" + `cuda-nvcc`, not the 8 GB "devel"
