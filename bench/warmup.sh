@@ -23,21 +23,11 @@ REPO="$(dirname "$HERE")"
 cd "$REPO"
 export PATH="$REPO/venv/bin:$PATH"
 
-# Reuse the API key the launcher started the server with. start_qwen.sh
-# exports VLLM_API_KEY (from $VLLM_API_KEY or api_key.txt), and vLLM reads
-# that variable to bind --api-key; vllm bench serve presents OPENAI_API_KEY,
-# so the two must agree or every request 401s. An explicit OPENAI_API_KEY
-# wins, then VLLM_API_KEY, then api_key.txt, then a harmless placeholder (the
-# server ignores the key when none was bound).
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-    if [ -n "${VLLM_API_KEY:-}" ]; then
-        export OPENAI_API_KEY="$VLLM_API_KEY"
-    elif [ -f "$REPO/api_key.txt" ]; then
-        export OPENAI_API_KEY="$(cat "$REPO/api_key.txt")"
-    else
-        export OPENAI_API_KEY="EMPTY"
-    fi
-fi
+# Present the key the launcher bound `--api-key` with, through the shared
+# resolver (issue #113): vllm bench serve presents OPENAI_API_KEY while vLLM
+# binds VLLM_API_KEY, so the two must agree or every request 401s.
+source "$REPO/resolve_api_key.sh"
+resolve_client_key
 
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-18020}

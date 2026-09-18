@@ -1277,3 +1277,47 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     not stack the two until the memory-pressure question behind it is
     understood; the measured rows in `docs/long-context.md` are fp8 KV with
     bf16 activations.
+
+58. **`reasoning_effort: "minimal"` from an OpenAI-protocol client 400s every
+    request that carries it.** The shipped `chat_template.jinja` accepts only
+    xhigh/medium/low and defaults to xhigh, while gpt-5-era clients speak the
+    OpenAI vocabulary (none/minimal/low/medium/high/xhigh/max). vLLM's
+    `ChatCompletionRequest.reasoning_effort` accepts all seven and passes the
+    value verbatim into `apply_chat_template` (`vllm/renderers/hf.py`
+    `safe_apply_chat_template`), so `minimal` reaches the template's
+    `raise_exception` and comes back as a 400 Bad Request. Headroom passes it
+    through untouched — its effort router only rewrites Responses-API turns and
+    deliberately does not run on chat/completions (`shape_openai_chat_request`,
+    headroom `proxy/output_shaper.py`). First seen 2026-09-15: one 400 among
+    eleven requests, session otherwise healthy.
+    Fix: `prepare/translate_chat_template.py` rewrites the effort block in
+    place — it maps only the names the template does not know (minimal→low,
+    high/max→xhigh) and lets every other value fall through unchanged, so the
+    template's own levels keep their behaviour and an omitted effort keeps the
+    template default (`xhigh`): no measured baseline moves. The raise is
+    dropped, so an unknown value no longer 400s — it ends up with no reasoning
+    instruction, the same outcome as `medium`. Idempotent (v2 marker, with a
+    v1→v2 upgrade so a dir translated by the first cut does not keep its
+    `medium` default) and self-healing: `docker/prepare.sh` re-runs it on every
+    boot (`TRANSLATE_EFFORT=0` skips the step), including on the model actually
+    served (`MODEL`), so a re-download that clobbers the template is
+    re-translated. A template whose effort block matches no known shape warns
+    and is left alone — this runs under `set -e` after the download, so it must
+    not fail a ready model dir. A running server loads the template at startup
+    — restart to pick up a translation.
+59. **Two prepares at once leave a model dir half-written.** Every step of
+    `docker/prepare.sh` is idempotent, but the script is not concurrency-safe:
+    two runs against one model dir can interleave a shard rewrite with an index
+    write, and the damage surfaces much later — a shard missing from
+    `model.safetensors.index.json`, a config that disagrees with the tensors on
+    disk, or a half-fetched fast variant that `verify.sh` then reports far from
+    its cause. It happens without anyone typing two commands: the entrypoint
+    runs `prepare` before every start, so a booting container races
+    `docker compose run --rm prepare`, and two servers starting together after a
+    crash race each other. Fix: the script takes an exclusive `flock` on
+    `<models dir>/.prepare.lock` — beside the model dir rather than inside it,
+    so `BASE_MODEL_DIR` cannot move it out of the volume — and waits up to
+    `PREPARE_LOCK_WAIT` seconds (default 600) for a holder before refusing to
+    run. The lock is advisory and is released when the holder exits, so a
+    leftover `.prepare.lock` file is inert: it is a lock, not a marker, and
+    nothing has to clean it up.

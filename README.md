@@ -11,6 +11,7 @@
 <a href="https://github.com/vllm-project/vllm"><img alt="vLLM 0.28.0" src="https://img.shields.io/badge/vLLM-0.28.0-5C3EE8"></a>
 <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/github/license/syv-ai/HyperQwen"></a>
 <a href="https://github.com/syv-ai/HyperQwen/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/syv-ai/HyperQwen?style=flat"></a>
+<a href="https://ko-fi.com/mhenrichsen"><img alt="support on Ko-fi" src="https://img.shields.io/badge/Ko--fi-support%20GPU%20time-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
 
 ![Stock vLLM against this repo, same card, same prompts](docs/media/demo.gif)
@@ -54,7 +55,42 @@ into `./models`), then serves on `:18020`. One GPU runs one mode at a time.
   [docs/docker.md](docs/docker.md#plain-docker-no-compose) ·
   [docs/install.md](docs/install.md)
 
-### Which mode
+## Which setup do I want?
+
+Three questions, and the answers are the whole of your `.env`.
+
+```mermaid
+flowchart TD
+  Q1{"Who is sending<br/>the requests?"}
+  Q1 -->|"an API backend, a pipeline,<br/>8+ at once"| A["<b>A — batch</b>"]
+  Q1 -->|"one or a few<br/>people chatting"| Q2{"Longest prompt<br/>you will send?"}
+  Q2 -->|"under 64k tokens"| Q3{"Do the answers quote<br/>the prompt back?"}
+  Q2 -->|"up to 150k"| D["<b>D — long context</b>"]
+  Q2 -->|"200k and beyond"| E["<b>E — huge context</b>"]
+  Q3 -->|"no — normal chat"| B["<b>B — single, default</b>"]
+  Q3 -->|"yes — code edits, RAG,<br/>rewrites, translation"| C["<b>C — reproduction</b>"]
+```
+
+Starting from the `.env` you copied in Quick start, which already ships **B**:
+
+| | change in `.env` | start with | what you get |
+|---|---|---|---|
+| **A** | nothing | `--profile batch` | ~1,035 tok/s aggregate at 64 concurrent |
+| **B** | nothing | `--profile single` | 127 tok/s single stream, 64k context |
+| **C** | add `DFLASH_TOKENS=15` | `--profile single` | 381 tok/s while quoting, at 4 slots and 56k |
+| **D** | `SPEC=mtp` and `CTX=long` | `--profile single` | 150k context, ~95-100 tok/s |
+| **E** | add `CTX=huge` | `--profile single` | 240k context, 67 tok/s mixed and 164 while quoting |
+
+Torn between B and C: B is the safe default, and C only pays off when the output
+really does repeat the input — it trades request slots and context for it. D drops
+back to MTP speculation on purpose, because DFlash2 past 64k is worth it only for
+reproduction and loses to `SPEC=mtp CTX=long` about 2:1 on everything else; at E
+the KVarN cache buys the context instead, so DFlash2 stays on. A needs no edit at
+all — batch ignores `SPEC` and says so on startup. Every knob, and what each costs:
+[single-user/README.md](single-user/README.md#if-you-are-the-only-user-do-this) ·
+[batch/README.md](batch/README.md).
+
+### The numbers behind that
 
 | | **batch** → [batch/](batch/) | **single** → [single-user/](single-user/) |
 |---|---|---|
@@ -70,24 +106,6 @@ sessions, where a speculating request reserves recurrent-state pages the pool ha
 few of ([measurement](docs/long-context.md)). Both modes share one install.
 [Full prefill matrix](batch/README.md#prefill) ·
 [how each number was won](docs/optimizations.md).
-
-## If you are the only user
-
-The shipped default is conservative — MTP speculation, 8 request slots, 64k
-context. If the card is yours alone, two settings are worth more than every
-other knob in this repo put together:
-
-```bash
-printf 'SPEC=dflash2\nPREFIX_CACHE=1\n' >> .env
-docker compose --profile single up -d
-```
-
-`SPEC=dflash2` proposes 7 tokens in one pass instead of 4 chained ones;
-`PREFIX_CACHE=1` keeps the document you already sent. Add `DFLASH_TOKENS=15` if
-your answers quote your prompts — that is the 381 tok/s row above.
-
-Full numbers, the venv equivalent, and what each setting costs:
-[single-user/README.md](single-user/README.md#if-you-are-the-only-user-do-this).
 
 ## Roadmap: more Qwen models, more cards
 
@@ -161,6 +179,10 @@ badly, which is usually the more useful half.
 If you can help, open an issue titled "compute offer" and we will take it from
 there. Small amounts are genuinely useful: a single day on one unfamiliar card
 has historically been worth more to this project than a month on a familiar one.
+
+Money works too, if that is easier than credits:
+[ko-fi.com/mhenrichsen](https://ko-fi.com/mhenrichsen) — it goes to rented GPU
+hours and the runs get written up here like any other reproduction.
 
 
 ## Documentation
