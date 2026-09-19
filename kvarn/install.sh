@@ -10,10 +10,15 @@ PY=${PY:-$REPO/venv/bin/python}
 SP=$("$PY" -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] || { echo "cannot import vllm with $PY (README: Setup)"; exit 1; }
 cp -r "$HERE/files/vllm/." "$SP/"
-patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-0.28.0.patch" || true
+# --fuzz 0 and a FAILED grep: both files are exported from the fork branch at their position after the
+# whole patches/ series, so a hunk that needs slack is a hunk cut against a tree this is not. `patch -N`
+# exits 1 for "already applied" too (a rerun), so the exit code cannot be the signal; the text can.
+apply_kvarn() { local out; out=$(patch -p1 -N --fuzz 0 -r /dev/null -d "$SP" < "$HERE/$1" 2>&1) || true; echo "$out"
+  case "$out" in *FAILED*) echo "ERROR: $1 has a hunk that does not apply to this vLLM tree (re-cut it against the pin)" >&2; exit 1 ;; esac; }
+apply_kvarn kvarn-0.28.0.patch
 # V2-runner port: lets SPEC=dflash2 run with CTX=huge (KVarN KV + prefix caching, 240k).
 # Depends on hunks from both the patches/ set and kvarn-0.28.0.patch, hence applied last.
-patch -p1 -N -r /dev/null -d "$SP" < "$HERE/kvarn-v2-runner-0.28.0.patch" || true
+apply_kvarn kvarn-v2-runner-0.28.0.patch
 find "$SP" -type d -name __pycache__ -path "*kvarn*" -prune -exec rm -rf {} + 2>/dev/null || true
 "$PY" - "$SP" "$HERE" <<'PY'
 import sys

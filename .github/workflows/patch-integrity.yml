@@ -16,11 +16,17 @@ jobs:
       - name: Check repository
         uses: actions/checkout@v4
 
+      # The series is checked against the pin the image installs, read from docker/requirements.txt,
+      # so a pin bump and its regenerated patches are judged together instead of against a stale tag.
+      - name: Read the vLLM pin
+        id: pin
+        run: echo "tag=v$(grep -E '^vllm==' docker/requirements.txt | cut -d= -f3)" >> "$GITHUB_OUTPUT"
+
       - name: Check pinned vLLM source
         uses: actions/checkout@v4
         with:
           repository: vllm-project/vllm
-          ref: v0.28.0
+          ref: ${{ steps.pin.outputs.tag }}
           path: .ci/vllm
           fetch-depth: 1
 

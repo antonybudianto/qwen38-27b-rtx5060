@@ -44,6 +44,15 @@ fi
 REPO="$(dirname "$DIR")"
 cd "$REPO"
 
+# Backlog 6 / F13: one validated resolver — refuses unknown KV, warns on
+# ignored (CTX/SPEC) and EXTRA_ARGS-shadowed controls, prints the redacted
+# effective config. Refusal exits here, before anything boots. The launcher
+# does not run under `set -e`, so a missing file would otherwise skip the check
+# silently.
+source "$REPO/resolve_config.sh" \
+  || { echo "start_qwen: cannot source $REPO/resolve_config.sh - refusing to boot unvalidated" >&2; exit 1; }
+resolve_effective_config batch
+
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
 PORT=${PORT:-18020}
 MAX_SEQS=${MAX_SEQS:-64}
@@ -162,6 +171,15 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DIST
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi
+# The CPU offload tier (--kv-offloading-size in EXTRA_ARGS, or any --kv-transfer-config) is a KV connector, and
+# vLLM 0.28 refuses every KV connector under expandable_segments:True unless the cumem allocator is on: the VMM
+# allocator can move KV pages out from under the connector's pinned copies. On WSL2 the default above already
+# avoids it; on native it is the default, so the tier could not boot with the launcher's defaults (#95).
+case " ${EXTRA_ARGS:-} " in
+  *"--kv-offloading-size"*|*"--kv-transfer-config"*)
+    [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
+    ALLOC_DEFAULT=expandable_segments:False ;;
+esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);
 # the attention kernels JIT fine. Remove this if you have a recent CUDA toolkit.
@@ -175,9 +193,8 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
 
 # API key: put it in api_key.txt in the repo root, or export VLLM_API_KEY.
-if [ -z "$VLLM_API_KEY" ] && [ -f "$REPO/api_key.txt" ]; then
-  export VLLM_API_KEY="$(cat "$REPO/api_key.txt")"
-fi
+source "$REPO/resolve_api_key.sh"
+resolve_vllm_key
 
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \

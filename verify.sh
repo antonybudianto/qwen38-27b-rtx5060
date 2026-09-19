@@ -44,38 +44,53 @@ $PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer(
   && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
   || fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. pip install flashinfer-python flashinfer-cubin==0.6.13 (#35)" 
 
-echo "== vLLM patches (patches/*.patch)"
+echo "== vLLM patches (order: patches/series)"
 # A later patch can rewrite the region an earlier one added -- both still apply, in
 # order, but the earlier one's lines are no longer in the tree, so neither check
 # above can see it. The later patch declares "Supersedes: <basename>" in its header;
 # that only counts if the later patch is itself applied (#67 over #57).
+SERIES=()
+while IFS= read -r name; do
+  SERIES+=("$name")
+done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series)
+ON_DISK=$(for f in patches/*.patch; do basename "$f"; done | sort)
+IN_SERIES=$(printf '%s\n' "${SERIES[@]}" | sort)
+if [ "$ON_DISK" = "$IN_SERIES" ]; then
+  ok "patches/series lists all ${#SERIES[@]} patches"
+else
+  fail "patches/series out of sync with patches/ (a patch not in series is never applied):"
+  comm -3 <(printf '%s\n' "$ON_DISK") <(printf '%s\n' "$IN_SERIES") | sed 's/^/    /'
+fi
 superseded_by() {
   local target="$1" q
-  for q in patches/*.patch; do
-    grep -q "^Supersedes: $target\$" "$q" || continue
-    patch -p1 -R --dry-run -s -d "$SP" < "$q" >/dev/null 2>&1 || $PY patches/_check_applied.py "$q" "$SP" 2>/dev/null || continue
-    basename "$q"; return 0
+  for q in "${SERIES[@]}"; do
+    grep -q "^Supersedes: $target\$" "patches/$q" || continue
+    patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < "patches/$q" >/dev/null 2>&1 || $PY patches/_check_applied.py "patches/$q" "$SP" 2>/dev/null || continue
+    printf '%s' "$q"; return 0
   done
   return 1
 }
 # The reverse dry-run is exact, but two patches touching the same file (the DFlash2 pair)
 # can no longer be reversed individually once both are applied; then look for their content.
-for p in patches/*.patch; do
-  if [ "$(basename "$p")" = "dflash2-backport.patch" ]; then
+for name in "${SERIES[@]}"; do
+  p="patches/$name"
+  if [ "$name" = "dflash2-backport.patch" ]; then
     ok "dflash2-backport.patch retired (DFlash2 is native in vLLM 0.28.0)"
     continue
   fi
-  if patch -p1 -R --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then ok "$(basename $p) applied"
-  elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$(basename $p) applied (content check; hunks overlap another patch)"
-  elif s=$(superseded_by "$(basename $p)"); then ok "$(basename $p) applied (superseded by $s, which is applied)"
-  elif patch -p1 -N --dry-run -s -d "$SP" < "$p" >/dev/null 2>&1; then fail "$(basename $p) NOT applied (patch -p1 -d $SP < $p)"
-  else fail "$(basename $p) neither applied nor applicable — vLLM version mismatch?"; fi
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < "$p" >/dev/null 2>&1; then ok "$name applied"
+  elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$name applied (content check; hunks overlap another patch)"
+  elif s=$(superseded_by "$name"); then ok "$name applied (superseded by $s, which is applied)"
+  elif patch -p1 -N --dry-run -s --fuzz 0 -d "$SP" < "$p" >/dev/null 2>&1; then fail "$name NOT applied (patch -p1 -d $SP < $p)"
+  else fail "$name neither applied nor applicable — vLLM version mismatch?"; fi
 done
-grep -q "VLLM_MARLIN_INT8_INCLUDE_RE" "$SP/envs.py" 2>/dev/null && ok "int8 layer-select env vars registered in envs.py" || fail "envs.py lacks VLLM_MARLIN_INT8_INCLUDE_RE"
+# Behavioural, not textual: the name must be in the live registry, so a comment or docstring cannot satisfy it
+# (a text grep here would; found on the native 3090, 2026-09-13). Negative control: a made-up name exits 1 in the same image.
+$PY -c "import vllm.envs as e, sys; sys.exit(0 if 'VLLM_MARLIN_INT8_INCLUDE_RE' in e.environment_variables else 1)" 2>/dev/null && ok "int8 layer-select env vars registered in envs.py (live registry)" || fail "envs.py does not register VLLM_MARLIN_INT8_INCLUDE_RE"
 
 echo "== KVarN (optional, kvarn/)"
 if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
-  if patch -p1 -R --dry-run -s -d "$SP" < kvarn/kvarn-0.28.0.patch >/dev/null 2>&1; then
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-0.28.0.patch >/dev/null 2>&1; then
     $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null && ok "KVarN backend importable, patch applied (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
   else fail "KVarN modules present but kvarn-0.28.0.patch not applied (bash kvarn/install.sh)"; fi
   if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.28.0.patch "$SP" >/dev/null 2>&1; then
@@ -99,9 +114,29 @@ def ok(m): print("  PASS ", m)
 def fail(m):
     global F
     print("  FAIL ", m); F += 1
-# lm_head / embed int8
-if "lm_head.weight_packed" in idx and any(g["targets"] == ["re:.*lm_head$"] and g["weights"]["num_bits"] == 8 for g in groups.values()): ok("lm_head requantized to int8 (prepare/quant_lm_head.py)")
-else: fail("lm_head not requantized: run prepare/quant_lm_head.py")
+# lm_head requantized to int8 (prepare/quant_lm_head.py), or int4-GPTQ as the
+# drafter/ pipeline writes it (the shipped ...-AutoRound-fast layout). The width
+# is whatever config declares; what must hold is the packed geometry it implies,
+# so a config claiming int4 over int8 tensors (or vice versa) still fails here.
+lm_g = next((g for g in groups.values() if g.get("targets") == ["re:.*lm_head$"]), None)
+lm_bits = lm_g["weights"]["num_bits"] if lm_g else None
+if "lm_head.weight_packed" not in idx or lm_bits not in (4, 8):
+    fail(f"lm_head not requantized to int4/int8 (prepare/quant_lm_head.py; lm_head group says num_bits={lm_bits})")
+else:
+    tc = c.get("text_config", c)
+    V, K = tc.get("vocab_size"), tc.get("hidden_size")
+    sh = {}
+    with open(d + idx["lm_head.weight_packed"], "rb") as f:
+        import struct
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    for k in ("lm_head.weight_packed", "lm_head.weight_scale"):
+        if k in hdr: sh[k] = tuple(hdr[k]["shape"])
+    want = {"lm_head.weight_packed": (V, K * lm_bits // 32), "lm_head.weight_scale": (V, K // 128)}
+    if sh == want:
+        ok(f"lm_head requantized to int{lm_bits}, packed geometry matches the declared width (prepare/quant_lm_head.py / fast variant)")
+    else:
+        fail(f"lm_head declares int{lm_bits} but packed geometry {sh} != implied {want}")
 if any(k.endswith("embed_tokens.weight_packed") for k in idx) and any(g["targets"] == ["re:.*embed_tokens$"] for g in groups.values()): ok("embed_tokens requantized to int8 (prepare/quant_embed.py)")
 else: fail("embed_tokens not requantized: run prepare/quant_embed.py")
 if "mtp.layers.0.mlp.down_proj.weight_packed" in idx and "mtp.layers.0.mlp.down_proj" not in ign: ok("MTP draft module quantized (prepare/quant_mtp.py)")
@@ -111,6 +146,28 @@ else: print("  WARN  draft head missing (prepare/build_draft_vocab.py --ids prep
 missing = [f for f in set(idx.values()) if not os.path.exists(d + f)]
 if missing: fail(f"safetensors shards missing: {missing}")
 else: ok(f"{len(set(idx.values()))} safetensors shards present")
+# duplicate tensors across shards: vLLM reads every key of every shard it opens,
+# not just the index-mapped ones, so a tensor that lives in more than its mapped
+# shard gets loaded twice — the second load wins, or a shape mismatch aborts the
+# boot far from the cause. This happens for real when a model dir is assembled by
+# hardlinking shards from the dir it was built from and one of them still carries
+# superseded tensors (e.g. an int8 MTP module surviving inside a hardlinked
+import struct
+def keys_of(f):
+    with open(d + f, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        return set(k for k in json.loads(fh.read(n)) if k != "__metadata__")
+holders = {}
+for f in (f for f in os.listdir(d) if f.endswith(".safetensors") and ".bak" not in f):
+    for k in keys_of(f):
+        holders.setdefault(k, []).append(f)
+colliding = [(name, hs) for name, hs in
+             ((name, holders.get(name, [])) for name in idx) if hs != [idx[name]]]
+if colliding:
+    for name, hs in colliding:
+        fail(f"tensor {name} present in {hs}, index maps {idx[name]}")
+else:
+    ok(f"every index tensor lives in exactly its mapped shard (no duplicates across {len(set(idx.values()))} mapped + stray files)")
 sys.exit(1 if F else 0)
 EOF
 [ $? -ne 0 ] && FAILS=$((FAILS+1))

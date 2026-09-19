@@ -14,9 +14,16 @@ Apply from the installed vllm package directory:
 
 Validated against vLLM 0.28.0.
 
+Env knobs this patch reads go through vllm.envs and are registered there (2026-09-15, the 0.28 hygiene pass; the
+registry mirrors the raw defaults, and registration puts them in the torch.compile cache key): (none; read moved to the registry)
+
+--- exported from cpuchip/vllm a049f223e (marlin-int8-layer-select); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index ed62659cf..e7074a52e 100755
 --- a/envs.py
 +++ b/envs.py
-@@ -177,6 +177,8 @@
+@@ -184,6 +184,8 @@
      VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
      VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
      VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
@@ -25,7 +32,7 @@ Validated against vLLM 0.28.0.
      VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
      VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
      VLLM_HUMMING_USE_F16_ACCUM: bool = False
-@@ -1455,6 +1457,14 @@
+@@ -1514,6 +1516,14 @@
      "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
          "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
      ),
@@ -40,6 +47,8 @@ Validated against vLLM 0.28.0.
      # The online quantization dtype for humming kernel
      "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
          os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+diff --git a/model_executor/layers/quantization/utils/marlin_utils.py b/model_executor/layers/quantization/utils/marlin_utils.py
+index 3658761d6..2284750e9 100644
 --- a/model_executor/layers/quantization/utils/marlin_utils.py
 +++ b/model_executor/layers/quantization/utils/marlin_utils.py
 @@ -666,7 +666,17 @@
@@ -49,9 +58,9 @@ Validated against vLLM 0.28.0.
 -    elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
 +    # syv patch: per-layer include/exclude regexes for the int8/fp8 activation
 +    # path (lm_head is int8-weight -> W8A8 unsupported by marlin; mtp stays 16-bit)
-+    import os as _os, re as _re
-+    _exc = _os.environ.get("VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp")
-+    _inc = _os.environ.get("VLLM_MARLIN_INT8_INCLUDE_RE", "")
++    import re as _re
++    _exc = envs.VLLM_MARLIN_INT8_EXCLUDE_RE
++    _inc = envs.VLLM_MARLIN_INT8_INCLUDE_RE
 +    if prefix is not None:
 +        if _exc and _re.search(_exc, prefix):
 +            return

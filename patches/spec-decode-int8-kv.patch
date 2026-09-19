@@ -39,9 +39,13 @@ Apply from the repo root, after spec-decode-attn.patch:
 
 Validated against vLLM 0.28.0. Reapply after upgrades.
 
+--- exported from cpuchip/vllm 2c429487f (spec-decode-int8-kv); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
+index 700553011..680d44068 100755
 --- a/v1/attention/backends/flash_attn.py
 +++ b/v1/attention/backends/flash_attn.py
-@@ -1757,7 +1757,7 @@
+@@ -1855,7 +1855,7 @@
      return _SPEC_ATTN_QMAX
  
  
@@ -50,13 +54,15 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
      from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
  
      key = (impl.num_heads, impl.head_size, q.device)
-@@ -1776,4 +1776,5 @@
+@@ -1874,4 +1874,5 @@
          )
          _SPEC_ATTN[key] = att
      att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
 -            cu_seqlens_q.shape[0] - 1, max_seqlen_q)
 +            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
 +            k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index 4b1c167e7..fd5469386 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
 @@ -41,6 +41,11 @@
@@ -71,7 +77,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
  from vllm.v1.kv_cache_interface import (
      AttentionSpec,
      KVQuantMode,
-@@ -688,6 +693,44 @@
+@@ -707,6 +712,44 @@
  
          mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
  
@@ -116,6 +122,8 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
          unified_attention(
              q=query[:num_actual_tokens],
              k=key_cache,
+diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
+index ed6e4f8ab..76b7ef36e 100644
 --- a/v1/attention/ops/spec_decode_attn.py
 +++ b/v1/attention/ops/spec_decode_attn.py
 @@ -21,6 +21,22 @@
@@ -141,7 +149,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
  Restrictions: q_len <= QMAX_TOKENS per request, D a power of two <= 256, no sliding
  window / softcap / alibi.
  """
-@@ -40,14 +56,17 @@
+@@ -41,14 +57,17 @@
  def _spec_attn_partial(
      q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr,
      part_o_ptr, part_m_ptr, part_l_ptr,
@@ -160,7 +168,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
  ):
      pid = tl.program_id(0)
      req = pid // NTILE
-@@ -89,7 +108,17 @@
+@@ -93,7 +112,17 @@
          v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
          k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
          v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
@@ -179,7 +187,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
          allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
          s = tl.where(allowed, s, float("-inf"))
          m_new = tl.maximum(m_i, tl.max(s, 1))
-@@ -97,7 +126,10 @@
+@@ -101,7 +130,10 @@
          p = tl.exp(s - m_safe[:, None])
          alpha = tl.exp(tl.where(m_i == float("-inf"), float("-inf"), m_i - m_safe))
          l_i = l_i * alpha + tl.sum(p, 1)
@@ -191,7 +199,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
          m_i = m_new
  
      # store partials at flat index ((req*Hq + head)*QMAX + i)*NSEG + seg
-@@ -171,10 +203,14 @@
+@@ -175,10 +207,14 @@
          qt = max(1, block_m // G)
          return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
  
@@ -207,7 +215,7 @@ Validated against vLLM 0.28.0. Reapply after upgrades.
          assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
          assert num_reqs <= self.max_num_reqs
          # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
-@@ -184,13 +220,16 @@
+@@ -188,13 +224,16 @@
          _spec_attn_partial[grid](
              q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
              self.part_o, self.part_m, self.part_l,

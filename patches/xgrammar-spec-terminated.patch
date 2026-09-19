@@ -46,9 +46,13 @@ loud.
 Applies to the vLLM tree:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/xgrammar-spec-terminated.patch
 
+--- exported from cpuchip/vllm f382a40de (xgrammar-spec-terminated); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/structured_output/backend_xgrammar.py b/v1/structured_output/backend_xgrammar.py
+index 258b1dff3..73906a0f0 100644
 --- a/v1/structured_output/backend_xgrammar.py
 +++ b/v1/structured_output/backend_xgrammar.py
-@@ -152,11 +152,15 @@
+@@ -157,11 +157,15 @@
      def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
          """Accepts a list of tokens and advances the FSM.
  
@@ -67,7 +71,7 @@ Applies to the vLLM tree:
          for token in tokens:
              if not self.matcher.accept_token(token):
                  logger.error(
-@@ -167,7 +171,9 @@
+@@ -172,7 +176,9 @@
                  )
                  return False
              self.num_processed_tokens += 1

@@ -16,12 +16,35 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DIST
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi
+# The CPU offload tier (--kv-offloading-size in EXTRA_ARGS, or any --kv-transfer-config) is a KV connector, and
+# vLLM 0.28 refuses every KV connector under expandable_segments:True unless the cumem allocator is on: the VMM
+# allocator can move KV pages out from under the connector's pinned copies. On WSL2 the default above already
+# avoids it; on native it is the default, so the tier could not boot with the launcher's defaults (#95).
+case " ${EXTRA_ARGS:-} " in
+  *"--kv-offloading-size"*|*"--kv-transfer-config"*)
+    [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
+    ALLOC_DEFAULT=expandable_segments:False ;;
+esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export PATH="$PWD/venv/bin:$PATH"
 export VLLM_API_KEY="$(cat api_key.txt)"
 export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
+# The multi-query 3D verify for the int4 cache (patches/spec-decode-int4-kv-mq3d.patch) was opt-in and nothing
+# set it, so this profile ran the stock 2D verify: on a 4090 at 120k, DFlash2 k=7, fresh prefill, decode 43.9 / 26.5 /
+# 16.6 tok/s at 24k / 49k / 88k tokens; with it on, 90.4 / 73.7 / 60.2 (and 48.1 at 145k on a 200k boot). Set
+# INT4_MQ_3D=0 to get the old path back.
+export VLLM_INT4_MQ_3D=${INT4_MQ_3D:-1}
+# INT8_ACT=int8: the W4A8 Marlin path for prefill, the same knob start_qwen.sh has (docs/optimizations.md). On this
+# profile it lifts fresh prefill +42% at 24k tokens to +13% at 145k (2,765 / 1,884 / 1,246 / 835 tok/s against
+# 1,942 / 1,446 / 1,039 / 736 on a 4090, 200k max length). It is a prefill knob: the paired 4090 repro measured
+# decode 8 to 13% lower and the KV pool 22% smaller with it on, and the quality trade is the documented int8 one,
+# so it stays opt-in here too. INT8_LAYERS narrows it the same way.
+INT8_ACT=${INT8_ACT-}
+INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
+[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
+[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
 
 # Ghost regions from a previous OOM-killed server hold host RAM hostage
 # (gotcha: 70 restarts of accumulation); same cleanup as start_qwen.sh.
@@ -40,7 +63,9 @@ DRAFT=${DRAFT:-models/Qwen3.8-27B-DFlash2-W4A16}
 # an arm that must read 1.00). Unrecognized values refuse for the same reason.
 SPEC=${SPEC:-dflash2}
 case "$SPEC" in
-  dflash2) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":${DFLASH_TOKENS:-7}}") ;;
+  # draft_sample_method: see start_qwen.sh -- on 0.28 the draft-logits buffer is only
+  # allocated when the config asks, and without it acceptance drops ~16% (#73).
+  dflash2) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":${DFLASH_TOKENS:-7},\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}") ;;
   off|none) SPEC_ARGS=() ;;
   *) echo "SPEC=$SPEC is not a mode here: dflash2 (default) or off." >&2; exit 1 ;;
 esac

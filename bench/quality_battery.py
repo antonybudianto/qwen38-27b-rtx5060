@@ -18,7 +18,7 @@ values are not JSON compliant: nan", and the batteries that do complete read
 PREFIX_CACHE=0 makes the same server exact and stable to four decimals. SPEC=off
 and SPEC=dflash2 on KVarN are unaffected, at the same pool size, and so is
 CTX=fast on all three settings, so the published quality tables are not
-implicated. Measured in #64 (gotcha 51).
+implicated. Measured in #64 (gotcha 46).
 Usage: python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]
 """
 import json, os, sys, glob, re, math, time, random

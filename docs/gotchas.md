@@ -9,27 +9,61 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    perplexity check caught it. Whatever you change, run
    `bench/quality_battery.py` (perplexity + GSM8K against the live server)
    before you believe a tok/s number.
-2. **Restart onto a dirty GPU and you silently lose 25%.** vLLM profiles free
-   memory once at startup. If the previous process is still releasing VRAM at
-   that moment, the cache pool comes out ~40% smaller and stays that way. No
-   warning, the server runs fine, throughput is just quietly bad. The systemd
-   units in both mode dirs carry an `ExecStartPre` gate that waits for the GPU
-   to be actually free.
-3. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is not optional.** The
-   DeltaNet prefill kernels allocate transient workspace; without it the
-   allocator fragments and the engine OOMs at runtime once
-   `gpu-memory-utilization` goes past ~0.975.
+2. **The KV pool is sized by one profiling pass, and that pass measures the
+   machine as much as the model.** Two ways it goes wrong, both silent, both
+   leaving a server that runs fine and is merely quietly worse for its whole
+   life.
+   **A dirty GPU.** vLLM profiles free memory once at startup, so if the
+   previous process is still releasing VRAM at that moment the pool comes out
+   ~40% smaller and stays that way. The systemd units in both mode dirs carry
+   an `ExecStartPre` gate that waits for the GPU to actually be free.
+   **A cold torch.compile cache.** The profiling forward also runs inductor's
+   autotuning, which inflates the peak it measures: batch mode profiles a
+   1.96 GiB activation peak instead of 1.09 GiB and comes up with 196k KV
+   tokens instead of 224k (`Maximum concurrency ... 1.31x` in the log instead
+   of 1.49x). Restart once after the cache is warm (venv: `~/.cache/vllm`,
+   Docker: the `qwen-cache` volume). Gotcha 48 has this isolated to the
+   byte on the single-user path — 0.92 GiB of peak, 45,000 tokens of context —
+   and the reproducibility rule that follows from it.
+   The durable fix for both is to stop profiling: pin the pool in bytes with
+   `--kv-cache-memory` (`KV_MEM`), which is what the single-user profiles do.
+   (The WSL2 notes above pin it the other way round — record the cold-start
+   `--kv-cache-memory` recommendation and pass it via `EXTRA_ARGS` — if you
+   prefer the extra transient headroom to the extra KV pages.)
+3. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on bare metal, and
+   `False` on WSL2.** The DeltaNet prefill kernels allocate transient
+   workspace; without expandable segments the allocator fragments and the
+   engine OOMs at runtime once `gpu-memory-utilization` goes past ~0.975. It is
+   not unconditional, which this entry used to imply: expandable segments need
+   CUDA VMM, which WSL2's paravirt driver rejects during capture, so both start
+   scripts set `expandable_segments:False` when they detect WSL2.
 4. **With MTP enabled, even that isn't enough — single-user mode runs
    `gpu-memory-utilization 0.93`.** The speculative decode path's DeltaNet
    workspace grows beyond what vLLM's startup memory profiling measures, and
    the engine dies mid-request on long generations at 0.95+. It survives short
    benchmarks, which is exactly how it fools you. We soak-tested 0.93 with a
    100k-token prompt plus 6k-token generations at 4 concurrent.
-5. **The torch.compile cache does not know about your env vars.** Switching
-   `INT8_LAYERS` between runs replays a compiled graph that expects the other
-   layer set and dies with `KeyError: 'input_global_scale'`. Our patch
-   registers the selection env vars with vLLM so they become part of the cache
-   key; if you invent your own, `VLLM_DISABLE_COMPILE_CACHE=1`.
+5. **A stale compiled artifact replays a graph built for other shapes, and the
+   error never mentions the cache.** Three doors into the same room:
+   - **Env vars vLLM does not know about.** Switching `INT8_LAYERS` between runs
+     replays a graph expecting the other layer set and dies with `KeyError:
+     'input_global_scale'`. Our patch registers the selection env vars with vLLM
+     so they become part of the cache key; if you invent your own,
+     `VLLM_DISABLE_COMPILE_CACHE=1`.
+   - **Shapes baked into the graph.** The compiled graph bakes in e.g. the
+     Marlin workspace size, so a new knob that changes it must be registered in
+     `envs.py` (`patches/speed-knobs-envs.patch`) or you get `assert_size_stride
+     ... expected size 328==82` from a cached artifact.
+   - **A second cache vLLM does not control.** The layer-select envs *are* in
+     vLLM's compile hash, but `torch_aot_compile` keeps its own; changing
+     `VLLM_MARLIN_INT8_INCLUDE_RE` can crash at the first forward with a
+     stable-ABI `aten::empty` RuntimeError from a cached inductor artifact. Wipe
+     `~/.cache/vllm/torch_compile_cache` when switching layer sets.
+
+   Unrelated to caching but found the same way: `INT8_LAYERS="mlp|linear_attn"`
+   (int8 GDN + fp16 attention) crashes even from a clean cache — an inductor
+   codegen bug with that mixed set on this torch pin; `mlp` and the full default
+   both compile fine.
 6. **Random-token benchmarks are meaningless for speculative decoding.** The same
    server does 35, 83 or 151 tok/s on `--dataset-name random` depending on what
    the noise turns into, because acceptance depends entirely on whether the
@@ -39,9 +73,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
 7. **Bigger prefill chunks make things worse.** `--max-num-batched-tokens
    8192` inflates the profiled activation peak, which shrinks the cache pool,
    which caps concurrency. 2048 wins on this card.
-8. **Benchmark twice.** The first run after any restart includes JIT warmup
-   and reads 30-50% low.
-9. **`--language-model-only` drops the vision tower cleanly** (no weights
+8. **`--language-model-only` drops the vision tower cleanly** (no weights
    loaded), and it is the default in both start scripts. `VISION=1` keeps the
    tower for a client that sends images. The tower is **0.858 GiB**, not the
    2.7 GB this entry used to give: `model.visual.*` sums to 0.858 GiB of BF16 in both
@@ -81,7 +113,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
 
    One precision from re-verifying the premise on a headless 3090, same 250 W:
    with nothing else on the card, `VISION_OFFLOAD=0` *does* boot -- and lands at
-   440 MiB free after boot, inside gotcha 39's kill zone (396 MiB free died on a
+   440 MiB free after boot, inside gotcha 35's kill zone (396 MiB free died on a
    concurrent burst where 436 survived). The hard no-boot above needs something
    else holding a share of the card -- the measuring box also ran a desktop
    compositor and a browser, which is the normal state of a 3090 in a
@@ -91,22 +123,22 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    tokens (`KV_MEM` has moved since the 69,758 above was measured), identical
    between `VISION=0` and `VISION=1`, and the image round-trip reads a marker
    that exists only in the pixels either way.
-10. **`prompt_logprobs` on long prompts OOMs the engine at 0.972 utilization**
+9. **`prompt_logprobs` on long prompts OOMs the engine at 0.972 utilization**
     (a 300-token prompt needs ~300 MB of fp32 logits and there is no headroom).
     Run quality checks at 0.93.
-11. **Don't chase the DeltaNet kernels.** `bench/tune_gdn.py` microbenchmarks
+10. **Don't chase the DeltaNet kernels.** `bench/tune_gdn.py` microbenchmarks
     the decode kernel across block/warp configs: it already runs at ~85% of the
-    3090's memory bandwidth and every variant lands within 3%. The state dtype
-    (point 3 above) is the lever, not the kernel.
-
-12. **The draft vocabulary is the single-user ceiling.** A draft head can only
+    3090's memory bandwidth and every variant lands within 3%. The state dtype is the
+    lever, not the kernel: `--mamba-ssm-cache-dtype float16`, which both start
+    scripts pass. (This used to cite a numbered entry that no longer exists.)
+11. **The draft vocabulary is the single-user ceiling.** A draft head can only
     propose tokens in its id list; a miss is a certain rejection that also ends
     the chain. Count the list over the model's *own* outputs (`drafter/gen_data.py`,
     then the frequency step in `prepare/build_draft_vocab.py`), not over web text —
     92% vs 97.5% coverage was the difference between 98 and 109 tok/s greedy.
     Coverage saturates around 40k rows; the model only ever emits ~54k distinct
     tokens.
-13. **FlashAttention-2 does not split KV for multi-query decode.** With k
+12. **FlashAttention-2 does not split KV for multi-query decode.** With k
     speculative tokens the verify step has k+1 queries per request and FA2's
     varlen path then runs one thread block per (request, head): 24 blocks on 82
     SMs, 57 µs per layer at 1.5k context and 1.3 ms at 16k. vLLM's Triton
@@ -115,34 +147,26 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     KV only) is a 180-line Triton fix. Watch its query cap: the kernel used to
     handle at most `BLOCK_M / (heads per kv head)` = 10 query tokens and fall
     back silently past that, which doubled the step at 25k context the moment
-    the verify block grew to 16. It now tiles the query rows instead.
-14. **Greedy is not deterministic across drafter configs.** The target rounds
+    the verify block grew to 16. It now tiles the query rows instead. And
+    watch the pool size: until #91 the kernel multiplied the block id by the
+    cache stride in int32, so a pool of more than about 2,383 blocks (bf16,
+    block 880) was silently reading the wrong memory for any request placed
+    above that id (issue #86, a 64 GB card; a 24 GB card never gets there).
+    The one `blk.to(tl.int64)` cast fixes it, `bench/test_spec_decode_bigpool.py`
+    forces the shape on any card. The int8 prefill kernel carries the same
+    pattern; its cast and test are pending in #109.
+13. **Greedy is not deterministic across drafter configs.** The target rounds
     differently when it verifies 5 tokens vs 1, so a different drafter changes
     the generated text at near-ties and the 8-prompt acceptance numbers move
     ±3%. Repeat before trusting a small difference; `drafter/README.md` has an
     offline chain simulator that removes the noise.
-15. **A stale torch.compile cache bites anything that changes tensor shapes
-    behind vLLM's back.** The compiled graph bakes in e.g. the Marlin workspace
-    size; a new env knob that changes it must be registered in `envs.py`
-    (`patches/speed-knobs-envs.patch`) or you get `assert_size_stride ...
-    expected size 328==82` from a cached artifact.
-16. **The very first start gets a smaller KV pool.** vLLM sizes the pool from
-    the peak memory of a profiling forward pass, and on a cold torch.compile
-    cache that pass also runs inductor's autotuning: batch mode profiles a
-    1.96 GiB activation peak instead of 1.09 GiB and comes up with 196k KV
-    tokens instead of 224k (`Maximum concurrency ... 1.31x` in the log instead
-    of 1.49x). Restart once after the cache is warm (venv: `~/.cache/vllm`,
-    Docker: the `qwen-cache` volume) and the pool is back to the README numbers.
-    (The WSL2 notes above pin it the other way round — record the cold-start
-    `--kv-cache-memory` recommendation and pass it via `EXTRA_ARGS` — if you
-    prefer the extra transient headroom to the extra KV pages.)
-17. **vLLM picks the speculative method from the model *path*.** `"dflash" in
+14. **vLLM picks the speculative method from the model *path*.** `"dflash" in
     model_path` switches `method` to dflash — for the *target* too, since MTP
     uses the target path as its draft model. A checkout under a directory with
     "dflash" in its name turns `SPEC=mtp` into a crash in `EAGLEConfig`
     (`'Qwen3_5Config' object has no attribute 'vocab_size'`). Name your
     directories accordingly.
-18. **The V2 model runner (`SPEC=dflash2`) does not count its CUDA graphs when
+15. **The V2 model runner (`SPEC=dflash2`) does not count its CUDA graphs when
     sizing the KV pool** (~1.2 GiB on top of whatever `--gpu-memory-utilization`
     you asked for), the hybrid allocator sizes KV groups by the smallest layer
     bucket, and the profiled activation peak varies by ~1 GiB between starts of
@@ -153,12 +177,12 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     runner also answers `thinking_token_budget` with 400, and the first request
     after a cold start JIT-compiles four Triton kernels (~5 s once; cached in
     `~/.triton`).
-19. **`INT8_LAYERS=.` needs `GPU_UTIL=0.95`.** Quantizing the activations of every linear
+16. **`INT8_LAYERS=.` needs `GPU_UTIL=0.95`.** Quantizing the activations of every linear
     layer (rather than just the MLP) is worth ~11% throughput — 1,042 vs 942 tok/s at 64
     concurrent — but the extra per-layer scratch no longer fits batch mode's 0.972: the
     engine dies with `torch.OutOfMemoryError` inside `chunk_fwd_o` once ~17 requests are
     resident, which reads as every request returning 500 while `/health` still answers.
-20. **A Triton kernel's scratch buffers may not grow after CUDA graph capture.** The
+17. **A Triton kernel's scratch buffers may not grow after CUDA graph capture.** The
     split-KV verify attention sizes its partial buffers from the longest query block it has
     been asked for. Once the block got longer than the drafter's — and once a small prefill
     chunk could land on the same kernel — that "longest so far" changed mid-run, the buffers
@@ -166,21 +190,22 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `CUDA error: an illegal memory access was encountered`, a few hundred tokens into the
     first request. `VLLM_SPEC_DECODE_ATTN_QMAX` (set by `single-user/start_qwen.sh` from
     `DFLASH_TOKENS`) fixes the size at startup instead.
-21. **Async scheduling pins the number of speculative tokens.** vLLM only feeds draft token
+18. **Async scheduling pins the number of speculative tokens.** vLLM only feeds draft token
     ids — and therefore the *count* the worker wants verified — back to the scheduler on the
     synchronous path (`EngineCore.post_step`). With async scheduling on, every decode step is
     padded to `num_speculative_tokens` and a worker asking for fewer is ignored, silently.
     Adaptive block length (`LOOKUP=1` with `DFLASH_TOKENS > 7`) needs `ASYNC_SCHED=0`; at
     batch 1 that costs under 1%.
-22. **`--async-scheduling` is already the default in 0.28.0.** The flag exists and passing it
+    Still true on 0.28.0, and worth knowing *why*, because 0.28 looks like it
+    handles this for you and does not: `VllmConfig` disables async scheduling
+    automatically for speculative methods outside an allowlist, but that
+    allowlist is `EagleModelTypes`, and `DFlashModelTypes` is inside it
+    (`config/speculative.py:66`). So dflash keeps async scheduling on unless
+    something turns it off, and the launcher is that something.
+19. **`--async-scheduling` is already the default in 0.28.0.** The flag exists and passing it
     changes nothing; `--no-async-scheduling` is what turns it off. Two hours of "the adaptive
     block isn't working" was this.
-23. **A longer verify block costs KV pool per request slot, not per token.**
-    `--mamba-cache-mode align` reserves `2 + num_speculative_blocks` recurrent-state pages
-    per slot, so `DFLASH_TOKENS=31` with 8 slots wants 5.3 GiB before a single token of
-    context and refuses to start. Single-user mode drops to 4 slots when the block is long,
-    which is what makes the long block affordable at all.
-24. **The DFlash draft pass is a captured CUDA graph, so its Python runs once.**
+20. **The DFlash draft pass is a captured CUDA graph, so its Python runs once.**
     `DFlashSpeculator._generate_draft` — everything the speculator does per step, including
     the lookup — is replayed from a graph. The Triton kernels inside it do run every step and
     do read live buffers, so the lookup itself works; but host-side Python in there executes
@@ -189,22 +214,22 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     belongs in a method the model runner calls per step (`next_num_draft_tokens`), reading
     device tensors the replayed kernels wrote. Three separate "the trigger doesn't fire"
     debugging rounds were this.
-25. **`torch.cuda.is_current_stream_capturing()` is not a usable guard on this path.** It
+21. **`torch.cuda.is_current_stream_capturing()` is not a usable guard on this path.** It
     reads True inside the captured draft pass — which is correct, and exactly why a guard
     written as `if not is_current_stream_capturing():` silently disables the code it guards
     for the entire run, not just during warm-up.
-26. **rsync preserves mtimes, and Python trusts mtimes.** Copying a source file into
+22. **rsync preserves mtimes, and Python trusts mtimes.** Copying a source file into
     `site-packages` with `rsync -a` can leave the `.pyc` newer than the `.py`, in which case
     the interpreter keeps running the old bytecode and every measurement lands on the
     previous revision. Delete `__pycache__` after installing patched files.
-27. **A shorter draft block than `num_speculative_tokens` loses the decode CUDA graphs.**
+23. **A shorter draft block than `num_speculative_tokens` loses the decode CUDA graphs.**
     The V2 runner captures uniform-decode graphs at `decode_query_len = num_speculative_tokens
     + 1` and dispatch requires an exact match, so scheduling the drafter's 8-token block on a
     16-token server matches nothing and the step runs piecewise: 27.9 ms against 25.9 ms for
     the same work, on every short step. `cudagraph_utils.py` already knows how to capture
     several decode lengths (it does it for dynamic speculative decoding); the lookup patch
     adds the drafter's block to that list. Costs 1.8 GiB of graphs instead of 1.45.
-28. **A verify block costs step time in steps, not smoothly, and the two stairs are at 16
+24. **A verify block costs step time in steps, not smoothly, and the two stairs are at 16
     and 21 query tokens.** Measured on a copy at 25k context: 39.5 ms per step at 16 query
     tokens (`DFLASH_TOKENS=15`), 47.8 at 19, 47.2 at 21 — a jump between 16 and 19 and then
     flat. The first stair is the target's W4A16 GEMMs: GPTQ-Marlin tiles the M dimension in
@@ -218,7 +243,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     bottom stair, and 21, the most tokens obtainable for the price of the second. 31 pays
     both stairs and was never worth measuring; two attempts to start it died on memory
     first.
-29. **A verify block that outgrows its CUDA-graph reservation OOMs at run time, not at
+25. **A verify block that outgrows its CUDA-graph reservation OOMs at run time, not at
     startup.** `--kv-cache-memory` pins the pool, so `VLLM_V2_CUDAGRAPH_MEM_MIB` no longer
     sizes it — it only reserves headroom, and if it under-reserves, the server starts, logs a
     healthy pool, and then dies on the first prefill with 50 MiB left. Graph memory grows
@@ -226,7 +251,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     capture list length barely matters — 2.21 GiB at 20 with `CG` cut from 63 to 42). Budget
     a request as `64 KiB * context + 102 MiB * (DFLASH_TOKENS + 2)`, the second term being
     the aligned recurrent-state pages, and take the extra graph memory out of the pool.
-30. **The draft model is not redundant during a copy, even when the lookup overwrites every
+26. **The draft model is not redundant during a copy, even when the lookup overwrites every
     token it proposed.** It looks like free money: on a step the lookup controller selected,
     a qualifying match is long enough to take the head of the block too, so all seven of the
     drafter's tokens are replaced before anything is verified — skip its forward and save
@@ -237,7 +262,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     recovers the acceptance but only two runs in three — the flag it keys on is one step
     stale, and a stricter condition is more sensitive to that. Both variants are gone; this
     entry is here so the idea does not look untried.
-31. **Any controller state that outlives one step has to be per-request, or batch > 1 stops
+27. **Any controller state that outlives one step has to be per-request, or batch > 1 stops
     being reproducible.** The lookup's block-length decision is batch-wide by design — a long
     block costs step time on every request in the batch — and taking it from the current
     step's flags is fine, because those are a function of the requests present. Holding it
@@ -250,7 +275,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     fix is per-request draft counts, which `get_uniform_token_count` in
     `gpu/cudagraph_utils.py` will not dispatch a graph for — a ragged batch runs piecewise
     and costs 8%, more than the hold is worth.
-32. **Halving the KV element size can *cost* memory on a hybrid model with a draft model.**
+28. **Halving the KV element size can *cost* memory on a hybrid model with a draft model.**
     `unify_kv_cache_spec_page_size` equalizes page sizes by scaling a layer's block size up by
     the integer ratio `max_page / own_page`, and pads the *page* instead when that ratio is not
     an integer. Sliding-window layers are born at the backend's smallest kernel block — 16 —
@@ -268,8 +293,8 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     dtype. `patches/hybrid-sw-block-promote.patch` rounds such a layer's block *up* instead
     (16 → 864), which turns that into 138,696 tokens. The tell in a log is an "estimated
     maximum model length" that is a small multiple of 16.
-33. **The aligned recurrent-state pages scale with the verify block, not with the slot count.**
-    Gotcha 23 says "per request slot"; that is wrong. Measured by asking for an impossible
+29. **The aligned recurrent-state pages scale with the verify block, not with the slot count.**
+    Not per request slot, which is the natural guess and is wrong. Measured by asking for an impossible
     `max_model_len` and fitting the two numbers vLLM prints: the fixed term is 0.88 GiB at
     `DFLASH_TOKENS=7` and 1.66 GiB at 15 — the ratio 0.53 is exactly 9/17, i.e. `(k+2)` — while
     `MAX_SEQS` 1 against 8 moves it by about **8 MiB in total**. So dropping to one slot for a
@@ -288,7 +313,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     they are in the ratio 8:5. The two facts together are the whole of the concurrency
     story for this mode: extra seats do not cost you pool, and they do not buy you
     residents either.
-34. **Asking for an impossible `max_model_len` is the cheapest way to read the memory model.**
+30. **Asking for an impossible `max_model_len` is the cheapest way to read the memory model.**
     vLLM prints "X GiB KV cache is needed ... available Y GiB ... estimated maximum model
     length is Z" and dies in ~90 s, before torch.compile finishes and long before graph
     capture. Two such points give slope and intercept for `needed(context)`, and the slope
@@ -297,9 +322,9 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     binary search over `max_memory_usage_bytes`, which rounds up to whole blocks, so the
     estimate is quantised by the block size: at an 864-token block the granularity is coarse
     and a two-point inversion at small lengths is unreliable.
-35. **`KV_MEM` assumes the card is headless, and the failure lands long after
+31. **`KV_MEM` assumes the card is headless, and the failure lands long after
     startup looks fine.** The single-user pool is pinned in bytes rather than sized
-    from `GPU_UTIL` (gotcha 33 and the comment in `single-user/start_qwen.sh` say
+    from `GPU_UTIL` (gotcha 29 and the comment in `single-user/start_qwen.sh` say
     why), and 5.2 GiB is what fits when nothing else is on the GPU. With a desktop
     session on the same card — Xorg plus a compositor plus a browser is easily
     ~1.3 GiB — the server still starts, still captures its graphs, still reports a
@@ -308,9 +333,9 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     warns you. On a card you also render on, drop `KV_MEM` by at least what the
     desktop is holding (`nvidia-smi` before you start the server): `KV_MEM=4000000000`
     was enough for the reporter of
-    [#12](https://github.com/syv-ai/qwen38-27b-rtx3090/pull/12). Setting `KV_MEM=`
+    [#12](https://github.com/syv-ai/HyperQwen/pull/12). Setting `KV_MEM=`
     empty falls back to `GPU_UTIL`, which profiles the actual free memory instead.
-36. **A model dir with no `tokenizer.json` is not an error to transformers — it is an
+32. **A model dir with no `tokenizer.json` is not an error to transformers — it is an
     empty vocabulary, and vLLM reports it as a reasoning-parser problem.**
     `AutoTokenizer.from_pretrained` on a dir that has `config.json` but no tokenizer
     files returns a `Qwen2Tokenizer` with `vocab_size == 1` that encodes *everything*
@@ -325,14 +350,14 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
 
     which names neither the tokenizer nor the directory, and prints the strings as
     empty because they are the *unset* config fields, not the ones the parser supplied.
-    Reported as [#15](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/15), where it
+    Reported as [#15](https://github.com/syv-ai/HyperQwen/issues/15), where it
     looked like a `SPEC=dflash2` bug: it reproduces with no speculative config at all,
     and the reason only the single-user modes failed is that they serve
     `models/Qwen3.8-27B-W4A16-AutoRound-fast` while batch mode serves the base dir.
     `verify.sh` now encodes `<think>` against every dir we pass to `--model` instead of
     only checking that the dir exists, and `docker/prepare.sh` counts `tokenizer.json`
     as part of a complete download.
-37. **Bug B needs a prefix-cache HIT, and then fires at one prompt length in every
+33. **Bug B needs a prefix-cache HIT, and then fires at one prompt length in every
     128. It is not dflash2-only.**
     Under `CTX=huge` with a CAPTURED (FULL) verify step, a request that hits the
     prefix cache and whose prompt length lands on one particular residue mod 128
@@ -347,14 +372,14 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     box running `MAX_LEN=240000` with a tool parser attached — 400 tokens of fluent
     Danish that open with a malformed `<think>` under `enable_thinking=false` and
     invent a translation task, `2/1146` verbatim at 3.38 tok/step
-    ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25), mjungnickel18).
+    ([#25](https://github.com/syv-ai/HyperQwen/issues/25), mjungnickel18).
     So do not test for a symptom. The only property all three share is that the copy
     did not come back, which is what `bench/verbatim.py` scores and what both sweeps
     now judge on.
 
     Two conditions, and it took two people to see both. The **hit** is necessary:
     a fresh server, one request, no warm-up, never collapses at any length
-    ([#13](https://github.com/syv-ai/qwen38-27b-rtx3090/pull/13), mjungnickel18) —
+    ([#13](https://github.com/syv-ai/HyperQwen/pull/13), mjungnickel18) —
     which is also why `PREFIX_CACHE=0` always looked clean. The **residue** decides
     whether a hit corrupts, and it is a clean function of the draft count:
 
@@ -433,24 +458,23 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     wrote 82% there, which is the figure for six broken residues, and hung a
     "5 of 5 clean" claim on it. `bench/residue_sweep.py` walks all 128 by stepping
     the pad one token at a time, which covers each residue exactly once.
-38. **The decode-graph budget is sized for 64 query tokens, and `MAX_SEQS` multiplies
+34. **The decode-graph budget is sized for 64 query tokens, and `MAX_SEQS` multiplies
     into it.** `CG = MAX_SEQS x (k+1)` is what the V2 runner captures, and
     `VLLM_V2_CUDAGRAPH_MEM_MIB` is reserved for what the shipped defaults produce —
     8x8 at `DFLASH_TOKENS=7`, 4x16 at 15, i.e. 64 either way. Ask for
     `DFLASH_TOKENS=15 MAX_SEQS=8` and it becomes 128: the server boots, captures its
     graphs, answers `/health`, and then dies on the first concurrent batch with
     `torch.OutOfMemoryError` inside the engine — `EngineDeadError`, every request 500,
-    `/health` still 200. Same shape as gotcha 18 and as
-    [#18](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/18): a memory bill that
+    `/health` still 200. Same shape as gotcha 15 and as
+    [#18](https://github.com/syv-ai/HyperQwen/issues/18): a memory bill that
     the startup profile does not see. `single-user/start_qwen.sh` now caps the derived
     `CG` at 64, which leaves every shipped default untouched and makes the oversized
     batches run piecewise instead of not at all. Set `CG` explicitly to override, and
     raise `VLLM_V2_CUDAGRAPH_MEM_MIB` with it.
-
-39. **The engine needs non-KV headroom for its first real batch, `MAX_SEQS` and
+35. **The engine needs non-KV headroom for its first real batch, `MAX_SEQS` and
     `KV_MEM` are two doors into the same shortfall — and on WSL2 the failure is
     silent.** First seen as a seat-count death: `MAX_SEQS > 12` at `CTX=huge` kills
-    the engine and the graphs are innocent — same visible failure as gotcha 38
+    the engine and the graphs are innocent — same visible failure as gotcha 34
     (boots, captures, `/health` 200, dies on the first prompt with
     `torch.OutOfMemoryError`), different bill. `CG` is pinned at its 64 cap in every
     one of the runs below, so the memory is going to allocations that scale with
@@ -472,7 +496,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     Reproduced twice with byte-identical counters.
 
     The seat count is only one door into that shortfall.
-    [@mjungnickel18 named the real subject](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25#issuecomment-5392694387)
+    [@mjungnickel18 named the real subject](https://github.com/syv-ai/HyperQwen/issues/25#issuecomment-5392694387)
     — *how much non-KV headroom does the engine need*, with `MAX_SEQS` and `KV_MEM` as
     two doors into the same room — after a `KV_MEM` pin on his box produced a failure
     this table does not contain (below). The same room walked through the `KV_MEM`
@@ -497,7 +521,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     configuration anywhere on either ladder was ever merely *slow*.
 
     That last sentence is the platform note, and it is the part that cost a week of
-    cross-box debugging in [#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25):
+    cross-box debugging in [#25](https://github.com/syv-ai/HyperQwen/issues/25):
     on bare-metal Linux this failure has exactly two states, full speed or a loud named
     `torch.OutOfMemoryError`. Under WSL2 the WDDM driver backs the failed mapping with
     host memory instead, so the same exhaustion produces **no error at all** — just
@@ -505,7 +529,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     @mjungnickel18 under a `KV_MEM` pin that left ~630 MiB free). A WSL user who raises
     `KV_MEM` gets the context they asked for, no warning, and 5–10× the TTFT, with
     nothing in the logs and no `nvidia-smi` number that flags it. The two boxes in
-    [#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25) make it concrete: the
+    [#25](https://github.com/syv-ai/HyperQwen/issues/25) make it concrete: the
     same pin (`KV_MEM=6871947673` at `CTX=fast`, `MAX_SEQS=2`; the boxes produce
     byte-identical pool geometry, 81,368 tokens at the fixed sibling pin) read
     ~630 MiB free after boot on WSL and served — slowly — for four days, while on bare
@@ -515,7 +539,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     prompt-length ladder against a known-good rate. On WSL, ladder any `KV_MEM` above
     stock before trusting it; the launcher now prints a warning when the pin exceeds
     the profile default. A cheaper live check, from a second WSL2 box in
-    [#61](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/61): `nvidia-smi dmon`
+    [#61](https://github.com/syv-ai/HyperQwen/issues/61): `nvidia-smi dmon`
     while it generates. Healthy decode on a 24 GB card is high SM occupancy *and*
     high power draw; host-backed memory shows as **SM near 100% at only 100-200 W**,
     because the SMs are stalled on PCIe rather than doing work. That reporter's rule
@@ -534,9 +558,8 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     Worth reading next to the concurrency section of the README: seats above the
     residency were already useless (they queue, then preempt). Past 12 at `CTX=huge`
     they stop being useless and become fatal.
-
-40. **Tool calling / structured output under a speculator killed requests at the
-    grammar's end** ([#31](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/31),
+36. **Tool calling / structured output under a speculator killed requests at the
+    grammar's end** ([#31](https://github.com/syv-ai/HyperQwen/issues/31),
     fixed by `patches/xgrammar-spec-terminated.patch`). A speculative verify window
     can legally accept tokens past the point where the xgrammar matcher terminates —
     the newline after a closing `</tool_call>` tag, the stop token itself, anything
@@ -559,10 +582,9 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     draft tokens past a reasoning end that landed mid-window, a rejection the code
     explicitly tolerates. It is noise, the request completes normally, and it
     predates (and survives) this fix.
-
-41. **sm80 (GA100) Marlin repack can Xid-31 the whole card under memory
+37. **sm80 (GA100) Marlin repack can Xid-31 the whole card under memory
     pressure — and the kernel in the traceback is innocent.** Community
-    finding, [@ahnguyen17 in #27](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/27#issuecomment-5397500895),
+    finding, [@ahnguyen17 in #27](https://github.com/syv-ai/HyperQwen/issues/27#issuecomment-5397500895),
     on a CMP 170HX 40 GB: with ~27 GB resident, `gptq_marlin_repack`'s GB-scale
     int64 intermediates (k×n int64 ≈ 1.4 GB per 27B layer, several live at
     once) churn sm80 VMM mappings until an unrelated, trivially correct
@@ -576,9 +598,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     independent Xid-31 trigger. Not shipped here (no sm80 to regression-test
     against); recorded so the next GA100/A100 report starts from the answer
     instead of from five reboots.
-
-
-42. **The OffloadingConnector's CPU tier can be silently useless: uniform
+38. **The OffloadingConnector's CPU tier can be silently useless: uniform
     blocks meet asymmetric chunk sizes, and one request evicts everything
     (issue #33).** The tier allocates equal-size blocks sized for the LARGEST
     group's offload chunk. Under KVarN the drafter's sliding-window group
@@ -588,7 +608,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     document. Stores succeed, `complete_store` succeeds, and every
     cross-request lookup is a MISS: 41 GB written, 0 bytes ever read back,
     with nothing in the logs. On bf16 KV the SW group happens to share the
-    large per-token size (gotcha 25's 4096-B coincidence), the geometry
+    large per-token size (gotcha 28's 4096-B coincidence), the geometry
     stays uniform, and the same connector uplifts at PCIe speed — the KV
     dtype was never the mechanism, the chunk geometry it induces was. Since
     `offload-dflash-eagle-groups.patch` the config builder warns at boot
@@ -600,16 +620,53 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     from store while decoding; with dflash the flag now lands on the
     drafter's sliding-window group alone. Also: on bare-metal Linux the
     connector refuses this stack's default allocator
-    (`expandable_segments:True`) at config validation — run it with
-    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` (or the cumem
-    allocator), which the WSL2 branch of the launchers already defaults to.
+    (`expandable_segments:True`) at config validation. All three launchers
+    now default `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` whenever
+    `EXTRA_ARGS` carries `--kv-offloading-size` or `--kv-transfer-config`
+    (and print a line saying so); an explicit `PYTORCH_CUDA_ALLOC_CONF` in
+    the environment still wins, so setting it to `True` by hand reproduces
+    the refusal. The MTP/EAGLE serve fixes are in the series as
+    `offload-mtp-serve.patch` (upstream #52771 and #52807 plus the
+    finished-request store watermark clamp, #54288): with it the tier serves
+    stored hits under `SPEC=mtp` and the cached count on a replay lands on the
+    same block formula as the GPU path, one 832-token block more than before.
+    **Sizing the tier, and why a default boot can show it doing nothing.**
+    Residency has no gauge in 0.28.0: both `kv_offload_cpu_cache_usage_perc`
+    and its read twin count in-flight transfer pins (`num_used = allocated -
+    free - evictable`, and `complete_store()` marks a block evictable the
+    moment it lands), so a full tier reads 0.0 between transfers and a 0%
+    reading is not an idle tier — read `vllm:kv_offload_total_bytes_total`
+    and the external-prefix-cache hit counter instead. Size the tier from
+    blocks x tokens-per-block for YOUR arm, never from a GiB constant:
+    `blocks` = mmap bytes / bytes-per-block (the usage gauge quantises at
+    1/blocks, e.g. 0.02252... = 10/444), and `tokens-per-block` = distinct
+    tokens stored / `kv_offload_cpu_allocation_size_sum`. Measured on the
+    3090, `CTX=long` (fp8, MTP) at `--kv-offloading-size 12`: mmap
+    12,861,308,928 B over 444 blocks = 28,966,912 B per block; 367 blocks for
+    123,148 distinct tokens = ~336 tok/block; 444 x ~336 ~= **149k tokens**,
+    i.e. about ONE 150k session, not three. `CTX=huge` (KVarN) at the same
+    12 GiB is 110 x 2048 ~= 225k. Then read the GPU side off the SAME boot
+    log (`GPU KV cache size: N tokens`) and compare in TOKENS, not bytes: a
+    tier several times the pool in bytes can be smaller in tokens (86.2 KB
+    per tier token against 37.9 KB per pool token here, a 2.3x ratio), and a
+    tier smaller in tokens than the GPU prefix cache can never hold anything
+    the GPU cache has already dropped — which is the real reason a
+    default-pool 3x150k workload can show the tier doing nothing useful.
+    Capacity, not a scheduler veto. Both numbers must come from the same
+    boot: the pool is profiled per boot and moves ~1 GiB between a cold and a
+    warm compile cache (item 12), enough that a default `CTX=long` boot which
+    fits beside a tier one day refuses at KV sizing the next. Sized right,
+    the tier behaves as a high-churn working set rather than a resident
+    store: the reporter in
+    [#95](https://github.com/syv-ai/HyperQwen/issues/95) measured
+    658 GiB CPU->GPU, 541 GiB GPU->CPU and 15.95M external prefix hits
+    through a 12 GiB tier in ~3 h (dfein38347g).
     And when eviction probing, keep the resend prompt BYTE-identical: a
     two-token label difference shifts every block hash and manufactures a
     convincing, fake "per-request hash instability" (ask how we know).
-
-43. **"Every request re-prefills" is measurable, and the cause is usually the
+39. **"Every request re-prefills" is measurable, and the cause is usually the
     client's bytes, not the cache.** Reported against an agent client in
-    [#47](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/47) (44 s mean
+    [#47](https://github.com/syv-ai/HyperQwen/issues/47) (44 s mean
     TTFT at ~44k context, i.e. a full recompute per turn, while plain chat
     clients on the same server sat at the documented decode rates). Work the
     list in order:
@@ -621,12 +678,58 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
        field; this is the equivalent.) Server-side,
        `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` on `/metrics`
        give the same as counters.
-    2. **Know the floor.** Hits are counted in whole hash units and the
-       recurrent state resumes only at aligned boundaries
-       (`--mamba-cache-mode align`), so the hit length truncates DOWN to a
-       multiple of the unit — a prompt shorter than one unit can never hit,
-       and a shared prefix pays up to one unit of recompute past the match.
-       This is a fixed tax, not the 100%-miss failure mode.
+    2. **Know the floor, and it has a closed form.** Hits are counted in
+       whole hash units and the recurrent state resumes only at aligned
+       boundaries (`--mamba-cache-mode align`), so the hit length truncates
+       DOWN to a multiple of the hybrid attention block `B` — and the final
+       block of a cached request is never served, because its recurrent
+       state was never checkpointed at that boundary. Measured on the box
+       over two block sizes ([#102](https://github.com/syv-ai/HyperQwen/issues/102)):
+
+           cached_tokens = max(0, floor(n_prefix / B) - 1) * B
+
+       where `n_prefix` is the length of the EARLIER, cached request — not
+       the replay's own `prompt_tokens`. Round lengths cannot tell those two
+       apart; straddle lengths can. At B=480, a 958-token prompt replayed at
+       961 tokens gives `cached_tokens` **0**, where `floor(961/480)-1`
+       would predict 480; 1438 replayed at 1441 gives 480, not 960. So a
+       prompt shorter than 2B can never hit at all, and a shared prefix pays
+       up to two blocks of recompute past the match. This is a fixed tax,
+       not the 100%-miss failure mode.
+
+       **`B` is not a constant — read it from the boot log.** Every launch
+       prints it:
+
+           INFO [interface.py:928] Setting attention block size to 480 tokens
+                to ensure that attention page size is >= mamba page size.
+           INFO [interface.py:952] Padding mamba page size by 1.27% to ensure
+                that mamba page size and attention page size are exactly equal.
+
+       `B` is whatever makes one attention page cover one mamba page:
+       `B = 16 * ceil(mamba_page / (16 * attn_page_1_token))`. On this model
+       `attn_page_1_token` is 4096 B at bf16 KV, 2080 B at
+       `int8_per_token_head` and 2048 B at fp8, and — the part that surprises
+       people — `mamba_page` includes the speculative drafter's state, so it
+       grows with the number of draft tokens: 1,634,304 B with no drafter
+       plus 20,480 B per draft token. That makes `B` a function of
+       `DFLASH_TOKENS`, not of the machine. Measured and reproduced pairs:
+
+       | profile | KV dtype | drafts | B | mamba padding |
+       |---|---|---|---|---|
+       | CTX=fast (production) | bf16 | 15 | 480 | 1.27% |
+       | CTX=fast | bf16 | 7 | 448 | 3.23% |
+       | SPEC=dflash2 CTX=long | int8_per_token_head | 7 | 864 | 1.09% |
+       | SPEC=mtp CTX=long | fp8 | 3 | 832 | 0.48% |
+
+       Rows 1 and 3 are boot lines from this box; rows 2 and 4 are the same
+       formula evaluated against this box's own config (no boot) and they
+       reproduce a contributor's boot lines on other 3090s to the last digit,
+       padding percentage included. That is the point: two boxes running the
+       "same" profile print different `B` purely because their
+       `DFLASH_TOKENS` differ (480 here at 15, 448 there at 7) — nothing
+       about the silicon, the build or the int8 prefill path is involved.
+       The contributor reports 448 and 832 stable from 0.28 to 0.29. Never
+       hard-code `B` into a client's cache arithmetic — read the boot line.
     3. **Byte-identity is over the RENDERED prompt.** What the cache hashes
        is the chat-templated token stream: system prompt + tool definitions +
        every message, in order. One changed byte at position P invalidates
@@ -643,7 +746,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
        agent's heartbeat pinging between chat turns is exactly that — can
        each evict the other before its recheck: measured as 0-of-3 warm in a
        3-context round-robin on 24 GB
-       ([docs/wsl2-4090.md](wsl2-4090.md), retention section). The CPU
+       ([wsl2-4090.md](wsl2-4090.md), retention section). The CPU
        offload tier turns that back into 3-of-3 (a RAM restore instead of a
        re-prefill).
     5. **The isolating experiment.** Bypass every proxy and fire the same
@@ -651,11 +754,10 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
        the server cache is healthy and the variable is the client payload
        (or a proxy that mutates it); if it does not, look at the server —
        and at 2 and 4 above.
-
-44. **`CTX=long`'s fp8 KV cache has exactly one attention backend on sm86, and
+40. **`CTX=long`'s fp8 KV cache has exactly one attention backend on sm86, and
     it is the one cell of the matrix this repo cannot A/B.** `FLASH_ATTN`
     refuses fp8 KV at startup ("requires FA3 on SM90 or FA4 on SM100" —
-    [#34](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/34)) and
+    [#34](https://github.com/syv-ai/HyperQwen/issues/34)) and
     `TRITON_ATTN` refuses it too ("native FP8 (fp8e4nv) requires SM89+",
     measured on the reference 3090), so the tier always auto-selects
     FlashInfer. #34 tracks a deterministic Xid-31 MMU write-fault (same
@@ -667,15 +769,61 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend=TRITON_ATTN
     --kv-cache-dtype=int8_per_token_head"`. Measured cost on the reference
     box: 17.9k in + 256 out takes 23.7 s against fp8/FlashInfer's 18.9
-    (~25% wall at that depth, mostly Triton prefill); in exchange the same
-    pinned pool holds more tokens at int8's geometry. The default stays
-    fp8/FlashInfer: two faults on one box do not justify a 25% tax on every
+    (~25% wall at that depth, mostly Triton prefill). The default stays
+    fp8/FlashInfer: two faults on one box do not justify that tax on every
     other box, but you should know which combination you are running.
 
-45. **On a low-RAM host, don't let the stock loader race page-cache eviction —
+    **What the escape actually buys and costs, measured** (reference 3090,
+    250 W, vLLM 0.28.0, `SPEC=mtp CTX=long PREFIX_CACHE=1 GPU_UTIL=0.93
+    MAX_SEQS=4 MAX_LEN=120000`, warm medians of 3 on `bench/real_rep.sh`,
+    C1 = 8 realistic prompts x 1024 out, concurrency 1):
+
+    | arm | decode tok/s | ms/step | tok/step | KV pool | GSM8K n=200 | PPL all |
+    |---|---|---|---|---|---|---|
+    | stock fp8 / FlashInfer / PIECEWISE | 101.1 | 27.2 | 2.68 | 172,500 | 0.960 | 8.2362 |
+    | int8 / TRITON_ATTN / FULL graphs | 103.7 | 25.4 | 2.57 | 145,030 | 0.965 | 8.2375 |
+
+    Three things to take from that. (a) The win at chat length is **+2.5%
+    end-to-end**, not the +6% a step-time number alone suggests: dropping the
+    spec-decode CUDA-graph downgrade really is worth −6.6% step time
+    (27.2 → 25.4 ms), but int8 KV gives ~4% of it straight back in MTP
+    acceptance (2.68 → 2.57 tok/step). Quote step time as step time.
+    (b) It is **quality-neutral** — GSM8K 96.5 vs 96.0 (n=200, SE ≈ 1.3 pt,
+    i.e. indistinguishable) and PPL +0.02%. Unlike int8 *activations*, int8
+    KV costs no accuracy here. (c) It **costs pool, it does not save it**:
+    145,030 vs 172,500 tokens, −15.9% at this geometry (per-token-head
+    scales plus the FULL-decode-graph capture), the opposite sign of what an
+    earlier version of this entry claimed.
+
+    **Do not reach for it as the fast path.** The same C1 row under
+    `SPEC=dflash2 CTX=fast` (FLASH_ATTN, bf16 KV, FULL graphs, 68,605-token
+    pool) reads 135.5 decode tok/s / 3.49 tok/step at the same 26.6 ms/step
+    — **+31% over the int8 escape**, all of it acceptance. If your work fits
+    64k, that is the answer; the int8 tier is the #34 fallback and the
+    `SPEC=mtp` + depth route, not a performance recommendation.
+
+    **And it decays with depth.** Salted prompts (`cached_tokens = 0`), 256
+    out, greedy, stock vs int8 escape: equal at 8K (81.7 / 82.9 decode),
+    −22% decode at 25K (80.3 / 62.7), −34% decode and −44% fresh prefill at
+    60K (70.7 / 46.7 and 872 / 490 tok/s), with TTFT 68.9 → 122.6 s at 60K.
+    A WSL2 3090 contributor carried the same curve to 90K (stock ~80 decode
+    / 878 prefill, escape 46.3 / 355) while stock stayed flat from 25K out.
+    So: **stock fp8 FlashInfer for depth, the int8 escape only for
+    short-context decode-heavy work or when #34 forces it.**
+
+    **On sm89+ you do not have to give up the fp8 pool.** 0.28's
+    `_create_draft_vllm_config` deliberately does not inherit the target's
+    attention backend into the proposer, so the knob is the *speculative
+    config's own* `attention_backend` field — put TRITON_ATTN there, leave
+    the target on fp8/FlashInfer, and the downgrade goes away with the pool
+    intact. Unreachable on sm86: Triton refuses fp8 KV below SM89
+    ("native FP8 (fp8e4nv) requires SM89+"), so int8 is the only
+    flashinfer-free option on a 3090. Reported and verified on a 4090 by a
+    contributor ([#87](https://github.com/syv-ai/HyperQwen/issues/87)).
+41. **On a low-RAM host, don't let the stock loader race page-cache eviction —
     stream the weights.** A 16 GB host (~10 GiB actually free) died loading the
     15.9 GiB checkpoint at shard 5/8
-    ([#39](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/39)). Measured
+    ([#39](https://github.com/syv-ai/HyperQwen/issues/39)). Measured
     here under a 10 GiB cgroup cap standing in for that box: the **stock
     loader's memory peak was the cap to the byte** (10,737,418,240) — it loads
     by consuming everything and betting reclaim keeps up, which a fast NVMe
@@ -711,8 +859,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     65536 ... 4.76 GiB KV cache is needed`). The `-fast` variant (int4 lm_head
     and MTP head, `prepare/fetch_fast_variant.py`) is the launcher default for
     exactly that reason; with it the same box came up at a 72k-token pool.
-
-46. **`vllm bench serve` defaults to `--seed 0`, and with prefix caching that
+42. **`vllm bench serve` defaults to `--seed 0`, and with prefix caching that
     poisons every A/B.** Same seed = same prompts call to call; later calls
     get partial prefix-cache hits whose size depends on the arm's pool
     geometry, so the contamination differs *between the configs you are
@@ -720,25 +867,27 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     (spec-off arm, big pool) next to a baseline reading 15-20% low. Every
     random-dataset call needs its own `--seed`; `bench/run_benchmarks.sh`
     does this now (`SEED_BASE` pins the sequence).
+43. **`--max-num-batched-tokens` above 2048 costs pool, and 8192 does not boot.**
+    Re-measured on vLLM 0.28.0, `SPEC=dflash2 CTX=fast`, pinned `KV_MEM`, three
+    cold boots on the reference 3090:
 
-47. **Changing `VLLM_MARLIN_INT8_INCLUDE_RE` can replay a stale AOT-compiled
-    graph.** The layer-select envs are in vLLM's compile hash, but
-    `torch_aot_compile` keeps its own cache; switching the include set can
-    crash at the first forward with a stable-ABI `aten::empty` RuntimeError
-    from a cached inductor artifact. Wipe `~/.cache/vllm/torch_compile_cache`
-    when switching layer sets. Separately, `INT8_LAYERS="mlp|linear_attn"`
-    (int8 GDN + fp16 attention) crashes even from a clean cache — an inductor
-    codegen bug with that mixed set on this torch pin; `mlp` and the full
-    default both compile fine.
+    | `--max-num-batched-tokens` | result | pool |
+    |---|---|---:|
+    | 2048 (default) | boots | 68,605 tokens, 1.05x |
+    | 4096 | **boots** | 66,945 tokens, 1.02x |
+    | 8192 | refuses | — |
 
-48. **`--max-num-batched-tokens` above 2048 does not boot in single-user
-    dflash2 mode.** 4096 and 8192 both inflate the profiled activation peak
-    past the transient floor next to the pinned `KV_MEM` pool: the engine
-    fails initialization (batch mode documented the softer version of this —
-    bigger chunks shrink the pool; with the pool pinned, the same memory
-    comes out of the floor instead).
-
-49. **Align-mode prefix caching periodically drops whole conversations to a
+    Two corrections to what this entry used to say. **4096 boots** — it costs
+    2.4% of the pool and takes the concurrency margin from 1.05x to 1.02x, which
+    is a trade rather than a wall. And the mechanism is not "inflates the
+    profiled activation peak": with `KV_MEM` pinned the engine skips memory
+    profiling entirely and says so in the log. What the bigger chunk grows is
+    the per-request KV requirement, so 8192 fails as a clean startup refusal —
+    `5.35 GiB KV cache is needed, which is larger than the available KV cache
+    memory (5.2 GiB) ... estimated maximum model length is 63168` — not as a
+    mid-init OOM. Batch mode documents the softer version of the same thing:
+    unpinned, bigger chunks shrink the pool instead of refusing.
+44. **Align-mode prefix caching periodically drops whole conversations to a
     0% hit — a geometry lottery plus an inverted eviction order on the one
     mamba state page that unlocks them.** A hybrid cache hit is the
     *intersection* of per-group hits, and the mamba group can only resume
@@ -770,9 +919,28 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     lands on the conversation's own attention tail instead, which breaks
     the same hit from the other side. If between-turn traffic exceeds the
     whole free pool, nothing survives by policy; that regime needs a
-    bigger `KV_MEM`, not a smarter queue.
-
-50. **First-request Triton compiles on a fresh boot came from four separate
+    bigger `KV_MEM`, not a smarter queue. A second align-mode cost, fixed
+    since #101 (`patches/mamba-align-retire-null-gaps.patch`, upstream
+    #55450): a long prefill leaves null gaps between the state snapshots
+    awaiting retirement, and the base block remover stopped at the first
+    gap, so every older state stayed allocated until the request ended. The
+    maintainer's per-request counter of live non-null state blocks (inside
+    `remove_skipped_blocks`, on the repo's reference 3090, #101 review) read
+    up to 16 before the patch and 5 with it on every request; on that box
+    peak pool usage during a fresh 20k-token prefill fell 40 percent on
+    `SPEC=mtp CTX=long` and 21 to 23 percent where a large cached prefix
+    dominated the pool. On a second native 3090 and a WSL2 box, with the
+    pool pinned identical across arms, the peak fell 30 to 50 percent across
+    14k to 56k-token prefills at 0.28 and 0.29 (the reduction grows with
+    depth and is smaller on 0.29, which leaks less before the fix). No gap
+    forms on `CTX=fast` with DFlash2, so the fix is inert there: on the
+    maintainer's production profile the sampled peak agreed to four decimals
+    across 20 requests with and without it (#101 review). The win is
+    mtp/long shaped. One note for anyone
+    editing that patch file: it carries blank context lines that are a single
+    space, and a trailing-whitespace trim turns it into a malformed patch that
+    `git apply --check` rejects.
+45. **First-request Triton compiles on a fresh boot came from four separate
     warmup gaps, and the last one is invisible without logging what Triton
     specialises on.** Issue #48's fingerprint — a stall in the first large
     chunked prefill after boot, preceded by `jit_monitor` warnings — had, on
@@ -805,9 +973,16 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     why it could name the kernel and not the cause. `KVARN_LOOKUP_BLOCKS`
     pins the lookup size if a deployment ever needs to.
 
-51. **`prompt_logprobs` is wrong on `CTX=huge` + `SPEC=mtp` + prefix caching, and
+    One scope note, because the zero was measured on one path: that boot was
+    `SPEC=dflash2 CTX=huge`. The int8 prefill path shipped since and brings its
+    own uncovered kernels — a current production boot (`CTX=fast`,
+    `INT8_ACT=int8 PREFILL_ATTN=int8`) still logs three `JIT compilation during
+    inference` lines, for `_k_stats_kernel`, `_k_quant_kernel` and
+    `_prefill_attn_kernel`. Same class of gap, different kernels, not yet
+    prewarmed.
+46. **`prompt_logprobs` is wrong on `CTX=huge` + `SPEC=mtp` + prefix caching, and
     the NaN 400s are only its visible half.** Reported as
-    [#64](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/64) from a WSL2
+    [#64](https://github.com/syv-ai/HyperQwen/issues/64) from a WSL2
     3090 — `bench/quality_battery.py --ppl-only` failing with
     `{"message":"Out of range float values are not JSON compliant: nan"}` on
     some documents, and perplexity drifting 3.7% between identical runs.
@@ -847,11 +1022,10 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     else using `prompt_logprobs` on KVarN with `PREFIX_CACHE=0`, or on a
     non-MTP speculator. Ordinary generation is not implicated — needle
     retrieval and decode rates are normal on the same server.
-
-52. **`DFLASH_TOKENS=15` asserted at engine start on the int4 path, because the
+47. **`DFLASH_TOKENS=15` asserted at engine start on the int4 path, because the
     drafter's promoted block only has to *cover* the primary page, not divide
     it.** Filed as
-    [#63](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/63), fixed in
+    [#63](https://github.com/syv-ai/HyperQwen/issues/63), fixed in
     `patches/hybrid-sw-block-promote.patch`. `alternative.sh`
     (`int4_per_token_head`) died in a bare `assert` in
     `kv_cache_coordinator.py` at `DFLASH_TOKENS=15` — at any `MAX_LEN`, with
@@ -882,3 +1056,268 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     block is not free on int4**: at 15 the pool is 53,908 tokens against
     142,843 at 7, and the 256k default no longer fits (`estimated maximum
     model length is 180320`, a clear `ValueError` rather than an assert).
+48. **A benchmark row without its compile-cache state is not reproducible, because the
+    autotuner's timing race picks the kernels and the kernels pick the trajectory.**
+    Filed as [#75](https://github.com/syv-ai/HyperQwen/issues/75). Six Triton
+    kernels in the chunked Gated DeltaNet path are autotuned at first use; vLLM caches the
+    winners, but a fresh container or `VLLM_DISABLE_COMPILE_CACHE=1` re-runs the race, and a
+    different winner is a different reduction order, a different last bit, and at greedy a
+    different token at the first near tie. Measured on one image with the cache wiped before
+    each boot: 8 boots, 8 distinct winner sets, 5 distinct trajectories, the same twelve-turn
+    tool conversation ranging from 58 to 189 tool calls. With the cache persisted, two boots
+    were identical to the call. So: mount a persistent cache into bench containers rather than
+    disabling it for hygiene, and copy the `*.autotune.json` records beside a published row so
+    a reader can tell whether two rows are even comparable. A quiet bare box re-times to the
+    same winners even with the cache deleted; container timing noise is what makes the draw
+    vary. The same cache state also moves the profiled peak activation and therefore the KV
+    pool, by 0.92 GiB on the reference 3090, which is a separate channel with a separate fix
+    (state it, or pin `--kv-cache-memory`).
+49. **A high acceptance rate can mean the drafter is good or the generation has collapsed,
+    and the counter cannot tell you which.** Degenerate text is trivially predictable. One
+    repetition loop during the [#73](https://github.com/syv-ai/HyperQwen/issues/73)
+    work scored 79.7% acceptance per drafted token against a normal 35 to 45%, with a
+    distinct-word ratio of 0.051 against 0.77 to 0.83, and it was echoing the instruction
+    appended to its own prompt. So acceptance is heavy-tailed, a t-test over a dozen short
+    generations is the wrong instrument, and an arm that happens to sample more collapsed
+    trajectories looks like an acceptance *improvement*. Guard on drafted tokens per round
+    above about 1.2 times the drafter width (calibrated on 96 rows: above the width flags 40%
+    of ordinary rows, above 1.2 times it flags only the real events), or on distinct-word
+    ratio when the text is available. The guard reads the engine's own repetition signal,
+    because adaptive verify length extends the block only while a request is reproducing its
+    context. Run the guard **before** any stratification on block size: a degenerate row sorts
+    into the long-block stratum by construction and one such row moved a stratum estimate by
+    two tokens per step.
+50. **Per-request acceptance figures depend on what ran before the request, and on some boxes the
+    request's whole trajectory does.** Two observations, two boxes. On a quiet native 3090, same
+    build, same seeds, one boot, only the request order changed: drafts and accepted tokens came back
+    identical on every seed and drafted tokens did not, so `1 + accepted / drafts` repeated exactly
+    while `accepted / drafted` had an order-dependent denominator. On an RTX 4090 under WSL2 with a
+    prompt that keeps the long block engaged, the same design changed drafts and accepted tokens too
+    on four of six seeds, one seed by a factor of two, so there tokens per step itself moved with
+    order. Two mechanisms, both real: the long block is sticky and coasts on prior state without
+    consulting the emitted count, so a request that follows a long-block request inherits some of its
+    block length; and a different block length is a different verify batch shape, which on a
+    numerically knife-edged model can flip a near-tie token even with the seed fixed. Prefix caching
+    was the obvious third candidate, since the requests share a prompt; with the engine started
+    `--no-enable-prefix-caching` and the log confirming it, the order effect was unchanged, so it
+    is not the driver. What follows is the same either way: hold the request
+    order fixed within a comparison, report tokens per step rather than acceptance per drafted token,
+    and treat per-request figures from a sequence as dependent samples, never as independent ones.
+51. **At `DFLASH_TOKENS=15` on ordinary text the engine drafts 7 and queries 8, so 15 and 7 are
+    the same experiment unless the text repeats.** With the lookup on, the drafter's block is
+    clamped to the checkpoint's trained block (7), `num_query_per_req` follows it (8), and
+    adaptive verify length asks for the long block only while a request is reproducing its
+    context (`dflash2/speculator.py`, on by default). Measured over sixty single-prompt rows
+    on the reference 3090: 55% at exactly 7.000 drafted tokens per round, and the lookup
+    supplying 4.3% of the eight positions it could fill. On an eight-prompt cohort at 1024
+    output tokens the long block engaged on 44% of rows and those rows ran markedly faster.
+    Consequences: matching results at both widths are weak evidence that an effect is not
+    lookup-specific; anything that acts only in the long block, including
+    `dflash2-z-adaptive-emitted.patch`, is invisible on a short single-prompt cell and only
+    shows on a cohort; and `VLLM_DFLASH2_LOOKUP_CHEAP_CTX` (default 0, so the branch is dead)
+    takes the long block unconditionally below a context threshold and would invalidate any
+    bisect run across it. The same split shows in any production log without
+    instrumentation: at width 15 the engine's own per-position acceptance line reads seven
+    positions in the 0.79-0.96 band and a flat eight-position tail near 0.15 (0.958, 0.921,
+    0.899, 0.862, 0.845, 0.820, 0.793, then 0.155 x 6, 0.153, 0.148 -- reference 3090 under
+    real traffic).
+52. **Two passes with a fixed seed are two replays, and a short single-prompt cell cannot see a
+    cohort-scale effect at any number of seeds.** The engine seeds from zero and the noise draw
+    is a function of seed and position, so repeat boots on a quiet box come back bit-identical
+    on every counter, and "reproducible to three significant figures from two passes" measures
+    a deterministic harness rather than bounding an effect. The 16% DFlash2 acceptance
+    regression in [#73](https://github.com/syv-ai/HyperQwen/issues/73) was invisible
+    on one README prompt at 256 output tokens with six seeds *and* with thirty (seed spread
+    ten points, sd about four), and reproduced immediately through `bench/prefill_ab.sh` on the
+    cohort at 1024. Prompt choice alone moved acceptance from 22.7% on the cohort to 36.8% on a
+    236-character prompt, larger than the regression. Three different questions were asked of
+    that short cell during the bisect and it was underpowered for all of them. Match the
+    workload to the claim, vary the seed per request, and read a bare number from a fixed-seed
+    pass as one draw.
+53. **On WSL2 the card's usable dedicated memory is about half a gigabyte
+    smaller than the same card on bare metal, the shipped `SPEC=dflash2` boot
+    sits about 50 MiB under that line, and anything larger runs slow instead
+    of failing.** Windows accounts each adapter's memory as *dedicated* (on
+    the card) and *shared* (host memory the driver backs GPU allocations
+    with). On two RTX 4090s under WSL2 the dedicated figure tops out at about
+    23,371 MiB of a 24,564 MiB card, where a bare-metal 3090 of the same size
+    reports 23.3 GiB free at boot (the engine's log figure), about 490 MiB more. The default `SPEC=dflash2 CTX=fast` boot
+    lands about 50 MiB under the ceiling. Anything that adds to the working
+    set crosses it, and crossing it does not fail: the remainder lands in
+    host shared memory and the step runs two to six times slower, with
+    nothing in vLLM's log to show it. Four separately discovered "4090 costs"
+    were this one thing, each measured over the line and then with room:
+
+    | working set | over the line | with room |
+    |---|---|---|
+    | `DFLASH_TOKENS=15` (about 420 MiB over) | 56.5 ms/step | 23.4 |
+    | verify-kernel query maximum 16 at width 7 | 63.5 | 23.2 |
+    | a boot that recompiles the drafter's graph while loading the backbone's (about 300 MiB more) | 45.0 | 23.2 |
+    | a 4 GiB bf16 drafter at the shipped pin (1.8 GB in host memory) | 150 to 264 | 39 |
+
+    Three things to know and one to do:
+
+    - **Read the counters, not the log.** `nvidia-smi` shows the card full
+      either way. The Windows performance counters
+      `\GPU Adapter Memory(*)\Dedicated Usage` and `\Shared Usage`
+      (PowerShell `Get-Counter`, sampled every 10 s) show the split: shared
+      usage at its idle baseline (about 86 MiB here) through a run means the
+      working set is on the card; anything above it means part of it is not.
+      Gotcha 35's `nvidia-smi dmon` power-and-SM signature is the same state
+      seen from the other side.
+    - **Acceptance is untouched; only step costs lie.** The spill moves memory,
+      not arithmetic. Accepted-tokens-per-step columns from a spilled run
+      stand; its tok/s does not.
+    - **Boot class and memory state have to be matched before two hosts are
+      compared.** With both matched, a 4090 under WSL2 and a bare-metal 3090
+      agree on a drafter to a few percent; every cross-host "penalty" in the
+      #25 thread that did not survive came from one of the two being
+      unmatched.
+    - **Give it room.** `KV_MEM=3000000000 DFLASH_MAX_LEN=8192` runs every
+      configuration in the table at its bare-metal speed and costs the shipped
+      head nothing at width 7 (23.3 against 23.2 ms/step, 3.77 against 3.80
+      tokens/step). `SPEC_ATTN=0` frees about a gigabyte of graph capture
+      (1.32 against 0.33 GiB, the same on a 3090), which on this host is the
+      difference between fitting and not; on bare metal the room absorbs it.
+    - **Pin cards with `CUDA_VISIBLE_DEVICES`, not `--gpus device=N`.** On this
+      Docker Desktop host the device request is recorded (`docker inspect`
+      shows `"DeviceIDs":["1"]`) and not enforced: a container started with
+      `--gpus '"device=1"'` enumerated both cards and its CUDA device 0 was
+      host GPU 0. `-e NVIDIA_VISIBLE_DEVICES=<uuid> -e CUDA_VISIBLE_DEVICES=<uuid>`
+      pinned it, verified in-process before any GPU work. Everything above was
+      run with the variable set, and the adapter counters put each run on the
+      card it named.
+
+    Measured in the
+    [#25](https://github.com/syv-ai/HyperQwen/issues/25) comments of
+    2026-09-05 (items 13 and 14, and the corrections to items 9 and 11).
+
+54. **`verify.sh` reported two patches as not applied on a correctly patched
+    tree, because a `find -name '*.orig' -delete` cleanup removed files the
+    verifier was requiring.** `dflash2-lookup-drafting.patch` and
+    `dflash2-prewarm.patch` carried file-creation hunks for three `.orig`
+    backups of vLLM source (3,685 lines of copied upstream that were nobody's
+    patch). `patches/_check_applied.py` builds its file list from every `+++`
+    line in a patch, so those backup paths became files that had to exist in
+    the installed tree. Delete the junk and the verifier calls the patch
+    missing:
+
+    ```
+    dflash2-lookup-drafting: applied(0)      # patched tree, .orig present
+    --- find -name '*.orig' -delete ---
+    dflash2-lookup-drafting: NOT applied(1)  # same tree, unchanged code
+    ```
+
+    It cost a cross-card comparison in
+    [#89](https://github.com/syv-ai/HyperQwen/pull/89), where a real
+    paired result on the native 3090 was discounted as "not like-for-like"
+    on the strength of that false negative. Fixed in
+    [#92](https://github.com/syv-ai/HyperQwen/pull/92): the hunks are
+    gone, the installed tree no longer collects them, and a box that ran the
+    cleanup verifies green. The general rule is that a patch which creates a
+    file makes that file part of what verification demands, so a patch should
+    only create files it means to own.
+
+55. **A streaming response sends nothing during prefill, and a proxy in front
+    of the server closes the connection before the first token.** vLLM's SSE
+    stream is silent from the moment the request is accepted until the first
+    output token, so a long prefill looks like a dead socket to anything with
+    an idle read timeout — Bifrost's default is 120 s, and a cold 90K-token
+    prompt on this card prefills for ~105 s. The client sees a dropped
+    connection, not an error. `patches/sse-keep-alive.patch` (upstream vLLM
+    [#51034](https://github.com/vllm-project/vllm/pull/51034), backported to
+    0.28.0) adds `--sse-keep-alive-interval`, which emits a `: keep-alive`
+    comment line while the stream is idle; comment lines are part of SSE and
+    every conforming client ignores them.
+
+    `single-user/start_qwen.sh` sets it from `SSE_KEEP_ALIVE`, default 30 s —
+    **so every stream now carries a comment line every 30 seconds by default.**
+    That is deliberate (4x margin against a 120 s timeout) but it is not
+    nothing if you log raw SSE frames: measured on the reference 3090, an
+    18.2 s request emitted 18 comment lines at an interval of 1, and would
+    emit none at all at 30.
+    Set `SSE_KEEP_ALIVE=0` to turn the emission off, or `SSE_KEEP_ALIVE=`
+    (empty) to drop the flag entirely — which is also what you need if the
+    launcher is pointed at a vLLM tree that has not had the series applied,
+    since the flag only exists because the patch is in it.
+
+56. **Registering an env var in vLLM's `envs.py` puts it in the torch.compile
+    cache key, so `VLLM_INT4_MQ_3D_DEBUG=1` now recompiles from cold.**
+    `patches/int4-mq3d-envs.patch`
+    ([#93](https://github.com/syv-ai/HyperQwen/pull/93)) registers
+    `VLLM_INT4_MQ_3D` and `VLLM_INT4_MQ_3D_DEBUG`. That is not cosmetic:
+    `vllm/envs.py:compile_factors()` starts from every known vLLM env var,
+    drops only the names in its `ignored_factors` set, and hashes the rest;
+    `vllm/compilation/backends.py:1031-1066` folds that hash into the compile
+    cache directory key. Neither new knob is in `ignored_factors`, so each
+    value now selects its own compile cache.
+
+    Two consequences. The good one: an A/B of `INT4_MQ_3D=0` against `=1` on a
+    warm cache is no longer a stale-graph trap, and the per-arm
+    `rm -rf ~/.cache/vllm/torch_compile_cache` that the #93 review had to do by
+    hand is no longer required. The one to watch: a boot with
+    `VLLM_INT4_MQ_3D_DEBUG=1` has a different cache key from production, so it
+    compiles cold and must never be timed against a warm production boot.
+    "Never time an instrumented boot" arrives here by a new route: the
+    instrumentation does not have to be in the hot path to cost you the
+    startup, it only has to be registered.
+
+57. **The fp8 split-KV verify route is sm89 and up, and `INT8_ACT=int8` does not
+    stack on it.** `patches/triton-spec-attn-fp8-kv.patch` lets the split-KV
+    verify kernel read vLLM's per-tensor fp8 cache, so `--kv-cache-dtype fp8`
+    can run with `TRITON_ATTN` on both the target and the drafter and keep FULL
+    CUDA graphs (the launch line, verbatim, is in `docs/long-context.md`; the
+    `"attention_backend":"TRITON_ATTN"` inside the speculative config is the
+    part that is easy to drop, and dropping it silently costs the FULL graphs).
+    Two limits. Triton has no fp8e4nv conversion on sm86, so on a 3090 the
+    route does not exist: the compiler refuses the kernel outright (gotcha 40
+    has the backend map), and `bench/test_spec_decode_fp8.py` skips there by
+    design rather than dying. And `INT8_ACT=int8` on the fp8 route is slow with
+    or without this patch (a Marlin variant choice, tracked separately), so do
+    not stack the two until the memory-pressure question behind it is
+    understood; the measured rows in `docs/long-context.md` are fp8 KV with
+    bf16 activations.
+
+58. **`reasoning_effort: "minimal"` from an OpenAI-protocol client 400s every
+    request that carries it.** The shipped `chat_template.jinja` accepts only
+    xhigh/medium/low and defaults to xhigh, while gpt-5-era clients speak the
+    OpenAI vocabulary (none/minimal/low/medium/high/xhigh/max). vLLM's
+    `ChatCompletionRequest.reasoning_effort` accepts all seven and passes the
+    value verbatim into `apply_chat_template` (`vllm/renderers/hf.py`
+    `safe_apply_chat_template`), so `minimal` reaches the template's
+    `raise_exception` and comes back as a 400 Bad Request. Headroom passes it
+    through untouched — its effort router only rewrites Responses-API turns and
+    deliberately does not run on chat/completions (`shape_openai_chat_request`,
+    headroom `proxy/output_shaper.py`). First seen 2026-09-15: one 400 among
+    eleven requests, session otherwise healthy.
+    Fix: `prepare/translate_chat_template.py` rewrites the effort block in
+    place — it maps only the names the template does not know (minimal→low,
+    high/max→xhigh) and lets every other value fall through unchanged, so the
+    template's own levels keep their behaviour and an omitted effort keeps the
+    template default (`xhigh`): no measured baseline moves. The raise is
+    dropped, so an unknown value no longer 400s — it ends up with no reasoning
+    instruction, the same outcome as `medium`. Idempotent (v2 marker, with a
+    v1→v2 upgrade so a dir translated by the first cut does not keep its
+    `medium` default) and self-healing: `docker/prepare.sh` re-runs it on every
+    boot (`TRANSLATE_EFFORT=0` skips the step), including on the model actually
+    served (`MODEL`), so a re-download that clobbers the template is
+    re-translated. A template whose effort block matches no known shape warns
+    and is left alone — this runs under `set -e` after the download, so it must
+    not fail a ready model dir. A running server loads the template at startup
+    — restart to pick up a translation.
+59. **Two prepares at once leave a model dir half-written.** Every step of
+    `docker/prepare.sh` is idempotent, but the script is not concurrency-safe:
+    two runs against one model dir can interleave a shard rewrite with an index
+    write, and the damage surfaces much later — a shard missing from
+    `model.safetensors.index.json`, a config that disagrees with the tensors on
+    disk, or a half-fetched fast variant that `verify.sh` then reports far from
+    its cause. It happens without anyone typing two commands: the entrypoint
+    runs `prepare` before every start, so a booting container races
+    `docker compose run --rm prepare`, and two servers starting together after a
+    crash race each other. Fix: the script takes an exclusive `flock` on
+    `<models dir>/.prepare.lock` — beside the model dir rather than inside it,
+    so `BASE_MODEL_DIR` cannot move it out of the volume — and waits up to
+    `PREPARE_LOCK_WAIT` seconds (default 600) for a holder before refusing to
+    run. The lock is advisory and is released when the holder exits, so a
+    leftover `.prepare.lock` file is inert: it is a lock, not a marker, and
+    nothing has to clean it up.

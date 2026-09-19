@@ -1,6 +1,6 @@
 # What this repo does that stock vLLM doesn't
 
-Nine things stock vLLM doesn't give you on this model — summarised, then explained — plus the two speculative-decoding modes. For what each one is worth in tokens per second, see [what each step buys](../README.md#what-each-step-buys).
+Nine things stock vLLM doesn't give you on this model — summarised, then explained — plus the two speculative-decoding modes. For what each one is worth in tokens per second, see [what each step buys](#what-each-step-buys).
 
 [← back to the main README](../README.md)
 
@@ -142,7 +142,7 @@ head_dim 256 has no faster sm86 alternative (FlashInfer measured within 1.5%,
 and it costs the split-KV verify path at decode).
 
 **int8-QK prefill attention** (`PREFILL_ATTN=int8`,
-`patches/triton-prefill-attn-int8.patch`) attacks what is left after the GEMMs: the
+`patches/prefill-attn-int8.patch`) attacks what is left after the GEMMs: the
 16 full-attention layers, whose head_dim of 256 pins FA2 at 54-57 TFLOPS on
 sm86 (85% of the card's practical fp16 mma rate — no fp16 rewrite can win).
 A Triton kernel runs QK^T on int8 tensor cores at 2x the fp16 rate,
@@ -159,7 +159,7 @@ two interleaved arms per condition, each reproducing to 0.1%): 1,167 / 1,126 /
 1,012 tok/s at 4k / 16k / 51k against 1,164 / 1,114 / 980 stock — +0.3%,
 +1.1%, +3.3%, the gain growing with context exactly as the attention share
 does. A WSL2 3090 measured the same standalone cell 1-6% negative
-([#62](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/62)), so treat
+([#62](https://github.com/syv-ai/HyperQwen/issues/62)), so treat
 `PREFILL_ATTN` alone as noise-to-slightly-positive and pair it with
 `INT8_ACT`, where the same kernel is worth +1.8% at 16k and +4.5% at 51k on
 top (1,826 / 1,491 against 1,793 / 1,427).
@@ -357,3 +357,54 @@ DFlash2's own is running out of state pages at five residents where MTP holds ei
 and reaches 383 tok/s aggregate at C8. For **one person** with normal context — what single-user mode is
 for — it is the fastest config in this repo. Full table in
 [single-user/README.md](../single-user/README.md).
+
+## What each step buys
+
+Measured cumulatively on the 3090, 64 concurrent, 128 in / 512 out, `vllm bench
+serve` random dataset:
+
+| step | what it does | e2e output tok/s | steady-state decode |
+|---|---|---|---|
+| W4A16 AutoRound body (as published) + fp8 KV | int4 Marlin kernels, 66.7k-token pool | 370 (48 conc, 256/256) | — |
+| + lm_head / embed_tokens int8 | 2.6 GB of cache pages back | 516 | ~585 (37 requests resident) |
+| + fp16 recurrent state | 64 requests resident, half the state traffic | 707 | ~830 |
+| + int8 activations, MLP (default) | int8 tensor cores on 74% of the FLOPs | 942 | ~1,094 |
+| + int8 activations, everything (`INT8_LAYERS=.`, needs `GPU_UTIL=0.95`) | | 1,042 | ~1,222 |
+
+And single-stream on realistic prompts (single-user mode, T = model default /
+greedy):
+
+| step | tok/s | tokens per step | draft acceptance, position 0 |
+|---|---|---|---|
+| no speculation | 46 / 46 | 1.0 | — |
+| MTP-2 as shipped (bf16 drafter, full head, fp32 state) | 66 / 79 | 2.1 / 2.4 | 65% / 80% |
+| MTP-4, int8 drafter, 40k draft head, fp16 state | 78 / 99 | 2.2 / 2.7 | 58% / 70% |
+| + probabilistic draft sampling (`CTX=fast`, k=4) | 90 / 98 | 2.6 / 2.7 | 69% / 70% |
+| same with 3 drafts on FlashInfer/fp8 KV (`CTX=long`, 150k) | 84 / 89 | 2.5 / 2.4 | 69% / 71% |
+| + sampler patch, split-KV verify attention | 93 / 99 | 2.6 / 2.6 | 69% / 70% |
+| + draft vocab counted over the model's own outputs | 107 / 109 | 2.9 / 2.9 | 74% / 74% |
+| + GPTQ-int4 lm_head (calibrated) | 109 / 112 | 2.8 / 2.8 | 73% / 73% |
+| + GPTQ-int4 MTP module (**fast variant, shipped**) | **~114 / 118-124** | 2.8 / 2.9-3.0 | 74% / 77% |
+| DFlash2 block drafter instead of MTP (`SPEC=dflash2`, int4-requantized) | **118 / 126** | 3.14 / 3.34 | ~75% / ~78% |
+| + drafting from the context (`LOOKUP=1`, on by default) | **130** at C1, up to **259** where the model reproduces its context | 3.3-7.8 | |
+| + a 16-token verify block the context fills (`DFLASH_TOKENS=15`) | **133** at C1, up to **381** reproducing context | 3.4-15.0 | |
+
+(Steps 4-6 are the same 8-prompt protocol; greedy is deterministic for a
+given server and request order but differs between configs and even with
+prefix-cache hits, so single runs carry ±3-5% on tokens/step —
+`bench/run_benchmarks.sh single` reproduces 111.1 / 120.0 tok/s decode at C1,
+the best repeats read 119 / 124.)
+Going deeper (k=5) loses again: 106 / 105. k=4 is the knee, but on vLLM
+0.28.0's FlashInfer backend (needed for fp8 KV, i.e. for 150k context) four
+drafts crash the engine with an illegal memory access as soon as one request
+finishes while another is mid-generation — club-3090 reports the same "n=4
+eventually dies, n=3 stable" pattern — so `CTX=long` drafts 3 and gives up
+~7%; `CTX=fast` (FlashAttention, bf16 KV, ~64k context, the default) keeps k=4
+and is also the only backend the split-KV attention patch applies to.
+
+Two things that did *not* help, measured rather than assumed: fine-tuning the
+MTP head on the model's own outputs (KL halves, greedy top-1 on response
+tokens unchanged; `drafter/README.md`), and retuning Marlin's tile
+configuration for M ≤ 16 on sm86 (3-7% per GEMM in isolation,
+nothing measurable end to end — the remaining gap to peak bandwidth is the
+memory system's ramp on 16-92 MB reads, not the kernel).

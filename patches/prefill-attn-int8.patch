@@ -35,17 +35,101 @@ else falls through to FA2. Decode and the split-KV verify path are untouched.
 
 Apply from the installed vllm package directory, AFTER spec-decode-attn.patch:
 its flash_attn.py hunk inserts immediately before that patch's split-KV block
-and carries that block's first lines as context, so the file name sorts after
-spec-decode-*.patch on purpose -- the Docker gate and verify.sh apply
-patches/*.patch alphabetically (this is why it was named triton-... and not
-prefill-...: CI was red for four commits with 'Hunk #1 FAILED at 1038').
-  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/triton-prefill-attn-int8.patch
+and carries that block's first lines as context. The apply order is
+patches/series (a 453104e rename to triton-... once encoded this dependency in
+the sort order; the series file replaced it and the name came back).
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/prefill-attn-int8.patch
 
 Written against vLLM 0.27.1.
 
+Env knobs this patch reads go through vllm.envs and are registered there (2026-09-15, the 0.28 hygiene pass; the
+registry mirrors the raw defaults, and registration puts them in the torch.compile cache key): VLLM_PREFILL_ATTN
+
+--- exported from cpuchip/vllm 0f0373568 (prefill-attn-int8); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index c5cef9161..2e269abd2 100755
+--- a/envs.py
++++ b/envs.py
+@@ -206,6 +206,8 @@
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
++    # syv patch (prefill-attn-int8): "int8" / "fp16" selects the Triton prefill kernel on the hybrid model
++    VLLM_PREFILL_ATTN: str = ""
+     # syv patch (marlin-repack-staged-sm80): "1"/"0" override of the staging buffer, unset = on for sm80 only
+     VLLM_MARLIN_REPACK_STAGED: str | None = None
+     # syv patch (hybrid-kv-groups-v2-cudagraph): MiB reserved for V2 CUDA graphs before the KV cache is sized
+@@ -1583,6 +1585,8 @@
+     "VLLM_MARLIN_INT8_EXCLUDE_RE": lambda: os.environ.get(
+         "VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp"
+     ),
++    # syv patch (prefill-attn-int8)
++    "VLLM_PREFILL_ATTN": lambda: os.environ.get("VLLM_PREFILL_ATTN", ""),
+     # syv patch (marlin-repack-staged-sm80)
+     "VLLM_MARLIN_REPACK_STAGED": lambda: os.environ.get("VLLM_MARLIN_REPACK_STAGED"),
+     # syv patch (hybrid-kv-groups-v2-cudagraph)
+diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
+index 680d44068..791f7af75 100755
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -1118,6 +1118,50 @@
+                     )
+                     causal = not has_window
+ 
++                # syv patch: int8-QK Triton prefill attention for head_dim 256
++                # (SageAttention-style; ~1.3-1.35x FA2 at 16-51k context on
++                # sm86). Single-request prefill chunks only — anything else
++                # falls back to FA2 below. K is mean-smoothed per head, which
++                # shifts every logit in a row equally, so the softmax — and
++                # the output — is exact up to int8 rounding of Q rows and
++                # 64-key K tiles (measured cos > 0.99999 against fp32).
++                if (
++                    envs.VLLM_PREFILL_ATTN in ("int8", "fp16")
++                    and max_seqlen_q > 16
++                    and cu_seqlens_q.shape[0] == 2
++                    and self.num_heads == 24 and self.num_kv_heads == 4
++                    and self.head_size == 256
++                    and not is_quantized_kv_cache(self.kv_cache_dtype)
++                    and (
++                        sliding_window_size is None
++                        or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
++                    )
++                    and not self.logits_soft_cap
++                    and self.alibi_slopes is None
++                    and self.sinks is None
++                    and causal is True
++                    and mm_mask_mod is None
++                    and rswa_mask_mod_fn is None
++                ):
++                    from vllm.v1.attention.backends.prefill_attn_hd256 import (
++                        prefill_attn as _prefill_attn_hd256,
++                    )
++                    _kv_len = int(seqused_k[0].item())
++                    _q_len = int(num_actual_tokens)
++                    _prefill_attn_hd256(
++                        query[:num_actual_tokens],
++                        key_cache,
++                        value_cache,
++                        output[:num_actual_tokens],
++                        block_table[0],
++                        _kv_len,
++                        _kv_len - _q_len,
++                        self.scale,
++                        int8_qk=envs.VLLM_PREFILL_ATTN == "int8",
++                        block_t=128, block_n=64, num_warps=8, num_stages=3,
++                    )
++                    return output
++
+                 # syv patch: split-KV Triton attention for speculative-decode
+                 # batches (1 < queries/request <= 10). FA2 does not split the KV
+                 # sequence when max_seqlen_q > 1, leaving most SMs idle.
+diff --git a/v1/attention/backends/prefill_attn_hd256.py b/v1/attention/backends/prefill_attn_hd256.py
+new file mode 100644
+index 000000000..afc8ea9c6
 --- /dev/null
 +++ b/v1/attention/backends/prefill_attn_hd256.py
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,242 @@
 +"""Prefill attention for head_dim 256 on sm86: GQA-packed, paged-KV, causal,
 +with an int8-QK^T mode (SageAttention-style) that runs the score GEMM on int8
 +tensor cores at 2x the fp16 rate.
@@ -86,6 +170,7 @@ Written against vLLM 0.27.1.
 +        pos = start + tl.arange(0, CHUNK)
 +        ok = pos < kv_len
 +        blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=ok, other=0)
++        blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +        slot = pos % BLOCK_SIZE
 +        ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks \
 +            + kvh * stride_kh + d[None, :]
@@ -111,6 +196,7 @@ Written against vLLM 0.27.1.
 +    ok = pos < kv_len
 +    d = tl.arange(0, D)
 +    blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=ok, other=0)
++    blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +    slot = pos % BLOCK_SIZE
 +    ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks \
 +        + kvh * stride_kh + d[None, :]
@@ -178,6 +264,7 @@ Written against vLLM 0.27.1.
 +        pos = start + tl.arange(0, BLOCK_N)
 +        k_ok = pos < kv_len
 +        blk = tl.load(bt_ptr + pos // BLOCK_SIZE, mask=k_ok, other=0)
++        blk = blk.to(tl.int64)  # the stride multiply below overflows int32 past block id 2,383 (#86)
 +        slot = pos % BLOCK_SIZE
 +
 +        if INT8_QK:
@@ -285,57 +372,3 @@ Written against vLLM 0.27.1.
 +        num_warps=num_warps, num_stages=num_stages,
 +    )
 +    return out
---- a/v1/attention/backends/flash_attn.py
-+++ b/v1/attention/backends/flash_attn.py
-@@ -1038,6 +1038,51 @@
-                     )
-                     causal = not has_window
- 
-+                # syv patch: int8-QK Triton prefill attention for head_dim 256
-+                # (SageAttention-style; ~1.3-1.35x FA2 at 16-51k context on
-+                # sm86). Single-request prefill chunks only — anything else
-+                # falls back to FA2 below. K is mean-smoothed per head, which
-+                # shifts every logit in a row equally, so the softmax — and
-+                # the output — is exact up to int8 rounding of Q rows and
-+                # 64-key K tiles (measured cos > 0.99999 against fp32).
-+                import os as _os
-+                if (
-+                    _os.environ.get("VLLM_PREFILL_ATTN", "") in ("int8", "fp16")
-+                    and max_seqlen_q > 16
-+                    and cu_seqlens_q.shape[0] == 2
-+                    and self.num_heads == 24 and self.num_kv_heads == 4
-+                    and self.head_size == 256
-+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
-+                    and (
-+                        sliding_window_size is None
-+                        or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
-+                    )
-+                    and not self.logits_soft_cap
-+                    and self.alibi_slopes is None
-+                    and self.sinks is None
-+                    and causal is True
-+                    and mm_mask_mod is None
-+                    and rswa_mask_mod_fn is None
-+                ):
-+                    from vllm.v1.attention.backends.prefill_attn_hd256 import (
-+                        prefill_attn as _prefill_attn_hd256,
-+                    )
-+                    _kv_len = int(seqused_k[0].item())
-+                    _q_len = int(num_actual_tokens)
-+                    _prefill_attn_hd256(
-+                        query[:num_actual_tokens],
-+                        key_cache,
-+                        value_cache,
-+                        output[:num_actual_tokens],
-+                        block_table[0],
-+                        _kv_len,
-+                        _kv_len - _q_len,
-+                        self.scale,
-+                        int8_qk=_os.environ.get("VLLM_PREFILL_ATTN") == "int8",
-+                        block_t=128, block_n=64, num_warps=8, num_stages=3,
-+                    )
-+                    return output
-+
-                 # syv patch: split-KV Triton attention for speculative-decode
-                 # batches (1 < queries/request <= 10). FA2 does not split the KV
-                 # sequence when max_seqlen_q > 1, leaving most SMs idle.

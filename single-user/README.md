@@ -18,6 +18,10 @@ Realistic chat prompts (8 mixed English/Danish/code tasks in
 > These are vLLM 0.27.1 baseline measurements. Re-benchmark on a GPU after the
 > v0.28.0 upgrade before using the figures for capacity planning.
 
+Quote these against that harness. A client with a different output length is not
+measuring the same thing, and mixing the two is how
+[#3](https://github.com/syv-ai/HyperQwen/issues/3) got confusing.
+
 **`CTX=fast` + fast variant (the default; 64k context)**, as reproduced by
 `bash bench/run_benchmarks.sh single`:
 
@@ -124,8 +128,10 @@ happens when the streams are big. Where it is *not* the better choice:
   5 sliding-window layers from padding the target's attention/GDN layers (105 →
   78 KB of pool per token; without it this mode caps out at ~40k), and the V2
   runner's profiled activation peak swings ~1 GiB between starts, which makes a
-  utilization-based setting non-deterministic. `CTX=huge` stays MTP (the script falls back
-  with a message). `CTX=long` doubles the context — 138,696 tokens at `DFLASH_TOKENS=7`,
+  utilization-based setting non-deterministic. `CTX=huge` combines with this drafter —
+  268k tokens of pool at 245760 max-model-len over the KVarN cache
+  ([docs/long-context.md](../docs/long-context.md#dflash2-at-240k-ctxhuge-kvarn-also-combines-with-specdflash2));
+  any other `CTX` falls back to MTP with a message. `CTX=long` doubles the context — 138,696 tokens at `DFLASH_TOKENS=7`,
   114,224 at 15 — by moving to an `int8_per_token_head` cache on the Triton backend; it is
   worth it only for context reproduction, and `SPEC=mtp CTX=long` beats it about 2:1 on
   everything else. See [docs/long-context.md](../docs/long-context.md#dflash2-past-64k-specdflash2-ctxlong).
@@ -237,9 +243,8 @@ step and costs 5%. And decode CUDA graphs are captured for
 the common case — fell back to piecewise and paid 8% (27.9 ms against 25.9 ms for the same
 8-token step on a 7-slot server).
 
-Reproduction mode also costs KV pool per request slot rather than per token
-(`--mamba-cache-mode align` reserves state pages per slot per speculative block), so it runs
-4 slots and 56k of context instead of 8 and 64k.
+Reproduction mode runs 4 slots and 56k of context instead of 8 and 64k
+([why](../docs/optimizations.md#drafting-from-the-context-lookup1)).
 
 Quality is unchanged: GSM8K 96.5% (200 questions, greedy) with the lookup on, the same as
 without it, and 96.0% with the hold — one question, which is what a 200-question sample
@@ -257,7 +262,7 @@ The same server measured on random tokens (256 in, 1,024 out) reads anywhere fro
 tables above use real prompts. For comparison against another engine on this card,
 [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) publishes 71.00 tok/s decode
 at C1 on its own protocol (short real prompts, thinking on); the caveats are in the
-[main README](../README.md#vs-ninfer-3090).
+[main README](../docs/benchmarks.md#vs-ninfer-3090).
 
 ### How the draft got cheap
 
@@ -331,7 +336,7 @@ DeltaNet layers can't verify a tree.
 
 ## Setup
 
-Do the [common setup](../README.md#setup) first (venv, model download,
+Do the [common setup](../docs/install.md) first (venv, model download,
 requantization, draft head, the fast variant via `prepare/fetch_fast_variant.py`, vLLM
 patches; `bash verify.sh --no-server` checks all of it). Then:
 
@@ -373,6 +378,33 @@ systemctl --user enable --now qwen-serving
 loginctl enable-linger $USER
 ```
 
+### Post-boot serving warmup (optional, off by default)
+
+`/health` can return 200 before the serving path has been exercised: the first
+real request still pays the first-batch transient allocation (gotcha 35) and
+may compile Triton variants the boot-time profile misses (gotcha 45's scope
+note — `_k_stats_kernel`, `_k_quant_kernel`, `_prefill_attn_kernel` still JIT
+in-request on the current production profile). `single-user/qwen-server.sh`
+wraps the launcher: it waits for `/health`, runs `bench/warmup.sh` (a small
+decode pass, then a concurrent one), and only then considers the server ready
+for traffic. It complements the kernel prewarm in #48, it does not replace it:
+
+```bash
+WARMUP=1 bash single-user/qwen-server.sh   # wait /health, warm, then serve
+bash single-user/qwen-server.sh            # default: plain boot, no warmup
+```
+
+The warmup pass costs 21-25 s on the reference 3090 (production profile, warm
+torch.compile cache; boot-to-health is 36-50 s on top of that). It is
+advisory: a health timeout or a failed warmup is logged and the wrapper serves
+anyway, so a drifted deploy tree cannot turn a healthy engine into a restart
+loop. `WARMUP_ATTEMPTS` / `WARMUP_INTERVAL` tune the health-wait window
+(120 × 5 s by default); a boot that never completes is bounded by systemd's
+`TimeoutStartSec`, not by this script.
+
+To enable it in the unit, set `ExecStart` to `qwen-server.sh` and add
+`Environment=WARMUP=1`.
+
 Point your chat client at `http://<host>:18020/v1` with the key from
 `api_key.txt`. Works with anything that speaks the OpenAI API, tool calling
 included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
@@ -396,7 +428,9 @@ included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
 | `VISION` | 0 | 1 keeps the vision tower instead of `--language-model-only` (0.858 GiB of BF16 weights on this checkpoint), for a client that sends images: one image per prompt and a 2048-image-token pixel cap, both overridable from `EXTRA_ARGS` |
 | `VISION_OFFLOAD` | 1 | with `VISION=1`, keeps the tower's weights in pinned host RAM and copies each module to the GPU for its own forward (`patches/vision-tower-cpu-offload.patch`). **On 24 GB, `SPEC=dflash2` + `VISION=1` does not boot with this off** — the tower is 0.85 GiB of the ~1.1 GiB transient margin, and graph capture OOMs allocating the 960 MiB split-KV verify buffer with 787 MiB free. With it on, the same config comes up at the full 69,758-token pool and reads images. Costs 296 → 333 ms of encode per 8192-patch image, output bit-exact. 0 only on a card with headroom to spare. `VLLM_VISION_CPU_OFFLOAD_GB` (default 1) is the budget in GiB |
-| `REQ_METRICS` | 0 | 1 = `--enable-per-request-metrics --enable-force-include-usage`: per-request timing fields in every response and `usage` on every request, the fields llama-swap's dashboard reads ([#51](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/51)). `prompt_tokens_details.cached_tokens` is always on. Not compatible with `--disable-log-stats` in `EXTRA_ARGS`; vLLM's per-request spec-decode summary flag is nightly-only, not in 0.27.1 |
+| `REQ_METRICS` | 0 | 1 = `--enable-per-request-metrics --enable-force-include-usage`: per-request timing fields in every response and `usage` on every request, the fields llama-swap's dashboard reads ([#51](https://github.com/syv-ai/HyperQwen/issues/51)). `prompt_tokens_details.cached_tokens` is always on. Not compatible with `--disable-log-stats` in `EXTRA_ARGS`; vLLM's per-request *spec-decode* summary flag is nightly-only, not in 0.27.1 |
+| `WARMUP` | 0 | `qwen-server.sh` only: 1 = wait for `/health`, then run `bench/warmup.sh` (21-25 s) before serving (see "Post-boot serving warmup"). Advisory — a failed warmup logs and serves anyway. Not read by `start_qwen.sh` itself |
+| `SSE_KEEP_ALIVE` | 30 | seconds between SSE `: keep-alive` comment lines on a streaming response, so an idle stream survives a proxy read timeout during a long prefill (Bifrost's default is 120 s; a 90K cold prefill takes ~105 s and sends nothing until it finishes). `0` passes the interval vLLM reads as off; empty drops the flag entirely, which is what a vLLM tree without `patches/sse-keep-alive.patch` needs |
 | `PORT` | 18020 | |
 
 ## Switching modes
@@ -409,3 +443,76 @@ cp batch/qwen-serving.service ~/.config/systemd/user/   # or single-user/
 systemctl --user daemon-reload
 systemctl --user start qwen-serving
 ```
+
+## If you are the only user, do this
+
+The command above starts the conservative default — MTP speculation, 8 request
+slots, 64k context, 120 tok/s greedy at C1. Two settings are worth more than
+every other knob in this repo put together, and a third is worth a great deal on
+one particular workload:
+
+```bash
+printf 'SPEC=dflash2\nPREFIX_CACHE=1\n' >> .env
+# add DFLASH_TOKENS=15 if your answers quote your prompts — see below
+docker compose --profile single up -d
+```
+
+or, in the venv install:
+
+```bash
+venv/bin/python prepare/fetch_dflash2.py   # once, 1.2 GB (Docker's prepare step does it for you)
+SPEC=dflash2 PREFIX_CACHE=1 bash single-user/start_qwen.sh
+```
+
+`SPEC=dflash2` swaps Qwen's MTP head for the DFlash2 block drafter: 7 tokens
+proposed in one pass instead of 4 chained ones. `DFLASH_TOKENS=15` then lets the
+target verify 16 tokens per step — the drafter still proposes the 7 it was
+trained for, and the remaining positions are filled from the request's own
+context, which costs nothing to draft and is exactly right whenever the answer
+quotes the prompt. `PREFIX_CACHE=1` keeps the document you already sent, both
+its attention KV and its recurrent state. One request at a time, greedy, RTX
+3090 at 250 W:
+
+| decode | MTP (default) | `SPEC=dflash2` | `+ DFLASH_TOKENS=15` |
+|---|---|---|---|
+| 8 real chat prompts | 118 tok/s | 132 | **133** |
+| reproducing a 25k-token document | n/a* | 260 | **382** |
+| request slots / context | 8 / 64k | 8 / 64k | 4 / 56k |
+
+`VLLM_DFLASH2_CHAIN=1` adds drafter-free n-gram chains on top
+([#38](https://github.com/syv-ai/HyperQwen/issues/38), ported from
+@Dmtrii-tesla's fork with permission): while a request keeps reproducing its
+context, whole verify blocks come from history alone and the drafter's forward
+and graph replay are skipped until the first rejected token — +7% on the copy
+cell here (256.9 → 276 tok/s at `DFLASH_TOKENS=7`), flat on prose, greedy
+requests only by default (`patches/dflash2-ngram-chains.patch` explains why
+sampling keeps the drafter). Off by default.
+
+<sub>\* drafting from the context only exists in `SPEC=dflash2`. The two right
+columns are one server session, where run-to-run greedy divergence is ±3-5%;
+reproduce them with `venv/bin/python bench/labd_bench.py <tag> --ctx 20000`.</sub>
+
+`PREFIX_CACHE=1` is orthogonal to the other two and worth as much again in a
+chat client: a second turn against that same 25k-token document takes 0.56 s to
+first token instead of 22.4 s, with the answers unchanged token for token.
+
+**Read that table by column, not by its last cell.** `SPEC=dflash2` is the upgrade
+for everyone; `DFLASH_TOKENS=15` is for one workload. On chat it is worth 1%,
+because the eight positions past the drafter's own block are filled from the
+prompt and a chat answer does not quote the prompt — measured over
+`bench/prompts_real.jsonl`, positions 7-14 take **72 of 11,069 accepted tokens
+(0.65%)**, and @changtimwu measured exactly zero for them on a TP=2 box in
+[#22](https://github.com/syv-ai/HyperQwen/issues/22). What you pay for
+that 1% is half the request slots and 8k of context, because a 16-token verify
+block doubles the recurrent-state page every resident request holds (1.66 GiB
+against 0.88 by the gotcha-33 fit). So: set it if you are quoting documents or
+applying edits, where it is worth 47%, and leave it at the default 7 for a chat
+or agentic client. `DRAFT_TOKENS`/`DFLASH_TOKENS` is one variable you can flip
+per service.
+
+All of it is lossless: speculative decoding samples the same distribution as no
+speculation at all, the prefix cache resumes recurrent state rather than
+approximating it, and GSM8K reads 96.0-96.5% across the three columns.
+`SPEC=dflash2` is a one-user mode either way
+(see [concurrency](../docs/long-context.md#dflash2-at-240k-ctxhuge-kvarn-also-combines-with-specdflash2)).
+Every other knob: [single-user/](.).
