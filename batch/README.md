@@ -1,3 +1,7 @@
+> **New here?** Start at [docs/quickstart.md](../docs/quickstart.md) for the
+> canonical Docker path, then come back. Setup steps live in [## Setup](#setup) below.
+
+
 # Batch mode
 
 For serving many concurrent requests: API backends, data processing pipelines,
@@ -14,7 +18,7 @@ config (fp16 recurrent state, int8 activations on the MLP GEMMs):
 | 128/512, 64 concurrent | **~1,094** | 942 | 62.2 ms | 3.0 s* |
 | 256/256, 64 concurrent | ~1,094 | 673 | 81.4 ms | 3.4 s* |
 
-(Baseline measured on vLLM 0.27.1; re-run after the v0.28.0 upgrade. Two passes each were
+(Baseline measured on vLLM 0.27.1; re-run after the v0.30.0 upgrade -- these figures now predate three pins. Two passes each were
 within 0.4% of one another. The 128/512 row read 876 when this repo was first published — the difference is everything that landed
 since. `INT8_LAYERS=.` — int8 activations on every linear, not just the MLP — reaches
 **1,042 tok/s** e2e and ~1,222 steady-state decode, but needs `GPU_UTIL=0.95`: it OOMs inside
@@ -196,7 +200,7 @@ All overridable as env vars, defaults in the script:
 | `MAX_LEN` | 150000 | max context. Raising it much past this fails startup, the pool can't hold a longer request |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
 | `PORT` | 18020 | |
-| `GPU_UTIL` | 0.972 | do not raise, see gotchas in the main README. Use 0.93 when you want `prompt_logprobs` (quality checks) |
+| `GPU_UTIL` | 0.95 | do not raise: 0.972, the 0.28 default, OOMs in warmup on vLLM 0.29 (#182; the ladder is in `docs/vllm-0.29.md`). Use 0.93 when you want `prompt_logprobs` (quality checks) |
 
 ## Verify you're getting the numbers
 

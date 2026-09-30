@@ -41,6 +41,22 @@
 # launcher skips the single-card KV_MEM pin under --tensor-parallel-size > 1,
 # so the pool is sized from GPU_UTIL and moves with compile-cache state
 # (README, "More than one GPU"; docs/gotchas.md 48).
+# Three or more GPUs: a single engine cannot span all of them for this model
+# (README, "More than one GPU" — TP=3/PP=3 are rejected), so "solo" runs a
+# second standalone engine, the same single-user launcher on its own card
+# and port. Expose every card and pin each engine inside its container:
+#
+#   GPU_COUNT=all
+#   CUDA_VISIBLE_DEVICES=0,1                 # the "single"/"batch" pair
+#   EXTRA_ARGS="--tensor-parallel-size 2"
+#
+#   docker compose --profile single --profile solo up -d
+#
+# "solo" sets its own CUDA_VISIBLE_DEVICES=2 below (an explicit environment:
+# entry wins over .env, so the pair stays on 0,1). With two serve containers
+# up, keep VLLM_OFFLOAD_KEEP_SHM=1 in .env: each launcher's stale-region
+# reaper sees only its own container's processes (#33) and would delete the
+# other engine's live offload region.
 
 x-qwen: &qwen
   # Prebuilt on every main push by .github/workflows/docker-image.yml; the
@@ -130,6 +146,30 @@ services:
       - "host.docker.internal:host-gateway"
     # No GPU reservation on purpose: this container is an HTTP client, so it runs
     # even while single/batch hold both cards.
+  # Second standalone engine on its own card (TP=1, same launcher, own
+  # port). Inert unless --profile solo; needs GPU_COUNT=all in .env so the
+  # reservation exposes the extra card. See the header for the layout.
+  solo:
+    <<: *serve
+    profiles: [solo]
+    command: single
+    environment:
+      # YAML merge keys are shallow, so this block replaces the anchor's
+      # environment rather than extending it — re-declare HOME, or the
+      # container gets /root and the torch.compile/FlashInfer JIT cache
+      # lands in its writable layer instead of the qwen-cache volume.
+      HOME: /cache
+      PORT: "${SOLO_PORT:-18021}"
+      CUDA_VISIBLE_DEVICES: "2"  # explicit value wins over .env's 0,1
+      EXTRA_ARGS: ""             # one card: .env's --tensor-parallel-size must not apply
+    ports:
+      - "${SOLO_PORT:-18021}:${SOLO_PORT:-18021}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:${SOLO_PORT:-18021}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 900s
 
 volumes:
   qwen-cache:

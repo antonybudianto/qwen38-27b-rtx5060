@@ -18,9 +18,16 @@ ROWS=${ROWS:-"1024 4096 16384 51200"}
 PORT=${PORT:-18021}          # do not fight the production port
 OUT="$HERE/results-prefill-ab/$ARM"; mkdir -p "$OUT"
 export PATH="$REPO/venv/bin:$PATH"
-export OPENAI_API_KEY=${VLLM_API_KEY:-$(cat "$REPO/api_key.txt" 2>/dev/null)}
+# One precedence chain for every caller (#113): an explicit OPENAI_API_KEY
+# wins, else the server key, else api_key.txt, else the EMPTY placeholder --
+# never a bare "Bearer " against a server that bound a key.
+source "$REPO/resolve_api_key.sh"
+resolve_client_key
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound-fast}
-B="venv/bin/vllm bench serve --host 127.0.0.1 --port $PORT --model $MODEL --served-model-name qwen3.8-27b"
+# --model is the served name (the bench client's /tokenize alignment probe
+# posts it as the request's model; a checkpoint path 404s there); the
+# checkpoint dir rides --tokenizer, which is what actually reads it.
+B="venv/bin/vllm bench serve --host 127.0.0.1 --port $PORT --model qwen3.8-27b --tokenizer $MODEL --served-model-name qwen3.8-27b"
 
 # ---- boot -------------------------------------------------------------------
 if curl -sf -o /dev/null http://127.0.0.1:$PORT/health; then

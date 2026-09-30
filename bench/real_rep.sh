@@ -6,9 +6,15 @@
 #   bash bench/real_rep.sh <tag> [reps] [temperature]     # temperature 0 = greedy
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(dirname "$HERE")"; cd "$REPO"
 export PATH="$REPO/venv/bin:$PATH"
-export OPENAI_API_KEY=${VLLM_API_KEY:-$(cat "$REPO/api_key.txt" 2>/dev/null)}
+# One precedence chain for every caller (#113): an explicit OPENAI_API_KEY
+# wins, else the server key, else api_key.txt, else the EMPTY placeholder --
+# never a bare "Bearer " against a server that bound a key.
+source "$REPO/resolve_api_key.sh"
+resolve_client_key
 M=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}; TAG=$1; N=${2:-3}; T=${3:-}
-B="venv/bin/vllm bench serve --host 127.0.0.1 --port 18020 --model $M --served-model-name qwen3.8-27b"
+# --model is the served name (the /tokenize alignment probe posts it as the
+# request's model; a checkpoint path 404s there); --tokenizer loads locally.
+B="venv/bin/vllm bench serve --host 127.0.0.1 --port 18020 --model qwen3.8-27b --tokenizer $M --served-model-name qwen3.8-27b"
 metrics() { curl -s http://127.0.0.1:18020/metrics -H "Authorization: Bearer $OPENAI_API_KEY"; }
 snap() { metrics | grep -E "^vllm:spec_decode_num_(drafts|accepted_tokens)_total" | grep -v created | awk '{print $NF}' | tr "\n" " "; }
 for i in $(seq 1 $N); do

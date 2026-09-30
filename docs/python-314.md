@@ -67,7 +67,7 @@ venv/bin/pip install 'vllm[bench]==0.27.1' huggingface_hub hf_transfer ninja \
 VP=$(venv/bin/python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')
 sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series |
 while IFS= read -r name; do
-  patch -p1 -d "$VP" < "patches/$name"
+  patch -p1 --no-backup-if-mismatch -d "$VP" < "patches/$name"
 done   # order: patches/series
 bash verify.sh --no-server
 ```

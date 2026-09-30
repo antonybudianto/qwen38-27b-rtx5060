@@ -19,36 +19,8 @@ model's default sampling (temperature 1.0, top-p 0.95, top-k 20):
 Apply from the repo root:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/sampler-small-topk-fast-softmax.patch
 
-Env knobs this patch reads go through vllm.envs and are registered there (2026-09-15, the 0.28 hygiene pass; the
-registry mirrors the raw defaults, and registration puts them in the torch.compile cache key): VLLM_DRAFT_TOPK_TOPP VLLM_DRAFT_TEMP_SCALE
+--- exported from cpuchip/vllm 9b58aeee3 (sampler-small-topk-fast-softmax); regenerate with scripts/export-patch.sh, do not edit ---
 
---- exported from cpuchip/vllm 2015b89ba (sampler-small-topk-fast-softmax); regenerate with scripts/export-patch.sh, do not edit ---
-
-diff --git a/envs.py b/envs.py
-index e7074a52e..29762694d 100755
---- a/envs.py
-+++ b/envs.py
-@@ -186,6 +186,10 @@
-     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
-     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
-     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
-+    # syv patch (sampler-small-topk-fast-softmax): draft-side top-k/top-p truncation and temperature scale,
-+    # read once at import; registered so they take part in the torch.compile cache key
-+    VLLM_DRAFT_TOPK_TOPP: bool = True
-+    VLLM_DRAFT_TEMP_SCALE: float = 1.0
-     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
-     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
-     VLLM_HUMMING_USE_F16_ACCUM: bool = False
-@@ -1524,6 +1528,9 @@
-     "VLLM_MARLIN_INT8_EXCLUDE_RE": lambda: os.environ.get(
-         "VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp"
-     ),
-+    # syv patch (sampler-small-topk-fast-softmax)
-+    "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
-+    "VLLM_DRAFT_TEMP_SCALE": lambda: float(os.environ.get("VLLM_DRAFT_TEMP_SCALE", "1.0")),
-     # The online quantization dtype for humming kernel
-     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
-         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
 diff --git a/v1/sample/metadata.py b/v1/sample/metadata.py
 index fa4ceac8e..1560b83f9 100644
 --- a/v1/sample/metadata.py
@@ -141,12 +113,12 @@ index 000000000..f8272f480
 +        return row_softmax_fp32(x)
 +    return x.softmax(dim=-1, dtype=torch.float32)
 diff --git a/v1/sample/ops/topk_topp_sampler.py b/v1/sample/ops/topk_topp_sampler.py
-index c83ac7c4b..b84a74336 100644
+index aeb82dec4..bbb1c03cd 100644
 --- a/v1/sample/ops/topk_topp_sampler.py
 +++ b/v1/sample/ops/topk_topp_sampler.py
-@@ -128,25 +128,38 @@
-         else:
-             self.forward = self.forward_native
+@@ -147,25 +147,38 @@
+         # Every accelerator backend can fall back to native sampling at runtime.
+         register_top_k_top_p_warmups()
  
 +    def __call__(self, logits, generators, k, p, k_max=None):
 +        # syv patch: forward variants that don't know k_max just ignore it
@@ -185,7 +157,7 @@ index c83ac7c4b..b84a74336 100644
          return (
              random_sample(probs, generators, self.use_fp64_gumbel),
              logits_to_return,
-@@ -346,12 +359,55 @@
+@@ -365,12 +378,55 @@
      return probs.div(q).argmax(dim=-1).view(-1)
  
  
@@ -239,14 +211,14 @@ index c83ac7c4b..b84a74336 100644
 +    ):
 +        return apply_top_k_top_p_small_k(logits, k, p, k_max)
 +
-     if current_platform.is_cpu():
-         if HAS_TRITON:
-             return apply_top_k_top_p_triton(logits, k, p)
+     if HAS_TRITON:
+         return apply_top_k_top_p_triton(logits, k, p)
+ 
 diff --git a/v1/sample/rejection_sampler.py b/v1/sample/rejection_sampler.py
-index a1baf0a80..f445eb9f3 100644
+index 85b623bd8..765243597 100644
 --- a/v1/sample/rejection_sampler.py
 +++ b/v1/sample/rejection_sampler.py
-@@ -469,7 +469,9 @@
+@@ -481,7 +481,9 @@
              return output_token_ids
  
      # Compute probability distribution from target logits.
@@ -257,7 +229,7 @@ index a1baf0a80..f445eb9f3 100644
      assert target_probs.is_contiguous()
  
      # Sample recovered tokens for each position.
-@@ -562,7 +564,7 @@
+@@ -571,7 +573,7 @@
  
      # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
      # which is slow for large vocab sizes. This may cause performance issues.
@@ -279,21 +251,14 @@ index 3efaf33d9..2c7487edf 100644
  
          if greedy_sampled is None:
 diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
-index 29a95caa8..d5513ed53 100644
+index 1bd1bdc45..044855c5b 100644
 --- a/v1/spec_decode/llm_base_proposer.py
 +++ b/v1/spec_decode/llm_base_proposer.py
-@@ -8,6 +8,7 @@
- import torch
- import torch.nn as nn
- 
-+import vllm.envs as envs
- from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
- from vllm.config import (
-     CUDAGraphMode,
-@@ -1851,6 +1852,10 @@
+@@ -1845,6 +1845,11 @@
  # Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
  # FIXME(woosuk): The logic here is duplicated with the main sampling code.
  # We should refactor this to reuse the same sampling implementation.
++import vllm.envs as envs
 +_DRAFT_TOPK_TOPP = envs.VLLM_DRAFT_TOPK_TOPP
 +_DRAFT_TEMP_SCALE = envs.VLLM_DRAFT_TEMP_SCALE
 +
@@ -301,7 +266,7 @@ index 29a95caa8..d5513ed53 100644
  def compute_probs_and_sample_next_token(
      logits: torch.Tensor,
      sampling_metadata: SamplingMetadata,
-@@ -1873,7 +1878,29 @@
+@@ -1867,7 +1872,29 @@
          is_greedy = temperature < _SAMPLING_EPS
          temperature = torch.where(is_greedy, 1.0, temperature)
      logits.div_(temperature.view(-1, 1))
@@ -333,10 +298,10 @@ index 29a95caa8..d5513ed53 100644
      # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
      # generating the draft tokens. We only use the temperature. While this
 diff --git a/v1/worker/gpu_input_batch.py b/v1/worker/gpu_input_batch.py
-index 0b805fca7..824b3b6b6 100644
+index 01b6b5b0c..77ceec79a 100644
 --- a/v1/worker/gpu_input_batch.py
 +++ b/v1/worker/gpu_input_batch.py
-@@ -946,6 +946,7 @@
+@@ -942,6 +942,7 @@
              all_random=self.all_random,
              top_p=None if self.no_top_p else self.top_p[:num_reqs],
              top_k=None if self.no_top_k else self.top_k[:num_reqs],

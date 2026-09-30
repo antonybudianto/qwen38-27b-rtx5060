@@ -1,13 +1,23 @@
 # Docker, and WSL2
 
+> **WSL2 + RTX 3090 checklist** — full path: [quickstart.md](quickstart.md).
+> 1. `cp .env.example .env` and `make keygen` (never commit `.env`).
+> 2. Keep `VLLM_WSL2_ENABLE_PIN_MEMORY=1` or the V2 runner aborts on UVA.
+> 3. First boot takes 2–15 min; follow it with `make logs`.
+> 4. Boot OOM? Fall back to `GPU_UTIL=0.93` in `.env`.
+> 5. Exit 137 in prepare? Raise WSL memory (`memory=20GB`, `swap=8GB`), then `wsl --shutdown`.
+> 6. Verify with `make doctor`. Stuck? See [gotchas.md](gotchas.md).
+
+
 The container image (same stack, frozen) and an independent WSL2 reproduction with its memory caveats.
 
 [← back to the main README](../README.md)
 
-The container image is the same stack, frozen: Python 3.12 venv, vLLM 0.28.0 pinned
+The container image is the same stack, frozen: Python 3.12 venv, vLLM 0.30.0 pinned
 (torch 2.13 / cu130 / Triton 3.7.1), every compatible patch in `patches/` applied
-(`dflash2-backport.patch` is retired because DFlash2 is native in v0.28.0), and
-`verify.sh --install` run at build time, KVarN preinstalled. Host prerequisites:
+(`dflash2-backport.patch` is retired because DFlash2 is native since v0.28.0), and
+`verify.sh --install` run at build time, KVarN preinstalled (its 0.30 port is
+described in [vllm-0.30.md](vllm-0.30.md)). Host prerequisites:
 an NVIDIA driver that speaks CUDA 13 (≥ 580), Docker with the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 configured as a runtime. The 250 W power limit is a host setting
@@ -63,6 +73,12 @@ difference is gotcha 16 below.
   `verify.sh --no-server` before every start — so a missing or half-prepared
   model heals itself, and a real FAIL refuses to serve (`PREPARE=0` / `VERIFY=0`
   skip the two steps).
+  Single-mode startup verifies the same model it will serve: an explicit
+  `MODEL` wins, otherwise the fast variant is selected when present. Batch
+  keeps its base-model default. Verification accepts the base model's packed
+  8-bit head and the fast variant's packed 4-bit head. The standalone `verify`
+  command still defaults to the base model; set `MODEL` explicitly to check
+  another directory.
 - **Concurrent prepares are serialised.** Because the entrypoint calls `prepare`
   before every start, a booting container can race a `docker compose run --rm
   prepare`, or two containers can start together; `docker/prepare.sh` takes an
@@ -151,10 +167,11 @@ hard abort rather than a tuning question:
    ([#25](https://github.com/syv-ai/HyperQwen/issues/25)).
 2. **The ordinary batch default may fail vLLM's startup free-memory gate.**
    On an otherwise clean card, WSL reported 22.75/24.0 GiB free, less than
-   the 23.33 GiB requested by `GPU_UTIL=0.972`. Launching with
+   the 23.33 GiB requested by `GPU_UTIL=0.972` (the 0.28 default; 0.29 ships
+   0.95, which asks for 22.80). Launching with
    `GPU_UTIL=0.93 bash batch/start_qwen.sh` retained a 201,832-token FP8
    pool, preserving the 150k context contract and expected C64 throughput.
-   Keep 0.972 as the tuned native-Linux default; 0.93 is a WSL fallback.
+   Keep the shipped default on native Linux; 0.93 is a WSL fallback.
 3. **Cold and cached starts can profile different activation peaks.** A warm
    start may turn the difference into extra KV pages and leave less transient
    headroom than the cold start. For a deterministic service, compile once

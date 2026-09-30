@@ -21,13 +21,19 @@ MODE=${1:-single}; shift || true
 DO_PREFILL=0; DO_LONG=0
 for a in "$@"; do case $a in --prefill) DO_PREFILL=1;; --long) DO_LONG=1;; esac; done
 export PATH="$REPO/venv/bin:$PATH"
-export OPENAI_API_KEY=${VLLM_API_KEY:-$(cat "$REPO/api_key.txt" 2>/dev/null)}
-HOST=${HOST:-127.0.0.1}; PORT=${PORT:-8000}
+# One precedence chain for every caller (#113): an explicit OPENAI_API_KEY
+# wins, else the server key, else api_key.txt, else the EMPTY placeholder --
+# never a bare "Bearer " against a server that bound a key.
+source "$REPO/resolve_api_key.sh"
+resolve_client_key
+HOST=${HOST:-127.0.0.1}; PORT=${PORT:-18020}
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
-# repo venv by default; fall back to whatever vllm is on PATH, or VLLM=/path/to/vllm
-VLLM=${VLLM:-$REPO/venv/bin/vllm}
-[ -x "$VLLM" ] || VLLM=$(command -v vllm) || { echo "no vllm binary: create the venv (python3 -m venv venv && venv/bin/pip install vllm) or set VLLM=/path/to/vllm"; exit 1; }
-B="$VLLM bench serve --host $HOST --port $PORT --model $MODEL --served-model-name qwen3.8-27b"
+# --model must be the SERVED name, not the checkpoint path: vllm bench serve's
+# tokenizer-alignment probe posts it to /tokenize as the request's model, and a
+# filesystem path 404s the model check there — the run then logs "WARNING:
+# /tokenize unavailable" and silently skips alignment. --tokenizer keeps
+# loading the tokenizer from the checkpoint dir, which is what the path is for.
+B="venv/bin/vllm bench serve --host $HOST --port $PORT --model qwen3.8-27b --tokenizer $MODEL --served-model-name qwen3.8-27b"
 OUT=${OUT:-$HERE/results}; mkdir -p "$OUT"
 
 # WAIT=<seconds> polls /health instead of failing on the first miss — a server

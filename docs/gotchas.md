@@ -37,6 +37,26 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    not unconditional, which this entry used to imply: expandable segments need
    CUDA VMM, which WSL2's paravirt driver rejects during capture, so both start
    scripts set `expandable_segments:False` when they detect WSL2.
+   **And `False` on bare-metal Linux as well, once TP>1 uses custom
+   all-reduce.** Same root, a different consumer: with
+   `--tensor-parallel-size 2` and CUDA graphs enabled, graph capture aborts
+   with `Cuda error /workspace/csrc/custom_all_reduce.cuh:164 'invalid
+   argument'` and the worker dies before the server comes up. Line 164 is the
+   `cudaIpcGetMemHandle` in `get_graph_buffer_ipc_meta()`, and an expandable
+   (VMM) segment has no IPC handle to export. Reported on 2x RTX 3090 NVLink,
+   driver 595.91.07, CUDA 13.2, vLLM 0.28.0
+   ([#163](https://github.com/syv-ai/HyperQwen/issues/163)), with the matrix
+   that isolates it: `NCCL_P2P_LEVEL=SYS` does not help, `--enforce-eager`
+   does (no graphs, no capture), and `expandable_segments:False` does while
+   keeping the graphs. The two workarounds that get a server up —
+   `--disable-custom-all-reduce` (NCCL carries the collectives) and
+   `expandable_segments:False` (custom all-reduce works) — are not equivalent:
+   in a controlled A/B on that box, C1 greedy decode is 171.8 tok/s on NCCL
+   against 182.8 on custom all-reduce, +6.4%, at an identical 3.32 tokens per
+   step, with every concurrency up to C8 improving. So on a multi-card box,
+   turn the allocator off before you turn custom all-reduce off. Not yet
+   soaked for fragmentation on long contexts, which is the thing
+   `expandable_segments:True` was turned on for in the first place.
 4. **With MTP enabled, even that isn't enough — single-user mode runs
    `gpu-memory-utilization 0.93`.** The speculative decode path's DeltaNet
    workspace grows beyond what vLLM's startup memory profiling measures, and
@@ -196,13 +216,13 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     padded to `num_speculative_tokens` and a worker asking for fewer is ignored, silently.
     Adaptive block length (`LOOKUP=1` with `DFLASH_TOKENS > 7`) needs `ASYNC_SCHED=0`; at
     batch 1 that costs under 1%.
-    Still true on 0.28.0, and worth knowing *why*, because 0.28 looks like it
+    Still true on 0.29.0, and worth knowing *why*, because 0.29 looks like it
     handles this for you and does not: `VllmConfig` disables async scheduling
     automatically for speculative methods outside an allowlist, but that
     allowlist is `EagleModelTypes`, and `DFlashModelTypes` is inside it
-    (`config/speculative.py:66`). So dflash keeps async scheduling on unless
+    (`config/speculative.py:69` on 0.29.0, `:67` on 0.28.0). So dflash keeps async scheduling on unless
     something turns it off, and the launcher is that something.
-19. **`--async-scheduling` is already the default in 0.28.0.** The flag exists and passing it
+19. **`--async-scheduling` is already the default in 0.28.0 and 0.29.0.** The flag exists and passing it
     changes nothing; `--no-async-scheduling` is what turns it off. Two hours of "the adaptive
     block isn't working" was this.
 20. **The DFlash draft pass is a captured CUDA graph, so its Python runs once.**
@@ -598,6 +618,12 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     independent Xid-31 trigger. Not shipped here (no sm80 to regression-test
     against); recorded so the next GA100/A100 report starts from the answer
     instead of from five reboots.
+    **On a GA100 mining card such as the CMP 170HX, set `VLLM_MARLIN_REPACK_STAGED=1`**
+    (opt-in since 2026-09-28). `marlin-repack-staged-sm80` stages the repack's
+    per-layer transients through one grow-only GPU buffer; on the 170HX that took the
+    repack window from the CPU fallback's 403.7 s to 44.9 s, bit-exact (the patch
+    header has the A/B). It is off by default everywhere because on a real A100 40 GB,
+    against the stock GPU repack, it saves 0.85 s of load and holds 1.19 GiB of pool.
 38. **The OffloadingConnector's CPU tier can be silently useless: uniform
     blocks meet asymmetric chunk sizes, and one request evicts everything
     (issue #33).** The tier allocates equal-size blocks sized for the LARGEST
@@ -631,7 +657,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     stored hits under `SPEC=mtp` and the cached count on a replay lands on the
     same block formula as the GPU path, one 832-token block more than before.
     **Sizing the tier, and why a default boot can show it doing nothing.**
-    Residency has no gauge in 0.28.0: both `kv_offload_cpu_cache_usage_perc`
+    Residency has no gauge in 0.28.0 or 0.29.0: both `kv_offload_cpu_cache_usage_perc`
     and its read twin count in-flight transfer pins (`num_used = allocated -
     free - evictable`, and `complete_store()` marks a block evictable the
     moment it lands), so a full tier reads 0.0 between transfers and a 0%
@@ -1321,3 +1347,87 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     run. The lock is advisory and is released when the holder exits, so a
     leftover `.prepare.lock` file is inert: it is a lock, not a marker, and
     nothing has to clean it up.
+60. **Two long conversations advanced in turn can evict each other completely at
+    `CTX=huge`, and the hit rate goes to 0, not to a remainder.** With DFlash2 and
+    `PREFIX_CACHE=1`, vLLM retains one Mamba state snapshot per attention block by
+    default ("dense"). Each long conversation then pins dozens of snapshots, and
+    once two of them no longer fit beside each other, whichever one ran last
+    evicts the other — every group, attention included, so `cached_tokens` reads
+    exactly 0 and every turn re-prefills the whole prompt. On the reference 3090
+    (pool 268,169) two ~32.6K chats alternating reused 0% and spent 31.8 s per
+    turn re-prefilling; two ~14.9K chats were fine; one ~103K chat alone was
+    fine. The knee scales with the pool (#174 found it at ~50-55K per side on a
+    542K pool, and halving `--kv-cache-memory` halved it), so it is capacity, not
+    a structural trigger. It is invisible in single-user benchmarks and is
+    exactly how a two-agent deployment runs. Fix: retain one snapshot in six
+    (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`, a CLI flag from 0.29 on), which the
+    launcher now sets at `CTX=huge` with DFlash2 — 93-99.5% reuse on the same
+    pair, no cost to a single long chat, and a reuse needle inside the restored
+    prefix still comes back right. The interval must be a multiple of the
+    attention block, and that block moves with the draft count (2176 at 7 drafts,
+    2432 at 15), so the launcher only sets it for measured counts; for any other,
+    `PREFIX_RETENTION` = 6 x the `attention block size` line the boot prints.
+    Upstream on 0.29, hybrid + EAGLE models are *forced* to dense unless the flag
+    is set explicitly, under a boot line ("defaulting prefix_cache_retention_interval
+    to dense checkpointing") that reads like a managed setting and is the arm that
+    fails ([#174](https://github.com/syv-ai/HyperQwen/issues/174)).
+    **What the sparse interval costs, so you can turn it the right way.** It also
+    sets hit granularity: a new conversation's first one or two follow-up turns
+    reuse only down to the last retained snapshot, and a conversation shorter than
+    one interval reuses nothing on those turns. After that all settings are
+    the same. Reference 3090, vLLM 0.29, 7 drafts (block 2176), one
+    conversation and no other traffic unless stated, cached tokens per turn:
+
+    | workload | dense | `PREFIX_RETENTION=4352` (2 blocks) | 13056 (default) |
+    |---|---|---|---|
+    | ~8K chat, turns 2-3 | 81% (1.7 s) | 54% (3.6 s) | **0%** (7.3 s) |
+    | ~8K chat, turn 4 on | ~98% | ~98% | ~98% |
+    | ~20K chat, turn 2 | 98% (0.8 s) | 87% (3.0 s) | 65% (7.2 s) |
+    | ~20K chat, turn 3 on | 99% | 99% | 99% |
+    | two ~32.6K chats alternating | **0%** (31.8 s) | 93% (2.7 s) | 93-99.5% |
+
+    So the default trades a few seconds on each new conversation's early turns for
+    never losing a long one outright. The knob runs one way: a **smaller** interval
+    (`PREFIX_RETENTION`, any multiple of the block) gives finer early hits and
+    less capacity before two long conversations collide; a **larger** one the
+    reverse. Two blocks already halves the early-turn cost and still held the
+    ~32.6K pair; where its collision knee sits is not measured, so a workload of
+    many short-to-medium chats is the one to try it on, and one that keeps two
+    or more long documents live should stay on the default.
+    One report from the other direction, on a different box
+    ([#208](https://github.com/syv-ai/HyperQwen/issues/208), 2x3090 TP=2,
+    DFlash2 k=3, so a 2048-token block, with its own client): at 32 streams of
+    32K each, 12 blocks (24576) read 130.6 tok/s and 92% cached against 6
+    blocks' (12288) 116.4 and 90%, and dense read 55.0 and 67%. So under heavy
+    concurrency of long prompts, a coarser interval than the default can pay.
+    On 0.30, 0.29's forcing to dense is gone (vllm #55760 went to the 0.29 release
+    branch only), and an unset interval means 0: the replay boundaries only. That does not zero
+    reuse, but each turn's hit now ends inside the previous prompt, two blocks (864
+    tokens at the MTP block) before 0.29's, which reached a few hundred tokens
+    into the reply, so a turn prefills those again. So both single-user launchers now pass the
+    interval on every draft profile: the measured one above, else `None` (dense,
+    0.29's behaviour). `PREFIX_RETENTION=0` asks for boundaries only
+    ([vllm-0.30.md](vllm-0.30.md) has the measurement). `alternative.sh` keys its
+    default on a KV tier, so `None` in one boot log and `0` in another is the tier:
+    without one it passes `0`, because at dense two ~60K conversations on its int4
+    pool evicted each other completely (0 / 0 cached, where `0` held 93.5% for both);
+    with `--kv-offloading-size` it passes `None`, which the tier serves from (96-98%
+    on 0.30, where beside `0` a tier served nothing on 0.29).
+61. **The shipped MTP draft vocabulary is English, Danish and code. On Chinese
+    output it covers about 6% of tokens, and `SPEC=mtp` collapses to ~1.06
+    tokens per step.** The 40,960-id list (`prepare/draft_vocab_ids.json`, and
+    `mtp_draft_vocab_ids.pt` in every checkpoint built from it) was counted over
+    Danish web text, English Wikipedia, Python and the model's own outputs, and
+    a token outside it can never be drafted, so it is a certain rejection that
+    also ends the chain. Measured with the model's own tokenizer: the repo's
+    docs 96.4%, its Python 92.8%, its shell 93.4%, a Chinese prose sample 6.4%.
+    A 3090 serving mostly Chinese traffic read 1.06 mean acceptance and 35.5
+    tok/s, and 2.23 and 80.6 tok/s at `MTP_DRAFT_VOCAB=0`
+    ([#196](https://github.com/syv-ai/HyperQwen/issues/196)). So for any
+    language outside the list's corpus, start with `MTP_DRAFT_VOCAB=0` (the
+    full `lm_head`; exact either way). Or rebuild the list from your own
+    traffic with `prepare/build_draft_vocab.py --corpus`. That report's rebuilt
+    list (99.8% held-out coverage on its own corpus) reached 61-64 tok/s at
+    `CTX=long` k=3, still below the full head's 80.6 there. The truncated head's
+    win in the `CTX=fast` k=4 ladder has not been re-measured at `CTX=long`.
+    DFlash2 does not use this list.

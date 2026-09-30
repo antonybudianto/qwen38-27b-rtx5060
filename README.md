@@ -8,13 +8,16 @@
 <a href="https://github.com/syv-ai/HyperQwen/actions/workflows/docker-image.yml"><img alt="docker image" src="https://github.com/syv-ai/HyperQwen/actions/workflows/docker-image.yml/badge.svg"></a>
 <a href="https://github.com/syv-ai/HyperQwen/actions/workflows/patch-integrity.yml"><img alt="patch integrity" src="https://github.com/syv-ai/HyperQwen/actions/workflows/patch-integrity.yml/badge.svg"></a>
 <a href="https://github.com/syv-ai/HyperQwen/pkgs/container/hyperqwen"><img alt="ghcr.io" src="https://img.shields.io/badge/ghcr.io-syv--ai%2Fhyperqwen-2496ED?logo=docker&logoColor=white"></a>
-<a href="https://github.com/vllm-project/vllm"><img alt="vLLM 0.28.0" src="https://img.shields.io/badge/vLLM-0.28.0-5C3EE8"></a>
+<a href="https://github.com/vllm-project/vllm"><img alt="vLLM 0.30.0" src="https://img.shields.io/badge/vLLM-0.30.0-5C3EE8"></a>
 <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/github/license/syv-ai/HyperQwen"></a>
 <a href="https://github.com/syv-ai/HyperQwen/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/syv-ai/HyperQwen?style=flat"></a>
 <a href="https://ko-fi.com/mhenrichsen"><img alt="support on Ko-fi" src="https://img.shields.io/badge/Ko--fi-support%20GPU%20time-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
 
-![Stock vLLM against this repo, same card, same prompts](docs/media/demo.gif)
+<a href="docs/media/demo.mp4"><img src="docs/media/demo.avif" alt="HyperQwen on one RTX 3090: one request against stock vLLM, replayed from recorded token arrivals, then 64 requests at once" width="100%"></a>
+
+<sub>One request against stock vLLM, replayed in real time from recorded token arrivals, then 64 at once.
+<a href="docs/media/demo.mp4">1080p60 MP4</a> · <a href="bench/demo">how it is made</a></sub>
 
 </div>
 
@@ -31,8 +34,8 @@ speculation that drafts out of the prompt. Most of that is not specific to one
 checkpoint or one card; it is just that one checkpoint and one card are what has
 been measured to death. See [Roadmap](#roadmap-more-qwen-models-more-cards) for
 what is and is not portable yet, and
-[Help us test more hardware](#help-us-test-more-hardware) if you have credits to
-spare on a GPU we have never touched.
+[Field tests wanted](#field-tests-wanted) if you have half an hour on a GPU we
+have never touched.
 
 ## Quick start
 
@@ -48,7 +51,7 @@ First start pulls the image (9.5 GB) and requantizes the model (~20 GB, once,
 into `./models`), then serves on `:18020`. One GPU runs one mode at a time.
 
 - **Before exposing it** — the server binds `0.0.0.0` with no auth:
-  `echo "VLLM_API_KEY=$(openssl rand -hex 24)" > .env`
+  `echo "VLLM_API_KEY=$(openssl rand -hex 24)" >> .env`
 - **Docker Desktop on WSL2** — keep `VLLM_WSL2_ENABLE_PIN_MEMORY=1` in `.env`, or
   the V2 runner aborts with `RuntimeError: UVA is not available`
 - **No compose, or no Docker at all** —
@@ -144,46 +147,61 @@ same treatment rather than a shrug; a larger one for 48 GB; the EXL3 route in
 path. If you want a specific model or card prioritized, say so in an issue — the
 order is mostly driven by who turns up with a reproduction.
 
-## Help us test more hardware
+## Field tests wanted
 
-**We are looking for Runpod or Vast.ai credits.** One RTX 3090 at 250 W is the
-entire hardware budget behind every number in this README, and it is shared with
-training jobs. That constraint shows: the tables above lean on community
-reproductions for every card that is not a 3090, an sm80 speculation bug has sat
-open because nobody here owns an sm80 card to debug it on, and each architecture
-sweep is scheduled around whatever else needs the GPU that week.
+Every number above is one RTX 3090 at 250 W, shared with training jobs. Every
+row for any other card came from someone else running the harness — so the ask
+here is a protocol rather than "try it and let us know".
 
-Rented compute converts directly into things this repo does not currently have:
+**About 30 minutes on one GPU**, most of it unattended. The harness lives in
+the container, so it runs through `compose exec` — on a venv install drop that
+prefix and use `python` instead of `venv/bin/python`:
 
-- **An architecture matrix that is measured rather than collected.** sm80, sm89,
-  sm90, sm120 and multi-GPU under one harness, one power protocol, one set of
-  prompts — instead of a table where every row came from a different person's
-  client and cannot honestly be compared to the row above it.
-- **Fixing the bugs we cannot reproduce.**
-  [#98](https://github.com/syv-ai/HyperQwen/issues/98) and
-  [#72](https://github.com/syv-ai/HyperQwen/issues/72) are sm80 faults diagnosed
-  entirely from other people's logs. A few hours on a rented A100 probably closes
-  both.
-- **Porting faster.** The vLLM 0.29.0 port
-  ([#106](https://github.com/syv-ai/HyperQwen/issues/106)) is blocked on
-  packaging details that need a machine to bisect on, while the one card here is
-  the card serving production.
-- **More models.** Every new checkpoint needs its draft vocabulary calibrated and
-  its drafter trained — GPU-hours, not cleverness.
+```bash
+sudo nvidia-smi -pl 250                 # your card's reference wattage; say which
+docker compose --profile single up -d   # first start also prepares the model
 
-What you get: results published here as reproductions with the raw harness
-output, credit in this section and on the runs themselves, and — if you would
-rather have it than the credit — an honest writeup of what your hardware does
-badly, which is usually the more useful half.
+docker compose exec single bash bench/run_benchmarks.sh single   # discard: a first run after a start reads 30-50% low
+docker compose exec single bash bench/run_benchmarks.sh single   # keep this one — its ROW lines are the report
 
-If you can help, open an issue titled "compute offer" and we will take it from
-there. Small amounts are genuinely useful: a single day on one unfamiliar card
-has historically been worth more to this project than a month on a familiar one.
+docker compose exec single venv/bin/hf download openai/gsm8k --repo-type dataset \
+  --include "main/test-*" --local-dir bench/quality-data/gsm8k
+docker compose exec single venv/bin/pip install pyarrow   # only on images published before 2026-09-21
+docker compose exec single venv/bin/python bench/quality_battery.py mycard --gsm-only
+```
 
-Money works too, if that is easier than credits:
-[ko-fi.com/mhenrichsen](https://ko-fi.com/mhenrichsen) — it goes to rented GPU
-hours and the runs get written up here like any other reproduction.
+Then open a
+[field report](https://github.com/syv-ai/HyperQwen/issues/new?template=field-report.yml).
+The form asks for the six things that make two runs comparable — card, power
+cap, driver, OS or container, commit, which setup letter — because without them
+a number cannot honestly be put next to the row above it. Ran something
+narrower, or with your own client? Post it anyway and say what you skipped; it
+gets listed as an independent report instead of a table row, which is what
+happened to most of
+[docs/reproductions/](docs/reproductions/README.md#results-from-other-hardware).
 
+**Most wanted, in order.** Several of these already have a thread with someone's
+hardware in it — check before you duplicate, and add to theirs if it matches:
+
+| | why it is worth your GPU hour |
+|---|---|
+| **sm90** — H100, H200 | The only architecture here with no datapoint at all. |
+| **sm80** — A100, A30, CMP 170HX | Two owners are mid-bisect on a speculation fault that only their cards produce ([#98](https://github.com/syv-ai/HyperQwen/issues/98), [#72](https://github.com/syv-ai/HyperQwen/issues/72)). A third sm80 box would separate the card from the build. |
+| **Four Ampere cards** | Four sm120 cards are measured ([#105](https://github.com/syv-ai/HyperQwen/issues/105)); nobody has run four 3090s, and two of them already give *less* aggregate throughput than one ([#135](https://github.com/syv-ai/HyperQwen/issues/135)). |
+| **12 GB cards, on the harness** | Two 3060s do serve this model ([#68](https://github.com/syv-ai/HyperQwen/issues/68)), reported with their owners' own clients — so the numbers cannot be set against the rows above. A harness run on that pair is most of what decides whether smaller Qwen checkpoints are worth preparing. |
+| **vLLM 0.30.0** ([docs/vllm-0.30.md](docs/vllm-0.30.md); 0.29.0 in [docs/vllm-0.29.md](docs/vllm-0.29.md)) | The pin this branch carries, measured on a 3090 and a WSL2 4090; the harness on it from any other card is the missing datapoint. |
+
+**What you get:** the run published in
+[docs/reproductions/](docs/reproductions/README.md) with your raw output and
+credit, the gotchas your platform exposes written into
+[docs/gotchas.md](docs/gotchas.md), and an honest account of what your hardware
+does badly — historically the more useful half.
+
+**Rather give hardware or money than time?** A box we can reach, or credits:
+open an issue titled "compute offer". Otherwise
+[ko-fi.com/mhenrichsen](https://ko-fi.com/mhenrichsen) buys hours on cards this
+project does not own, and those runs get written up here like any other
+reproduction.
 
 ## Documentation
 

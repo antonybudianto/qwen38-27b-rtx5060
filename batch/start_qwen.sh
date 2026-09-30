@@ -17,16 +17,18 @@
 #    checkpoint); VISION=1 keeps it for a client that sends images
 #  - expandable_segments is required: the DeltaNet prefill kernels allocate
 #    transient workspace and fragment the allocator, OOMs at util >= 0.978 without it
-#  - gpu-memory-utilization 0.972 is the sweet spot on a headless box
-#    (X/display holds ~220 MB; 0.98 fails the startup free-memory check)
+#  - gpu-memory-utilization 0.95 on vLLM 0.29 (0.972 on 0.28): see the KV=fp8
+#    branch below for why the default moved with the pin
 #  - max-num-batched-tokens 2048 beats 8192 here: bigger chunks inflate the
 #    profiled activation peak, which shrinks the KV/state page pool
 #  - kv-cache-dtype fp8 roughly doubles the usable context/pool
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
-# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+# flashinfer-cubin (the no-nvcc route, docs/install.md) must match flashinfer-python.
+# This used to cover a pair PyPI could not match (cubin 0.6.13 against python
+# 0.6.16.post3, #35); install.md now takes the cubin from flashinfer.ai at the
+# same version, so the export is kept only for venvs built the old way.
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # A dead engine leaves its OffloadingConnector region behind as
@@ -43,6 +45,23 @@ if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
 fi
 REPO="$(dirname "$DIR")"
 cd "$REPO"
+# vLLM 0.29 ships FlashInfer 0.6.18, whose JIT passes nvcc flags CUDA 12 does not know
+# (--compress-mode=size): on a native install whose system nvcc is older than 13, the first
+# boot that compiles a FlashInfer kernel (SPEC=mtp CTX=long's fp8 prefill, for one) dies
+# with "nvcc fatal: Unknown option". FlashInfer takes CUDA_HOME before `which nvcc`, and pip
+# already put a CUDA 13 toolchain in the venv, so point CUDA_HOME at it. Only when unset and
+# the nvcc on PATH is older than 13 (or missing): the Docker image carries CUDA 13 and is
+# untouched, and an explicit CUDA_HOME always wins.
+if [ -z "${CUDA_HOME:-}" ]; then
+  NVCC_MAJOR=$(nvcc --version 2>/dev/null | sed -nE 's/.*release ([0-9]+)\..*/\1/p')
+  for CU13 in "$REPO"/venv/lib/python3*/site-packages/nvidia/cu13; do
+    if [ -x "$CU13/bin/nvcc" ] && [ "${NVCC_MAJOR:-0}" -lt 13 ]; then
+      export CUDA_HOME=$CU13
+      echo "[start_qwen] nvcc on PATH is ${NVCC_MAJOR:-missing}, older than the CUDA 13 FlashInfer JIT needs: CUDA_HOME=$CUDA_HOME (set CUDA_HOME to override)"
+    fi
+    break
+  done
+fi
 
 # Backlog 6 / F13: one validated resolver — refuses unknown KV, warns on
 # ignored (CTX/SPEC) and EXTRA_ARGS-shadowed controls, prints the redacted
@@ -65,7 +84,27 @@ API_SERVERS=${API_SERVERS:-1}
 # KV=int4pth: vLLM's built-in int4 per-token-head KV cache on the Triton
 # attention backend: 262k context with no extra install, ~1.5x slower decode /
 # 2.3x slower prefill at 100k than fp8 (docs/long-context.md).
+# Under WSL2 an unset GPU_UTIL means 0.91, or 0.88 for KV=kvarn, whose unset MAX_LEN there means 131072. Above
+# these the batch pool spills to system RAM (docs/wsl2-4090.md). On a 4090 (0.30, one boot per value), fp8 ran clean
+# up to 0.92, while at 0.93 its first sampled batch needed ~250 MB more than the card had: Windows moved it to system
+# RAM (the adapter's Shared Usage counter stepped 382 -> 632 MB) and 64-way decode fell to 25-40% for the rest of the
+# run. kvarn spills above 0.89 as soon as its KV cache is allocated at boot, and 262144 tokens fit at no setting that
+# stays on the card. fp8 and kvarn each keep one 0.01 step below their highest clean value, the margin 0.95 keeps
+# natively; int4pth, whose default 0.93 did not spill under WSL2 either, takes fp8's.
+# Native Linux is unchanged, and an explicit GPU_UTIL or MAX_LEN always wins.
+WSL=0
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then WSL=1; fi
 KV=${KV:-fp8}
+if [ "$WSL" = 1 ]; then
+  if [ "$KV" = "kvarn" ] && [ -z "${MAX_LEN:-}" ]; then
+    MAX_LEN=131072
+    echo "WSL detected: KV=kvarn MAX_LEN=131072 (262144 does not fit without spilling to system RAM; set it explicitly to override)"
+  fi
+  if [ -z "${GPU_UTIL:-}" ]; then
+    if [ "$KV" = "kvarn" ]; then GPU_UTIL=0.88; else GPU_UTIL=0.91; fi
+    echo "WSL detected: GPU_UTIL=$GPU_UTIL (above it the batch pool spills to system RAM; set it explicitly to override)"
+  fi
+fi
 if [ "$KV" = "int4pth" ]; then
   MAX_LEN=${MAX_LEN:-262144}
   GPU_UTIL=${GPU_UTIL:-0.93}
@@ -79,7 +118,16 @@ elif [ "$KV" = "kvarn" ]; then
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
 else
   MAX_LEN=${MAX_LEN:-150000}
-  GPU_UTIL=${GPU_UTIL:-0.972}
+  # 0.95, not 0.28's 0.972. 0.29 with memory-profile-after-warmup and
+  # cudagraph-memory-from-allocator stops over-reserving ~1.5 GiB (KV 6.09 GiB at
+  # 0.972 on 0.28, 7.63 on 0.29, same box and settings), and at 0.972 that ~1.5 GiB
+  # was the headroom batch's unprofiled warmup transients lived in: 0.972 OOMs in
+  # warmup on 0.29 on a 3090, tower on or off (#182). Ladder on the reference 3090,
+  # boot plus 128 requests at 64-way concurrency: 0.93, 0.94, 0.95 and 0.96 all
+  # boot and serve with VISION=0 and 1, 0.972 does not. 0.95 keeps one 0.01 step
+  # below the highest value that passed, boots cold to the same pool as warm
+  # (219,587 tokens with the tower), and holds at least the pool 0.28 had at 0.972.
+  GPU_UTIL=${GPU_UTIL:-0.95}
   KV_ARGS="--kv-cache-dtype fp8"
 fi
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
@@ -93,7 +141,13 @@ INT8_LAYERS=${INT8_LAYERS-mlp}
 # for that prefix once and paying for it every time: 64 requests sharing a 5.8k-token system
 # prompt (conc 32) take 222 s without it and 17 s with it. Costs ~14% of the KV pool
 # (223,821 -> 193,298 tokens) and nothing on workloads with no shared prefix (870 vs 876
-# tok/s on the 128/512 row). Hybrid models keep this opt-in upstream.
+# tok/s on the 128/512 row). Hybrid models keep this opt-in upstream. (All measured when this
+# flag was added, 2026-08-19, on vLLM 0.27.1.) From vLLM 0.28 on, generative hybrid models get
+# prefix caching by default (EngineArgs dropped 0.27's `and not model_config.is_hybrid`
+# opt-in), so PREFIX_CACHE=0 no longer turns it off and =1 only adds align mode. On 0.30 (a
+# 4090 under WSL2, GPU_UTIL=0.91, a ~5K-token system prompt shared by 32 concurrent
+# requests) caching read 934 output tok/s against 395 with --no-enable-prefix-caching, align made no difference to that shape, and
+# caching cost 1.5% of the pool (212,041 -> 208,762 tokens).
 if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS}"
 fi
@@ -124,7 +178,16 @@ TOOL_ARGS=()
 # Array, not $( [ ] && echo ): the command substitution exits 1 when the test
 # is false, which under `set -e` killed this script silently (#59).
 METRICS_ARGS=()
-[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
+if [ "${REQ_METRICS:-0}" = 1 ]; then
+  # vLLM 0.29.0: per-request speculative-decoding acceptance metrics ride in the response under
+  # metrics.speculative_decoding (n == 1 only; the field is experimental, shape as of v0.29.0). summary
+  # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
+  # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
+  # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
+  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
+  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
+                --per-request-spec-decode-metrics "$SPEC_METRICS")
+fi
 
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
@@ -164,7 +227,7 @@ fi
 export PATH="$REPO/venv/bin:$PATH"
 # Off under WSL, where the VMM calls break Marlin repack — see the long note in
 # single-user/start_qwen.sh. Overridable both ways.
-if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+if [ "$WSL" = 1 ]; then
   ALLOC_DEFAULT=expandable_segments:False
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
@@ -179,6 +242,26 @@ case " ${EXTRA_ARGS:-} " in
   *"--kv-offloading-size"*|*"--kv-transfer-config"*)
     [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
     ALLOC_DEFAULT=expandable_segments:False ;;
+esac
+# vLLM's custom all-reduce exports its graph buffers over CUDA IPC
+# (`cudaIpcGetMemHandle`, csrc/custom_all_reduce.cuh:164) and an expandable
+# (VMM) segment has no handle to export, so at TP>1 with CUDA graphs capture
+# aborts with "Cuda error ... 'invalid argument'" and the worker dies before
+# the server is up (#163, 2x3090 NVLink). --disable-custom-all-reduce also
+# clears it by handing the collectives to NCCL, but that arm measured 6.4%
+# slower at C1 on the reporting box, so default the allocator off and keep
+# custom all-reduce. Skipped when the run already disables it or runs eager:
+# neither captures a graph buffer to export.
+case " ${EXTRA_ARGS:-} " in
+  *"--disable-custom-all-reduce"*|*"--enforce-eager"*) ;;
+  *"--tensor-parallel-size"*|*" -tp "*)
+    ALLOC_TP=$(printf %s " ${EXTRA_ARGS:-}" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
+    if [ "${ALLOC_TP:-1}" -gt 1 ] 2>/dev/null; then
+      if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ]; then
+        echo "tensor-parallel-size $ALLOC_TP: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (custom all-reduce cannot export a VMM graph buffer over CUDA IPC, #163; set it explicitly to override)"
+      fi
+      ALLOC_DEFAULT=expandable_segments:False
+    fi ;;
 esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);

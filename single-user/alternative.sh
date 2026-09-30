@@ -29,7 +29,16 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export PATH="$PWD/venv/bin:$PATH"
-export VLLM_API_KEY="$(cat api_key.txt)"
+# Same key precedence as the launchers (resolve_api_key.sh): exported
+# VLLM_API_KEY wins, api_key.txt is the file fallback, no key = keyless
+# boot like start_qwen.sh (previously: hardcoded `cat api_key.txt`).
+ALT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ALT_REPO="$(dirname "$ALT_DIR")"
+REPO="$ALT_REPO"   # resolve_vllm_key reads $REPO/api_key.txt; unset, the file fallback silently finds nothing and the server boots with no key
+# shellcheck disable=SC1091
+source "$ALT_REPO/resolve_api_key.sh" \
+  || { echo "[alternative] cannot source resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
+resolve_vllm_key
 export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
 # The multi-query 3D verify for the int4 cache (patches/spec-decode-int4-kv-mq3d.patch) was opt-in and nothing
 # set it, so this profile ran the stock 2D verify: on a 4090 at 120k, DFlash2 k=7, fresh prefill, decode 43.9 / 26.5 /
@@ -88,6 +97,24 @@ VISION_ARGS="--language-model-only"
 
 PREFIX_ARGS=""
 [ "$PREFIX_CACHE" = 1 ] && PREFIX_ARGS="--enable-prefix-caching --mamba-cache-mode align"
+# With the drafter on, pass the retention interval explicitly: 0.30's unset default is 0 (the replay
+# boundaries only), where 0.29 resolved it to dense (vllm #55760); start_qwen.sh has the measurement.
+# The default here depends on a KV tier (the connector check above): without one it is 0, because at dense two
+# ~60K conversations on this int4 pool evicted each other completely (0 / 0 cached where 0 held 93.5% for both);
+# with one it is None (dense), which the tier serves from (gotcha 60). PREFIX_RETENTION sets it (0 = boundaries
+# only, empty = dense); the flag in EXTRA_ARGS wins.
+if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
+  case " ${EXTRA_ARGS:-} " in
+    *"--prefix-cache-retention-interval"*) ;;
+    *)
+      case " ${EXTRA_ARGS:-} " in
+        *"--kv-offloading-size"*|*"--kv-transfer-config"*) R_DEFAULT=None ;;
+        *) R_DEFAULT=0 ;;
+      esac
+      if [ "${PREFIX_RETENTION+set}" = set ]; then R=${PREFIX_RETENTION:-None}; else R=$R_DEFAULT; fi
+      PREFIX_ARGS="$PREFIX_ARGS --prefix-cache-retention-interval $R" ;;
+  esac
+fi
 
 # Array, not $( ... || echo ... ): the fallback makes it errexit-safe, but an
 # unquoted expansion still word-splits; match SPEC_ARGS/METRICS_ARGS.
@@ -99,7 +126,16 @@ ASYNC_ARGS=(--no-async-scheduling)
 # Array, not $( [ ] && echo ): the command substitution exits 1 when the test
 # is false, which under `set -e` killed this script silently (#59).
 METRICS_ARGS=()
-[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
+if [ "${REQ_METRICS:-0}" = 1 ]; then
+  # vLLM 0.29.0: per-request speculative-decoding acceptance metrics ride in the response under
+  # metrics.speculative_decoding (n == 1 only; the field is experimental, shape as of v0.29.0). summary
+  # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
+  # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
+  # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
+  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
+  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
+                --per-request-spec-decode-metrics "$SPEC_METRICS")
+fi
 
 exec vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
