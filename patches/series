@@ -59,3 +59,6 @@ auth-deny-default.patch
 spec-attn-smem-fit.patch
 bench-sse-keepalive.patch
 sampler-warmup-cuda.patch
+pinned-kv-empty-cache.patch
+api-root-health.patch
+qwen3_5-embed-uva.patch

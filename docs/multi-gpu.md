@@ -123,6 +123,20 @@ NVLink**, 275 W):
   down to `SYS`, and vLLM's custom all-reduce faulted on that driver even at
   TP=2. Neither is reproducible on this repo's single-card box, so treat both as
   field reports, not as defaults — try TP first without them.
+- **With a P2P-patched consumer driver, NCCL usually will not use P2P until
+  you set `NCCL_P2P_LEVEL`, and the cause is wider than separate root ports.**
+  NCCL's default allows P2P only up to `PXB`, cards behind a PCIe switch.
+  Consumer boards put the cards on CPU root ports, which NCCL classes as `PHB`
+  or `SYS`, so it falls back to host shared memory even when every pair reports
+  peer access; the one exception built into NCCL 2.29 is two GPUs on an AMD
+  host. Boot once with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,P2P` and look
+  for `via P2P` or `via SHM`. If it says SHM, `NCCL_P2P_LEVEL=PHB` turns P2P on
+  for cards under one host bridge, and `SYS` across sockets. On 4x RTX 5060 Ti
+  at TP4 that gave 2-6% more decode at C1 and 10-16% at C4 with prefill
+  unchanged, because P2P cuts the latency of the small allreduces in each
+  decode step ([#254](https://github.com/syv-ai/HyperQwen/issues/254), one box;
+  the numbers are in [reproductions](reproductions/README.md)). When you A/B
+  P2P yourself, read the transport out of the log for each arm.
 
 ```bash
 NCCL_P2P_LEVEL=SYS SPEC=dflash2 PREFIX_CACHE=1 \
@@ -251,8 +265,8 @@ SPEC=mtp CTX=long EXTRA_ARGS="--tensor-parallel-size 2 --attention-backend TRITO
 Nothing in the repo sets `--pipeline-parallel-size`, and no profile is tested
 with it. One field report ([#160](https://github.com/syv-ai/HyperQwen/issues/160))
 measured it on vLLM 0.28.0, and it is worth knowing before you try: **PP=2 with
-`SPEC=off` works well, and PP=2 with MTP is a net loss.** It has not been re-run
-on 0.29 or 0.30, and it is one box.
+`SPEC=off` is healthy, and PP=2 with MTP is a net loss.** A later 0.29 re-run
+found PP=2 slower than TP=2 on fp8 KV as well (below). It is one box.
 
 Hardware: an RTX 3090 24 GB and an RTX A4000 16 GB, PCIe, no peer-to-peer.
 Serving: `--pipeline-parallel-size 2 --distributed-executor-backend mp`,
@@ -268,6 +282,45 @@ Greedy, 256-token generations, median of three:
 | PP=2 + `SPEC=off` | 32.9 | 61.4 | 55.6 | | 778,942 |
 | PP=2 + async + `SPEC=off` | 36.9 | 68.8 | **134.2** | | **844,852** |
 
+- **A current TP=2 baseline on the same two cards** (RTX 3090 + RTX A4000, no
+  peer-to-peer; reporter's follow-up, 2026-10). A vLLM 0.29-based recipe, MTP
+  k=4 with probabilistic draft sampling, `MAX_LEN=262144` per slot,
+  `MAX_SEQS=2`, FlashInfer attention with **fp8** KV (not the int4 KV of the
+  table above), 2048 batched tokens, prefix caching on: KV pool 342,065 tokens,
+  single stream about 54.6 tok/s, two streams 94.0 aggregate, TTFT about
+  111 ms, and 99-123 tok/s streaming decode across 16K-190K prompts once warm.
+  It has run in production for two weeks with no repetition or corruption, so
+  MTP's acceptance at TP=2 is normal and the collapse above is specific to
+  pipeline parallelism. The lower single-stream number against the 75.6 above
+  is most likely the different KV dtype and attention backend rather than a
+  regression: the fp8/FlashInfer path is the slow one on sm86 (see the 3090
+  rows in the reproductions page), though the report did not A/B it
+  ([#160](https://github.com/syv-ai/HyperQwen/issues/160)).
+- **PP=2 + `SPEC=off` on the 0.29 stack** (same cards, same reporter, fp8 KV,
+  FlashInfer, `VLLM_PP_LAYER_PARTITION=48,16`, 2048 batched tokens, async
+  scheduling on, `MAX_SEQS=2`; the only changes from the TP=2 baseline above are
+  `--pipeline-parallel-size 2` and no speculative config). It is healthy (a
+  long-prompt needle passes, no corruption) but slower than TP=2 + MTP on
+  every throughput row, and the pool advantage is small on fp8 KV:
+
+  | | TP=2 + MTP | PP=2 + `SPEC=off` |
+  |---|---|---|
+  | KV pool | 342,065 tokens | 405,773 (1.19x) |
+  | single stream | 52.9 tok/s | 39.1 (-26%) |
+  | 2 streams, aggregate | 95.0 | 74.2 (-22%) |
+  | TTFT (short) | 108 ms | 134 ms |
+  | prefill 33K | 19.9 s | 22.6 s |
+  | prefill 66K | 33.0 s | 30.4 s |
+
+  The 3.22x pool above was measured on the int4 KV stack, where the cost per
+  token is different, so it does not carry over to fp8 KV. Caveats from the
+  reporter: the 66K prefill rows are partly warm (the first 33K tokens are a
+  cached prefix from the preceding probe), the prefill rows are single samples,
+  and the TP=2 column has MTP on, with no TP=2 `SPEC=off` control. Both PP and
+  TP runs were at stock power limits (3090 350 W, A4000 140 W, its maximum); the
+  A4000's 7,001 MHz memory against the 3090's 9,751 MHz bounds bandwidth-bound
+  TP decode on that pair
+  ([#160](https://github.com/syv-ai/HyperQwen/issues/160)).
 - **PP=2 + MTP.** It only boots with a local patch: upstream's
   `_pp_broadcast_prev_sampled_token_ids` asserts one sampled token per request,
   which speculation breaks. With the patch, acceptance falls from 45.6% to about
@@ -286,9 +339,9 @@ Greedy, 256-token generations, median of three:
   581,403 (2.22x) at TP=2, a 32K prefill takes 15.9 s against 23.7 s at TP=2,
   and async scheduling with four slots reaches 134 tok/s aggregate.
 
-If you have two unequal cards and want the pool more than single-stream decode
-speed, `SPEC=off` is the combination to try (the fastest row above ran with
-async scheduling on). Do not combine PP with `SPEC=mtp`. The reporter's
+On the 0.28 int4-KV stack, PP=2 with `SPEC=off` was the way to get a large pool
+from two unequal cards; on 0.29 with fp8 KV, TP=2 with MTP was better on every
+row measured, so start there. Do not combine PP with `SPEC=mtp`. The reporter's
 TP=2 baseline was not confirmed to run at the same `MAX_LEN` and `MAX_SEQS` as
 the PP rows, and the two cards had different power limits (an A4000 is a 140 W
 part), which matters little for a PP comparison because the ranks run in turn.

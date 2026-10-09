@@ -99,6 +99,8 @@ fi
 source "$REPO/resolve_config.sh" \
   || { echo "start_qwen: cannot source $REPO/resolve_config.sh - refusing to boot unvalidated" >&2; exit 1; }
 resolve_effective_config single
+source "$REPO/launcher_common.sh" \
+  || { echo "start_qwen: cannot source $REPO/launcher_common.sh - refusing to boot" >&2; exit 1; }
 
 source "$REPO/single-user/select_model.sh"
 PORT=${PORT:-18020}
@@ -138,8 +140,7 @@ SSE_KEEP_ALIVE=${SSE_KEEP_ALIVE-30}   # no colon: SSE_KEEP_ALIVE= keeps the empt
 # codegen bug with the mixed set; use mlp or all.
 INT8_ACT=${INT8_ACT-}
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
-[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 # PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
 # layers during prefill (patches/prefill-attn-int8.patch): 1.27-1.35x FA2 on
 # the attention itself, worth up to ~+5% end-to-end at 51k on top of INT8_ACT
@@ -734,6 +735,12 @@ if [ "${VISION:-0}" = 1 ]; then
 else
   VISION_ARGS="--language-model-only"
 fi
+# EMBED_UVA=1 keeps the quantized token embedding in pinned host RAM, read through a CUDA UVA view
+# (patches/qwen3_5-embed-uva.patch, VLLM_EMBED_UVA). The freed VRAM goes to the KV pool: +15.7% tokens
+# (204,336 to 236,479) at SPEC=mtp CTX=long on a 3090 at PCIe 4.0 x16, decode and prefill unchanged, for
+# about 2.1 GiB of host RAM and 20 s of boot (#281). Off by default: a card with spare VRAM pays a PCIe
+# read per decode step for nothing, and a narrow slot is unmeasured.
+[ "${EMBED_UVA:-0}" = 1 ] && export VLLM_EMBED_UVA=1
 
 # fp16 activations do not work with the speculative path, and the way you find that out
 # is late and cryptic (#27): the split-KV verify kernel hardcodes tl.bfloat16 for the
@@ -817,11 +824,12 @@ esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
-source "$REPO/resolve_api_key.sh"
+source "$REPO/resolve_api_key.sh" \
+  || { echo "start_qwen: cannot source $REPO/resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
 resolve_vllm_key
 resolve_bind_host
 
-exec venv/bin/vllm serve "$MODEL" \
+qwen_exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
