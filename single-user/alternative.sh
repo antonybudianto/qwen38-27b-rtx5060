@@ -39,6 +39,7 @@ REPO="$ALT_REPO"   # resolve_vllm_key reads $REPO/api_key.txt; unset, the file f
 source "$ALT_REPO/resolve_api_key.sh" \
   || { echo "[alternative] cannot source resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
 resolve_vllm_key
+resolve_bind_host
 export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
 # The multi-query 3D verify for the int4 cache (patches/spec-decode-int4-kv-mq3d.patch) was opt-in and nothing
 # set it, so this profile ran the stock 2D verify: on a 4090 at 120k, DFlash2 k=7, fresh prefill, decode 43.9 / 26.5 /
@@ -139,7 +140,7 @@ fi
 
 exec vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \

@@ -25,16 +25,11 @@ COPY docker/requirements.txt docker/requirements.txt
 RUN venv/bin/pip install -r docker/requirements.txt
 
 COPY . .
-# Patch apply order lives in patches/series: a few patches carry hunk context
-# that an earlier patch adds, so the glob order of patches/*.patch is wrong.
+# patches/apply.sh reads the apply order from patches/series and applies it with --fuzz 0:
+# a few patches carry hunk context that an earlier patch adds, so the glob order of
+# patches/*.patch is wrong.
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
-    sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series | \
-    while IFS= read -r name; do \
-      case "$name" in \
-        dflash2-backport.patch) echo "== skip $name (DFlash2 is native since vLLM 0.28.0)"; continue ;; \
-      esac; \
-      echo "== $name"; patch -p1 --fuzz 0 --no-backup-if-mismatch -d "$SP" < "patches/$name"; \
-    done; \
+    bash patches/apply.sh "$SP"; \
     bash kvarn/install.sh; \
     bash verify.sh --install
 

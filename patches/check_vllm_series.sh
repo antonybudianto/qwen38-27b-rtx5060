@@ -5,11 +5,13 @@ set -euo pipefail
 #
 # Two passes, because two tools are in play and they answer different questions:
 #
-#   1. Every patch, in the order of patches/series (which the Dockerfile and
-#      the README use), applied with GNU `patch` -- the tool that actually
+#   1. Every patch, in the order of patches/series, then the three KVarN patches in
+#      kvarn/, applied by patches/apply.sh (which the Dockerfile, docs/install.md and
+#      kvarn/install.sh call) with GNU `patch` -- the tool that actually
 #      installs this stack. This is the pass that says "a clone of this repo
 #      still builds". It was missing entirely until 2026-09-07; the job checked
-#      five of thirty files.
+#      five of thirty files. The KVarN patches were checked only by the image
+#      build until 2026-09-30; they apply at exactly the point the series ends.
 #   2. The five DFlash patches whose order and hunk metadata are part of the
 #      0.28.0 contract, applied with `git apply`, which is strict about offsets
 #      and catches a hand-edited hunk header immediately.
@@ -33,47 +35,39 @@ GIT_ROOT=$(git -C "$VLLM_SOURCE" rev-parse --show-toplevel)
 PREFIX=${VLLM_SOURCE#"$GIT_ROOT"/}
 if [ "$PREFIX" = "$VLLM_SOURCE" ]; then PREFIX=.; fi
 
-# DFlash2 is native in 0.28.0; the backport patch is kept for older pins.
-SKIP=(dflash2-backport.patch)
+# patches/apply.sh owns the series: it reads the apply order, checks that it and the
+# patches/ directory agree exactly (exit 2 and each offender named, if not), and applies it.
+LIST=$(bash "$HERE/patches/apply.sh" --list)
+mapfile -t SERIES <<<"$LIST"
 
-# patches/series is the single source of truth for the apply order. It and the
-# directory must agree exactly: a patch absent from series is never applied by
-# the build, and one listed but missing is a typo.
-SERIES=()
-while IFS= read -r name; do
-  SERIES+=("$name")
-done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' "$HERE/patches/series")
-ON_DISK=$(for f in "$HERE"/patches/*.patch; do basename "$f"; done | sort)
-IN_SERIES=$(printf '%s\n' "${SERIES[@]}" | sort)
-[ "$ON_DISK" = "$IN_SERIES" ] || {
-  echo "ERROR: patches/series and the patches/ directory disagree:" >&2
-  comm -3 <(printf '%s\n' "$ON_DISK") <(printf '%s\n' "$IN_SERIES") | sed 's/^/    /' >&2
-  exit 1
-}
-
-echo "== pass 1: the whole series, GNU patch, patches/series order"
+echo "== pass 1: the whole series, GNU patch, patches/series order, then the KVarN patches"
 git -C "$GIT_ROOT" checkout -q -- . && git -C "$GIT_ROOT" clean -qfd
-# --fuzz 0: an offset means the context matched exactly and the file merely grew around it; fuzz means the
-# context did NOT match and GNU patch accepted an approximate anchor. The first is benign and reported, the
-# second is a patch cut against a tree that no longer exists, and it fails here instead of landing by guess
-# (the same flag is on the Dockerfile's apply loop, so the image cannot carry what this check would refuse).
-count=0; offset=0
-for name in "${SERIES[@]}"; do
-  for s in "${SKIP[@]}"; do [ "$name" = "$s" ] && continue 2; done
-  p="$HERE/patches/$name"
-  out=$(patch -p1 --forward --no-backup-if-mismatch --fuzz 0 -d "$VLLM_SOURCE" < "$p" 2>&1) || {
-    echo "FAILED: $name (a hunk's context does not exist in this tree; regenerate the patch against the pin)"
-    echo "$out" | sed 's/^/    /'; exit 1
-  }
-  n=$(printf '%s\n' "$out" | grep -c "offset" || true)
-  [ "$n" -gt 0 ] && { echo "   $name (applied, $n hunk(s) with an offset, context exact)"; offset=$((offset+1)); }
-  count=$((count+1))
-done
+# The apply policy (--fuzz 0: an offset is benign and reported, fuzz fails by name) is written
+# down in patches/apply.sh, next to the code it describes. The Dockerfile and the install pages
+# call the same file, so the image cannot carry what this check would refuse.
+out=$(bash "$HERE/patches/apply.sh" "$VLLM_SOURCE" 2>&1) || {
+  printf '%s\n' "$out" | sed 's/^/   /'; exit 1
+}
+printf '%s\n' "$out" | grep 'at an offset' | sed 's/^== /   /' || true
+count=$(printf '%s\n' "$out" | grep -c '^== ' || true)
+offset=$(printf '%s\n' "$out" | grep -c 'at an offset' || true)
 if git -C "$GIT_ROOT" diff --quiet; then
   echo "ERROR: the series applied but changed nothing -- the paths did not resolve." >&2
   exit 1
 fi
 echo "   $count patches applied with exact context, $offset of them at an offset, 0 with fuzz"
+# The KVarN patches are exported from the fork branch after the whole series, so they go on this tree.
+# On a pristine checkout every one must apply now; "already applied" here means the checkout is not pristine.
+kout=$(bash "$HERE/patches/apply.sh" --kvarn "$VLLM_SOURCE" 2>&1) || {
+  printf '%s\n' "$kout" | sed 's/^/   /'; exit 1
+}
+printf '%s\n' "$kout" | sed 's/^== /   kvarn: /'
+if printf '%s\n' "$kout" | grep -q 'already applied'; then
+  echo "ERROR: a KVarN patch reads as applied on a pristine checkout -- the checkout is not pristine." >&2
+  exit 1
+fi
+kcount=$(printf '%s\n' "$kout" | grep -c '^== ' || true)
+echo "   $kcount KVarN patches applied after the series; $((count + kcount)) in total"
 
 echo "== pass 2: the ordered DFlash patches, git apply --check"
 git -C "$GIT_ROOT" checkout -q -- . && git -C "$GIT_ROOT" clean -qfd

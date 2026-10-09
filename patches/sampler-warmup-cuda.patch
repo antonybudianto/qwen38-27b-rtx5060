@@ -1,0 +1,41 @@
+Register the V2 runner's top-k/top-p sampler JIT warmups on CUDA as well as ROCm. The V2 runner calls
+apply_top_k_top_p directly and never builds a TopKTopPSampler, whose __init__ is where these warmups register, so on
+0.30.0 the registry stays empty ("JIT kernel warmup finished in 0.00s"), and the new split top-p kernels
+(_topp_sb_stats, _topp_sb_step, _topp_sb_mask) and a _topk_topp specialization compile on the first sampled batch,
+on the request path.
+
+Measured on an RTX 3090, a cold cache volume per boot, sampled traffic at concurrency 1-16: without this, the
+default profile compiles 6 kernels in-request and DFlash2 k7 11, and the first sampled batch pays ~1.86 s (cold minus
+warm first TTFT, n=3). With it, 0 in-request compiles on both; the boot warmup takes 71 s (default) / 78 s (DFlash2
+k7) on a cold volume and ~0.2 s on a warm one.
+
+Backport of vllm-project/vllm@96e203b08e (#58092, Andreas Karatzas), which landed on vLLM main after v0.30.0. The
+nine added lines are upstream's, unchanged, placed at the same point of 0.30.0's sampler setup. vllm-project/vllm#58465
+then limited the registration to ROCm, because on CUDA every cold start pays for it (CI). This carries the registration
+without that gate: with a persistent cache volume the cost is paid once per volume. On 0.31 only the gate differs.
+
+Signed-off-by: Andreas Karatzas <akaratza@amd.com>
+Signed-off-by: Michael Stufflebeam <cpuchip@gmail.com>
+
+--- exported from cpuchip/vllm 92e7256fa (sampler-warmup-cuda); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 46acb1688..857b0d6d5 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -461,6 +461,15 @@
+ 
+         # Initialize samplers. Model states may override via custom_sampler().
+         if self.is_last_pp_rank and not self.is_pooling_model:
++            from vllm.v1.sample.ops.topk_topp_sampler import (
++                register_top_k_top_p_warmups,
++            )
++
++            # V2 bypasses TopKTopPSampler, which registers native warmups.
++            # CUDA also needs these for its FlashInfer fallback paths.
++            with self.jit_warmup_registry.activate():
++                register_top_k_top_p_warmups()
++
+             sampler_kwargs: dict[str, Any] = {
+                 "max_num_reqs": self.max_num_reqs,
+                 "vocab_size": self.vocab_size,

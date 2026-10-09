@@ -16,6 +16,10 @@ step pending, and the next run completes it, reusing a shard that already holds 
 packed embeddings (#195).
 
 Measured on an RTX 3090: another ~1.3 GB freed, round-trip error 0.56%.
+
+The config.json schema is checked before the first shard is read: a checkpoint
+these scripts cannot extend exits with one line and an untouched directory
+instead of a rewritten shard (#241).
 """
 
 import copy
@@ -27,12 +31,16 @@ from safetensors import safe_open
 from compressed_tensors.compressors.pack_quantized.base import pack_to_int32
 
 from atomic_publish import backup_once, save_tensors, write_json
+from quant_schema import load_config
 
 GROUP = 128
 BITS = 8
 QMAX = 127
 
 d = sys.argv[1].rstrip("/") + "/"
+# Before anything is read or written: a checkpoint these scripts cannot extend used to
+# fail on qc["ignore"] after the shard had already been replaced (#241).
+c, qc = load_config(d)
 
 idx = json.load(open(d + "model.safetensors.index.json"))
 wm = idx["weight_map"]
@@ -78,8 +86,6 @@ else:
     save_tensors(tensors, d + shard, meta or {"format": "pt"})
     del tensors
 
-c = json.load(open(d + "config.json"))
-qc = c["quantization_config"]
 g2 = copy.deepcopy(qc["config_groups"]["group_1"])
 g2["targets"] = ["re:.*embed_tokens$"]
 g2["weights"]["num_bits"] = BITS

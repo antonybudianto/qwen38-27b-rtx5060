@@ -1,7 +1,9 @@
 # Apply order for the vLLM patches, one basename per line.
 #
-# The Dockerfile, the README install loop, docs/python-314.md, verify.sh and
-# patches/check_vllm_series.sh all apply in THIS order, not glob order. A
+# patches/apply.sh reads this file and applies it in THIS order, not glob
+# order; the Dockerfile, docs/install.md and docs/python-314.md call it, and
+# verify.sh and patches/check_vllm_series.sh read the order from
+# `patches/apply.sh --list`. A
 # few patches carry hunk context that an earlier patch adds (e.g.
 # prefill-attn-int8.patch inserts before spec-decode-attn.patch's split-KV
 # block and carries its lines as context), so order is a hard requirement.
@@ -9,8 +11,8 @@
 #   - a new independent patch goes on the last line
 #   - a patch that must apply before an existing one is listed before it
 #
-# verify.sh and check_vllm_series.sh fail if this list and the directory
-# disagree in either direction.
+# `patches/apply.sh --list` exits 2, and names each offender, if this list and
+# the directory disagree in either direction; the apply refuses to start then.
 
 qwen3_5-embed-quant.patch
 marlin-int8-layer-select.patch
@@ -20,7 +22,6 @@ vllm-pr50021-gdn-spec-bounds.patch
 sampler-small-topk-fast-softmax.patch
 spec-decode-attn.patch
 speed-knobs-envs.patch
-dflash2-backport.patch
 hybrid-kv-groups-v2-cudagraph.patch
 dflash2-lookup-drafting.patch
 hybrid-sw-block-promote.patch
@@ -57,3 +58,4 @@ compile-key-runtime-knobs.patch
 auth-deny-default.patch
 spec-attn-smem-fit.patch
 bench-sse-keepalive.patch
+sampler-warmup-cuda.patch

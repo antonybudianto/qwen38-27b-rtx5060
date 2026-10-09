@@ -8,12 +8,16 @@ chat-template writers -- and quant_heads_stream.py. It kills the process after e
 write, once with the write complete and once with the file cut to its first half. After
 each kill one clean pass must complete, and every file, backups included, must match a
 run without a kill. That run must also leave each backup equal to the file as it was
-before its step.
+before its step. Finally (step `reject`) it runs each in-place script on a copy of the
+fixture whose config.json it cannot extend -- a native AutoRound export, no group_0, no
+ignore list -- and checks it exits non-zero with a message and leaves the copy identical,
+so an unsupported checkpoint is refused before the shard is replaced (#241).
 
   venv/bin/python bench/test_prepare_crash.py [step ...]   # CPU and Linux only, minutes
 
-Steps: lm_head embed mtp draft fast harden translate stream (default: all). The kill
-goes into the named steps only. Exit 0 when every case passes.
+Steps: lm_head embed mtp draft fast harden translate stream reject (default: all). The kill
+goes into the named steps only; reject has no kill and runs on its own. Exit 0 when every
+case passes.
 """
 import builtins
 import hashlib
@@ -31,7 +35,7 @@ from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[1]
 KILLED = 137
-STEPS = ("lm_head", "embed", "mtp", "draft", "fast", "harden", "translate", "stream")
+STEPS = ("lm_head", "embed", "mtp", "draft", "fast", "harden", "translate", "stream", "reject")
 BACKUPS = (".bak", ".bak_embed", ".bak-mtp", ".bak-quant", ".bak-draft", ".bak-orig")
 V, K = 512, 256  # vocab x hidden, multiples of the 128-wide quantization group
 MTP = {"mtp.fc": (K, 2 * K), "mtp.layers.0.mlp.down_proj": (K, 2 * K),
@@ -72,7 +76,8 @@ def build(root, prep, ids):
         w = {"num_bits": 4, "type": "int", "symmetric": sym, "group_size": 128, "strategy": "group"}
         if not sym:
             w["zp_dtype"] = "torch.int8"
-        dump({"quantization_config": {"config_groups": {"group_0": {"targets": ["Linear"], "weights": w}},
+        dump({"quantization_config": {"quant_method": "compressed-tensors", "format": "pack-quantized",
+                                      "config_groups": {"group_0": {"targets": ["Linear"], "weights": w}},
                                       "ignore": ["lm_head", *MTP]}}, f"{d}/config.json")
 
     base = f"{root}/base"
@@ -347,6 +352,66 @@ def check(ctx, name, run_pass, inject):
     return fails, cases
 
 
+# ---- unsupported checkpoints: refuse before the first write (#241) ----
+
+# config.json variants the in-place scripts cannot extend, and the phrase the refusal has
+# to name so the user can tell which one they hit.
+BAD_CONFIGS = (
+    ("autoround", "a native AutoRound export",
+     {"quant_method": "auto-round", "bits": 4, "group_size": 128, "sym": True, "data_type": "int"},
+     "quant_method is 'auto-round'"),
+    ("no-group0", "compressed-tensors, no config_groups.group_0",
+     {"quant_method": "compressed-tensors", "format": "pack-quantized", "ignore": ["lm_head"],
+      "config_groups": {}},
+     "no config_groups.group_0"),
+    ("no-ignore", "compressed-tensors, no ignore list",
+     {"quant_method": "compressed-tensors", "format": "pack-quantized",
+      "config_groups": {"group_0": {"targets": ["Linear"], "weights": {}}}},
+     "no 'ignore' list"),
+)
+
+
+def reject_case(ctx, key, d, script, qc, want):
+    """Run `script` on a copy of `d` whose config.json is `qc`. Return what is wrong, or []."""
+    root = f"{ctx.work}/reject-{key}"
+    shutil.copytree(d, root)
+    dump({"quantization_config": qc}, f"{root}/config.json")
+    before = snapshot(root)
+
+    def main():
+        sys.argv, sys.path[:0] = [script, root], [ctx.prep]
+        runpy.run_path(f"{ctx.prep}/{script}", run_name="__main__")
+
+    code, _ = fork(main, ctx.log)
+    log, after = open(ctx.log).read(), snapshot(root)
+    bad = []
+    if code == 0:
+        bad.append(f"exits 0 (want non-zero: {want})")
+    if want not in log:
+        bad.append(f"does not name the problem ({want!r} not in the output)")
+    diff = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+    if diff:
+        bad.append(f"wrote to {diff}")
+    return bad
+
+
+def reject(ctx):
+    """Every in-place script refuses an unsupported config before it touches the shard."""
+    cases = fails = 0
+    for script, d in (("quant_lm_head.py", f"{ctx.pristine}/base"),
+                      ("quant_embed.py", f"{ctx.pristine}/base"),
+                      ("quant_mtp.py", f"{ctx.pristine}/base"),
+                      ("quant_heads_stream.py", f"{ctx.pristine}/single")):
+        for key, what, qc, want in BAD_CONFIGS:
+            cases += 1
+            name = f"{script.removesuffix('.py').replace('quant_', '', 1)}/{what}"
+            bad = reject_case(ctx, f"{script}-{key}", d, script, qc, want)
+            print(f"{'FAIL  ' if bad else 'OK    '}{name}: "
+                  + ("; ".join(bad) if bad else "refused, nothing written"))
+            fails += bool(bad)
+    return fails, cases
+
+
 def main():
     steps = sys.argv[1:] or list(STEPS)
     if set(steps) - set(STEPS) or not hasattr(os, "fork"):
@@ -368,11 +433,15 @@ def main():
         shutil.copytree(REPO / "prepare", ctx.prep)
         if fork(lambda: build(ctx.pristine, ctx.prep, ctx.ids), ctx.log)[0]:
             sys.exit("fixture build failed:\n" + open(ctx.log).read())
-        for name, run_pass, own in (("prepare", prepare_pass, STEPS[:-1]), ("stream", stream_pass, STEPS[-1:])):
+        for name, run_pass, own in (("prepare", prepare_pass, STEPS[:-2]),
+                                    ("stream", stream_pass, ("stream",))):
             inject = [s for s in steps if s in own]
             if inject:
                 f, c = check(ctx, name, run_pass, inject)
                 fails, cases = fails + f, cases + c
+        if "reject" in steps:
+            f, c = reject(ctx)
+            fails, cases = fails + f, cases + c
     print(f"{cases} cases, {fails} failures")
     sys.exit(1 if fails else 0)
 

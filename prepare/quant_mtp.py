@@ -17,6 +17,10 @@ overwritten. Each file is written through prepare/atomic_publish.py (a temp file
 rename), and the index goes last: docker/prepare.sh's state() reads only the index, so
 a killed run leaves the step pending, and the next run completes it, reusing a shard
 that already holds the packed linears (#195).
+
+The config.json schema is checked before the first shard is read: a checkpoint
+these scripts cannot extend exits with one line and an untouched directory
+instead of a rewritten shard (#241).
 """
 
 import copy
@@ -28,6 +32,7 @@ from safetensors import safe_open
 from compressed_tensors.compressors.pack_quantized.base import pack_to_int32
 
 from atomic_publish import backup_once, save_tensors, write_json
+from quant_schema import load_config
 
 SUFFIXES = ("weight_packed", "weight_scale", "weight_shape")
 
@@ -46,6 +51,10 @@ MTP_LINEARS = ([] if KEEP_FC else ["mtp.fc"]) + [
 ]
 
 d = sys.argv[1].rstrip("/") + "/"
+# Before anything is read or written: a checkpoint these scripts cannot extend used to
+# fail on qc["ignore"] after the shard had already been replaced (#241).
+c, qc = load_config(d)
+
 idx = json.load(open(d + "model.safetensors.index.json"))
 wm = idx["weight_map"]
 shards = {wm[m + ".weight"] for m in MTP_LINEARS}
@@ -86,9 +95,7 @@ if changed:
     save_tensors(tensors, d + shard, meta or {"format": "pt"})
 del tensors
 
-c = json.load(open(d + "config.json"))
 backup_once(d + "config.json", ".bak-mtp")
-qc = c["quantization_config"]
 qc["ignore"] = [i for i in qc["ignore"] if i not in MTP_LINEARS]
 g = copy.deepcopy(qc["config_groups"]["group_0"])
 g["targets"] = ["re:^mtp\\.layers\\..*"] if KEEP_FC else ["re:^mtp\\..*"]

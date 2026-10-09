@@ -278,12 +278,12 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # API key: put it in api_key.txt in the repo root, or export VLLM_API_KEY.
 source "$REPO/resolve_api_key.sh"
 resolve_vllm_key
+resolve_bind_host
 
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.90 \
+  --host $BIND_HOST --port $PORT \
+  --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \

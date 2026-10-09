@@ -46,9 +46,9 @@ Port notes, for whoever bumps vLLM next:
   `supported_kv_cache_layouts = (LBNHC,)` and folds the runner's 4D view back into one
   tile per (block, head) at its two entry points (`_as_tile_view`, a `view`, so a wrong
   layout fails instead of copying). The old `attn_utils.py` strided-view hunk and the four
-  `kv_cache_utils.py` hunks are retired (their reasons are in the patch preambles); the
-  `kvarn-0.27.1.patch` and `kvarn-v2-runner.patch` files are the older ports, kept for
-  the diff history.
+  `kv_cache_utils.py` hunks are retired (their reasons are in the patch preambles). The
+  older ports (`kvarn-0.27.1.patch`, `kvarn-v2-runner.patch`) are removed from the tree;
+  git history keeps them.
 
 - 0.28.0's attention spec uses `cache_dtype_str="auto"` for specs whose
   `kv_quant_mode` is `NONE`; KVarN's shape depends on the preset, so the port

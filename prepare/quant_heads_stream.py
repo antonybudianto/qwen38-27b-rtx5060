@@ -32,6 +32,10 @@ Every file goes through prepare/atomic_publish.py (a temp file and a rename), an
 index is written last: docker/prepare.sh's state() reads only the index, so a killed run
 leaves the step pending, and the next run completes it, reusing a shard that already
 holds the packed tensors (#195).
+
+The config.json schema is checked before the first shard is read: a checkpoint
+these scripts cannot extend exits with one line and an untouched directory
+instead of a rewritten shard (#241).
 """
 
 import copy
@@ -45,6 +49,7 @@ from safetensors import safe_open
 from compressed_tensors.compressors.pack_quantized.base import pack_to_int32
 
 from atomic_publish import backup_once, publish, save_tensors, write_json
+from quant_schema import load_config
 
 GROUP = 128
 HEAD_BITS = 8
@@ -64,6 +69,9 @@ MTP_LINEARS = ([] if KEEP_FC else ["mtp.fc"]) + [
 ]
 
 d = sys.argv[1].rstrip("/") + "/"
+# Before the shards are streamed and rewritten: a checkpoint these scripts cannot extend
+# used to fail on qc["ignore"] after the shard had already been replaced (#241).
+c, qc = load_config(d)
 
 DTYPE_STR = {
     torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32",
@@ -266,9 +274,7 @@ for m in MTP_LINEARS:
 
 # ---- config.json ----
 cfg_path = d + "config.json"
-c = json.load(open(cfg_path))
 backup_once(cfg_path, ".bak-quant")
-qc = c["quantization_config"]
 
 
 def group(bits, targets):

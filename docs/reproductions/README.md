@@ -19,8 +19,14 @@ full reproductions; the list below collects the shorter reports from issues.
   maintainer's closing protocol past the 24-request boundary on main), plus the two
   boot-log lines the thread asked for and a 0.29.0 harness row
 - [a5000-230w.md](a5000-230w.md) — RTX A5000 24 GB (sm86) at a 230 W cap: the
-  1× batch profile, and the first 4× TP4 1M A/B (0.29 regresses vs 0.28,
-  reproduced over two days) — consolidates the #228 / #229 field reports
+  1× batch profile, the first 4× TP4 at 150k (0.28 and 0.29 tied within noise —
+  the 0.28→0.29 regression is 1M-specific) and at 1M (0.29 regresses −10 to
+  −22 %), the 24 GB mamba-align ceiling (~16–32k per single request) and the
+  cudagraph-64 capture OOM, plus a **0.30 follow-up: the 1M regression is
+  unchanged on vLLM 0.30, 1× stays GO** and a **TP=2 all-reduce-count test: TP2
+  is worse than TP4 (−22 to −34 % prefill, −53 % C8, grows with size) and cannot
+  hold 1M on 24 GB (~860k)** — so the regression is a 1M-profile effect, not an
+  all-reduce-count effect — consolidates the #228 / #229 field reports
 
 ## Results from other hardware
 
@@ -64,6 +70,7 @@ will not have in production.
 | CMP 170HX 64 GB unlocked (sm80) | 180 W pinned | **164.7 tok/s** | setup B (`SPEC=dflash2 CTX=fast`), greedy (155.3 at the default temperature), `tok/step` 3.38, vLLM 0.29.0 at da8a8e9, Docker. At the pin this is a power-capped number (see the note above), yet still 3090-class. Also the #72/#98 non-repro on this card, the stock-image positive control, and the boot-log lines from the thread: [cmp-170hx-64gb.md](cmp-170hx-64gb.md) | this write-up |
 | 2x RTX 3090 (TP=2), no NVLink, peer-to-peer by a patched driver | 420 W (uncapped) | 90.9 tok/s | setup D as shipped: greedy (80.5 at the default temperature), `tok/step` 2.73 / 2.53, GSM8K 0.950 over 200, vLLM 0.29 at 1cf8665. The same profile with `EXTRA_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"` reads **156.0** greedy (146.2 default) at the same `tok/step` 2.59 / 2.57, so the gap is the fp8/FlashInfer path's step time, not the drafter (~31 to ~18 ms per step). `SPEC=dflash2` on the same box, 170.6 greedy / 166.9 default at 3.40 / 3.41, GSM8K 0.960. Uncapped, so read it against other uncapped rows | [#217](https://github.com/syv-ai/HyperQwen/issues/217) |
 | 2x RTX 3080 20 GB (memory-modded, TP=2) | 220 W | 117.8 tok/s | `SPEC=dflash2 CTX=long` (int8 KV on `TRITON_ATTN`), greedy (114.8 at the default temperature), `tok/step` 3.28 / 3.25, GSM8K 0.970 over 200, on a third-party finetune (`ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound`) with the stock DFlash2 drafter. Native Fedora, Docker, vLLM 0.29 at 1cf8665. `CTX=fast` read 122.0 greedy in one indicative run | [#216](https://github.com/syv-ai/HyperQwen/issues/216) |
+| RTX 5090 (sm120, Blackwell) | 400 W | **212.8 tok/s** | setup E (`CTX=huge`), single, Docker compose on CachyOS, driver 615.71.09 / CUDA 13.4, main at d5e2a01 (vLLM 0.30). Greedy (204.9 at the default temperature), `tok/step` 3.34 / 3.28, GSM8K 0.960 over 200. The first Blackwell row and the first above 200 tok/s at C1. Cohort ladder, greedy decode aggregate: C2 383.9, C4 781.2, C8 1,609.7 tok/s (e2e 340.5 / 348.9 / 394.5); mean TTFT 69 ms at C1 and about 4.2 s at C4, 8.1 s at C8 (the C4/C8 TTFT is the prefill queue of a huge-context profile, not a stall). Power is 400 W, not 250 W, so it is a headroom number: read it against the uncapped rows and against the power note above, not against the 3090 at 250 W. The report does not say `SPEC`, `PREFIX_CACHE` or the attention backend, so those are the launcher defaults for setup E until the reporter says otherwise | [#247](https://github.com/syv-ai/HyperQwen/issues/247) |
 
 Batch profile (setup A), `bench/run_benchmarks.sh batch`, 64 concurrent on
 128 in / 512 out, aggregate decode:
@@ -157,6 +164,12 @@ other only loosely, and not rows for either table above:
   another request's mamba state), and four vLLM backports for evicted DFlash2
   conversations ([#208](https://github.com/syv-ai/HyperQwen/issues/208)). The
   "!!!!" fix is reworked in #222; the other seven are not in the series yet.
+  The reporter then tested #222 on 0.29 and on the 0.30 series: 0 NaN requests
+  with it on DFlash2 k=3 (320 replies, `bench/concurrent_collapse.py` 0 of 30,
+  544 pages dropped) and on the no-drafter config (480 replies, 262 pages
+  dropped). Without it, the no-drafter config still gave 1 NaN request in 480
+  on 0.29's V2 runner, much rarer than the ~0.8% of replies on 0.28's V1 runner,
+  and DFlash2 did not reproduce at all; why is not explained yet.
 - **2x RTX 3090, PCIe x8 without NVLink (TP=2)**: peer access through a
   community-patched driver lets vLLM's custom all-reduce run with the
   launcher's `expandable_segments:False` default. C1 greedy 207.5-211.9 tok/s

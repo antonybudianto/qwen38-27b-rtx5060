@@ -1,6 +1,6 @@
 # The patch series, one line each
 
-What every file in `patches/` (and `kvarn/`) is, where it came from, and what retires it. The Dockerfile applies
+What every file in `patches/` (and `kvarn/`) is, where it came from, and what retires it. `patches/apply.sh` applies
 them in the order of `patches/series` onto the installed vLLM wheel; `verify.sh` checks each one is in place. Kinds:
 
 - **backport**: a merged or open upstream change carried early. Retires when the pin carries it.
@@ -9,8 +9,8 @@ them in the order of `patches/series` onto the installed vLLM wheel; `verify.sh`
 - **local**: this hardware or environment (WSL2, sm80, a tuned build, env knobs). Stays.
 - **own**: a fix to a feature this repo introduced. Rides with that feature.
 
-Cut against: the pin the current hunks were generated on. Every file except the retired `dflash2-backport` is exported from its commit on one fork branch, `cpuchip/vllm` **`qwen38/0.30`** (v0.30.0 + one commit per row, in series order, subject `[qwen38] <topic>`; export point tagged `qwen38/0.30-cut5`, so a later rewrite of the branch never orphans a hash these files name), so the series applies to the 0.30.0 tree with exact context; the Dockerfile, `patches/check_vllm_series.sh`,
-`kvarn/install.sh` and `verify.sh` apply and check with `--fuzz 0`, and a hunk whose context has moved fails the
+Cut against: the pin the current hunks were generated on. Every file is exported from its commit on one fork branch, `cpuchip/vllm` **`qwen38/0.30`** (v0.30.0 + one commit per row, in series order, subject `[qwen38] <topic>`; export point tagged `qwen38/0.30-cut5`; this branch adds `sampler-warmup-cuda` on `qwen38/0.30-warmup`, tagged `qwen38/0.30-warmup-cut1`, so a later rewrite of the branch never orphans a hash these files name), so the series applies to the 0.30.0 tree with exact context; `patches/apply.sh` (which the Dockerfile and the install pages call),
+`patches/check_vllm_series.sh`, `kvarn/install.sh` and `verify.sh` apply and check with `--fuzz 0`, and a hunk whose context has moved fails the
 build by name instead of landing by guess. Regenerate a file with `bash scripts/export-patch.sh <fork checkout>
 <commit> patches/<topic>.patch`; do not edit the files by hand. A patch that reads an env knob registers it in
 `envs.py` in its own hunk (so the knob is in the torch.compile cache key), and reads it through `vllm.envs`.
@@ -20,7 +20,6 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | auth-deny-default | fix | --api-key guards every path except /health, /ping, /load and /version (deny by default). The old prefix list left /tokenize, /detokenize, /metrics and the docs open without the key. /metrics now needs the key: a scraper that cannot send it must use a separate listener, and the in-tree scrapes send it (bench-probe-errors). The allowlist ignores a trailing slash, so a probe on /health/ does not get a 401. Only a real CORS preflight (OPTIONS with Origin and Access-Control-Request-Method) skips the token; a bare OPTIONS needs it, because /metrics answers any method. The --api-key help text describes the allowlist | vllm #58028 | 0.30.0: cut against 0.29.0 and applies as cut (authenticate.py is unchanged; the cli_args.py help-text hunk lands at an offset) | upstream PR |
 | bench-probe-errors | fix | `vllm bench serve`'s /tokenize alignment probe sends the API key (Bearer from OPENAI_API_KEY, --header wins) and classifies its failure (404 route-or-name vs 401 vs unreachable vs timeout) instead of one "endpoint unavailable" line for every cause; the /metrics scrapes (`fetch_spec_decode_metrics`, `fetch_diffusion_metrics`) send the benchmark's headers too, so a keyed server no longer reports the spec-decode block as absent | vllm #58024 | 0.30.0 | upstream PR |
 | bench-sse-keepalive | fix | `vllm bench serve` no longer fails a request whose server sends an SSE keep-alive before the first token: the request functions stripped each network chunk, which deleted the blank line between SSE messages and glued the `: keep-alive` comment to every message after it. With the launchers' `--sse-keep-alive-interval 30`, that failed every prompt whose prefill took over 30 s (`run_benchmarks.sh --long` read zeros; #216 lost its 48k+ rows). The audio request function also skips SSE comments now | none yet | 0.30.0 | upstream PR |
-| dflash2-backport | backport, RETIRED | DFlash2 speculator on 0.27.1 | vllm #52816 (in 0.28.0) | 0.27.1 | done; kept for history, skipped by the Dockerfile |
 | dflash2-lookup-drafting | feature | lookup-augmented drafting for DFlash2 (n-gram search over the context) | none | 0.30.0 | upstreamed |
 | dflash2-ngram-chains | feature | quantized candidate chains for the drafter; `propose` override | none | 0.30.0 | upstreamed |
 | dflash2-prewarm | fix | compile every DFlash2 rung at boot instead of at first request | none yet | 0.30.0 | upstream PR |
@@ -41,6 +40,7 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | qwen3_5-embed-quant | fix | pass `quant_config` to the token embedding (main model and MTP module) | none yet | 0.30.0 | upstream PR |
 | qwen3_5-mtp-draft-vocab | feature | vocab-truncated draft head for MTP | none | 0.30.0 | upstreamed |
 | sampler-small-topk-fast-softmax | feature | sort-free top-k/top-p for small k, multi-block row softmax | none | 0.30.0: re-cut from the main-track resolution | upstreamed or superseded |
+| sampler-warmup-cuda | backport | registers the V2 runner's top-k/top-p sampler JIT warmups on CUDA too (vllm #58092 without #58465's ROCm-only gate): 0 in-request compiles, ~71-78 s of warmup once per cold cache volume, ~0.2 s warm | vllm #58092 (merged after 0.30.0) | 0.30.0 | the pin that carries #58092 with CUDA registration (upstream gates it to ROCm; an opt-in is the ask) |
 | spec-attn-smem-fit | fix | the split-KV verify attention sizes its KV tile to the device's shared memory: halve the KV tile when Triton reports OutOfResources, so it launches on Turing (sm75, 64 KB per block) | none | 0.30.0: hunk 1 (the import) re-placed by hand, hunks 2-4 at offset -1 | upstream with spec-decode-attn |
 | spec-decode-attn | feature | split-KV verify attention on FLASH_ATTN with query-row tiling | none | 0.30.0: main-track resolution, envs.py from the 0.29 line (#114), flash_attn.py hand-resolved against #55768 | upstreamed |
 | engine-completion-log | feature | one log line per completed engine step, so a stalled core is visible without scraping stats gaps | upstream PR (syv-ai #94/#110) | 0.30.0 | upstreamed |
@@ -68,6 +68,11 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 
 Retired at 0.30.0 and removed from the tree: `offload-mtp-serve` (vllm #52771, #52807 and #54288, all in 0.30.0) and `mamba-align-retire-null-gaps` (vllm #55450, in 0.30.0).
 
+Retired at 0.28.0 and removed from the tree later, with the older KVarN ports: `dflash2-backport` (the DFlash2
+speculator on 0.27.1, vllm #52816, native since 0.28.0; every apply site skipped it), `kvarn/kvarn-0.27.1.patch` and
+`kvarn/kvarn-v2-runner.patch` (the 0.27.1 KVarN ports; `kvarn/install.sh` applied neither). Git history keeps
+them.
+
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
 0.28.0; the `--sse-keep-alive-interval` flag is unchanged, so nothing that sets it needs to change).
@@ -80,4 +85,4 @@ this line's readers already go through `vllm.envs`, so applying it duplicates th
 and 0.29 shapes differ here by design.
 
 Two files still carry raw `diff -ruN` headers with timestamps instead of a preamble (`dflash2-z-adaptive-emitted`,
-`offload-wsl2-devptr`); their descriptions live in `docs/gotchas.md` and `docs/MR-DRAFT.md` until they get one.
+`offload-wsl2-devptr`); their descriptions live in `docs/gotchas.md` until they get one.

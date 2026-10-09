@@ -5,6 +5,13 @@ version: **nothing in this repo needs changing for 3.14.** One system package do
 
 [← back to the main README](../README.md)
 
+> **Status, 2026-09-30.** This page records a reproduction on vLLM 0.27.1. The repo now
+> pins vLLM 0.30.0, and the patch series is cut against 0.30.0, so the series does not apply
+> to 0.27.1. Nobody has re-run this page on 0.30.0 yet. vLLM 0.30.0 also publishes only
+> `cp38-abi3` wheels with `requires_python <3.15,>=3.10`, so the abi3 reasoning below can
+> still hold, but the torch and FlashInfer set for 0.30.0 is not checked on 3.14. Use the
+> steps and the numbers here as history until someone re-runs them.
+
 The README specifies Python 3.12, and the container freezes it there. That is a safe
 default rather than a hard requirement: vLLM 0.27.1 publishes an **abi3 wheel** (tagged
 `cp38`, `requires_python <3.15,>=3.10`) and torch 2.13 ships real `cp314` wheels, so
@@ -65,10 +72,7 @@ venv/bin/pip install 'vllm[bench]==0.27.1' huggingface_hub hf_transfer ninja \
   flashinfer-python flashinfer-cubin==0.6.13
 # model + requantization exactly as the README
 VP=$(venv/bin/python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')
-sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series |
-while IFS= read -r name; do
-  patch -p1 --no-backup-if-mismatch -d "$VP" < "patches/$name"
-done   # order: patches/series
+bash patches/apply.sh "$VP"   # the order is patches/series, with --fuzz 0
 bash verify.sh --no-server
 ```
 

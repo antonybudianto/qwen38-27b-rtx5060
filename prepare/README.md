@@ -6,6 +6,35 @@ fix that in place, on the CPU, once. They are the [Setup](../docs/install.md) st
 and `docker compose run --rm prepare` (see [docker/prepare.sh](../docker/prepare.sh))
 runs exactly them, each skipped when its result is already in the model dir.
 
+## Which checkpoints these scripts modify
+
+They **extend** a quantization config, they do not build or convert one: each reads
+`config.json`, clones `config_groups.group_0` and appends a group of its own (int8
+`lm_head`, int8 `embed_tokens`, int8/int4 `mtp.*`). The checkpoint they are pointed at
+therefore has to already be in **compressed-tensors `pack-quantized`** form.
+
+| what you have | what to do |
+|---|---|
+| the base W4A16 quant they were written for — `quant_method: "compressed-tensors"`, `ignore`, `config_groups.group_0` | run them, as below |
+| a checkpoint **already prepared** for HyperQwen (int8 heads + drafter) | none of `prepare/` — download it and start the server |
+| a **native AutoRound export** — `quant_method: "auto-round"`, `bits`/`group_size`/`sym`/`data_type` | not usable as it ships. It has no `group_0` and no `ignore` list to extend, so it has to be **converted** to compressed-tensors first; neither these scripts nor vLLM do that |
+| **single-shard or asymmetric AWQ** bodies | `quant_heads_stream.py`, see [A different checkpoint](#a-different-checkpoint) |
+
+The directory name is not a guide either way: the base checkpoint these scripts were
+written for is itself a compressed-tensors re-export that keeps `-AutoRound` in its name.
+Ask `config.json` instead:
+
+```bash
+python -c "import json,sys; q=json.load(open(sys.argv[1]))['quantization_config']; print(q.get('quant_method'), 'ignore' in q, sorted(q.get('config_groups', {})))" \
+  models/YOUR-MODEL/config.json
+# compressed-tensors True ['group_0']   -> these scripts work
+# auto-round False []                   -> convert it first; prepare/ cannot
+```
+
+Every in-place script runs that check before it opens a shard, and exits with one message
+if it does not match (`prepare/quant_schema.py`). A wrong checkpoint costs a second and
+writes nothing, instead of a `KeyError: 'ignore'` after the shard has been replaced (#241).
+
 Run from the repo root, in order — `quant_lm_head.py` first, because
 `build_draft_vocab.py` slices its rows:
 

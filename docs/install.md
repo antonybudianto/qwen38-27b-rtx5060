@@ -102,26 +102,21 @@ venv/bin/python prepare/fetch_dflash2.py
 venv/bin/python prepare/fetch_thirdparty.py
 venv/bin/python prepare/quant_heads_stream.py models/Qwen3.8-27B-Uncensored-W4A16
 
-# patch vllm (all compatible patches are written against 0.30.0; reapply after upgrades)
-# Order is patches/series, one basename per line: a few patches carry hunk context
-# that an earlier patch adds, so the glob order of the directory is wrong. A new
-# independent patch goes on the last line; one that must apply before an existing
-# patch is listed before it.
+# patch vllm (all compatible patches are written against 0.30.0; reapply after upgrades).
+# patches/apply.sh applies patches/series in order, with --fuzz 0, and stops at the first
+# patch that does not apply, by name. The order matters: a few patches carry hunk context
+# that an earlier patch adds. A new independent patch goes on the last line of
+# patches/series; one that must apply before an existing patch is listed before it.
 # the venv's own vllm directory: python3 -m venv names it after the interpreter (python3.12,
 # python3.14, ...), so ask the interpreter rather than spelling the path (verify.sh and
 # kvarn/install.sh find it the same way; tail -n1 because importing vllm can log to stdout)
 SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' 2>/dev/null | tail -n1)
-sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series |
-while IFS= read -r name; do
-  case "$name" in
-    dflash2-backport.patch) echo "skip $name (DFlash2 is native since vLLM 0.28.0)"; continue ;;
-  esac
-  patch -p1 --no-backup-if-mismatch -d "$SP" < "patches/$name"
-done
+bash patches/apply.sh "$SP"
 # optional: the KVarN 4/2-bit KV cache for 262k context (docs/long-context.md)
 bash kvarn/install.sh
 
-# api key — optional, but the server binds 0.0.0.0 and is open without one
+# api key — optional on one machine: with no key the launchers bind 127.0.0.1 only. To serve other
+# machines, set a key (they then bind 0.0.0.0) or set HOST explicitly.
 openssl rand -hex 24 > api_key.txt
 ```
 

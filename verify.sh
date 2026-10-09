@@ -73,17 +73,14 @@ echo "== vLLM patches (order: patches/series)"
 # order, but the earlier one's lines are no longer in the tree, so neither check
 # above can see it. The later patch declares "Supersedes: <basename>" in its header;
 # that only counts if the later patch is itself applied (#67 over #57).
-SERIES=()
-while IFS= read -r name; do
-  SERIES+=("$name")
-done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series)
-ON_DISK=$(for f in patches/*.patch; do basename "$f"; done | sort)
-IN_SERIES=$(printf '%s\n' "${SERIES[@]}" | sort)
-if [ "$ON_DISK" = "$IN_SERIES" ]; then
+# patches/apply.sh --list prints the series even when it and patches/ disagree, so the
+# checks below still run; the disagreement is a FAIL with each offender named.
+mapfile -t SERIES < <(bash patches/apply.sh --list 2>/dev/null)
+if LIST_ERR=$(bash patches/apply.sh --list 2>&1 >/dev/null); then
   ok "patches/series lists all ${#SERIES[@]} patches"
 else
   fail "patches/series out of sync with patches/ (a patch not in series is never applied):"
-  comm -3 <(printf '%s\n' "$ON_DISK") <(printf '%s\n' "$IN_SERIES") | sed 's/^/    /'
+  printf '%s\n' "$LIST_ERR" | sed '1d'
 fi
 superseded_by() {
   local target="$1" q
@@ -98,10 +95,6 @@ superseded_by() {
 # can no longer be reversed individually once both are applied; then look for their content.
 for name in "${SERIES[@]}"; do
   p="patches/$name"
-  if [ "$name" = "dflash2-backport.patch" ]; then
-    ok "dflash2-backport.patch retired (DFlash2 is native since vLLM 0.28.0)"
-    continue
-  fi
   if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < "$p" >/dev/null 2>&1; then ok "$name applied"
   elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$name applied (content check; hunks overlap another patch)"
   elif s=$(superseded_by "$name"); then ok "$name applied (superseded by $s, which is applied)"
@@ -117,13 +110,16 @@ if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
   if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-0.30.0.patch >/dev/null 2>&1; then
     $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null && ok "KVarN backend importable, patch applied (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
   else fail "KVarN modules present but kvarn-0.30.0.patch not applied (bash kvarn/install.sh)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.30.0.patch "$SP" >/dev/null 2>&1; then
+  # Exact, like the kvarn-0.30.0 check above: each KVarN patch reverses cleanly on its own in a fully
+  # installed tree. The content check (_check_applied.py) passes a tree that misses one hunk in a file
+  # whose other hunks carry most of the added lines, so it is not used here.
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-v2-runner-0.30.0.patch >/dev/null 2>&1; then
     ok "kvarn-v2-runner-0.30.0.patch applied (SPEC=dflash2 + CTX=huge available)"
-  else warn "kvarn-v2-runner-0.30.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-recycled-pages-0.30.0.patch "$SP" >/dev/null 2>&1 \
+  else warn "kvarn-v2-runner-0.30.0.patch not applied, or partly applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-recycled-pages-0.30.0.patch >/dev/null 2>&1 \
       && grep -q "def note_scheduled_blocks" "$SP/v1/attention/backends/kvarn_attn.py"; then
     ok "kvarn-recycled-pages-0.30.0.patch applied (no late KVarN flush into mamba state, #208)"
-  else warn "kvarn-recycled-pages-0.30.0.patch not applied: CTX=huge + PREFIX_CACHE=1 can print \"!!!!\" (#208; bash kvarn/install.sh)"; fi
+  else warn "kvarn-recycled-pages-0.30.0.patch not applied, or partly applied: CTX=huge + PREFIX_CACHE=1 can print \"!!!!\" (#208; bash kvarn/install.sh)"; fi
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
 if [ $INSTALL = 0 ]; then
@@ -324,9 +320,18 @@ else warn "no DFlash2 drafter (venv/bin/python prepare/fetch_dflash2.py; SPEC=df
 echo "== keys / units"
 # A key is optional: with neither api_key.txt nor VLLM_API_KEY the launchers export
 # nothing and vLLM serves unauthenticated, which is a fine way to run this locally.
-# Worth a WARN rather than silence only because both launchers bind 0.0.0.0.
-[ -s api_key.txt ] || [ -n "${VLLM_API_KEY:-}" ] && ok "API key configured (api_key.txt or VLLM_API_KEY)" \
-  || warn "no API key — the server will accept any request, and it listens on 0.0.0.0. Fine behind a firewall; otherwise: openssl rand -hex 24 > api_key.txt"
+# With no key the launchers bind 127.0.0.1 (resolve_bind_host in resolve_api_key.sh), so that is a WARN.
+# It is a FAIL only when the bind is explicitly set off loopback (HOST=0.0.0.0 and no key). A container
+# keeps 0.0.0.0 by default, so a keyless container is a WARN: the published port is what limits it.
+if [ -s api_key.txt ] || [ -n "${VLLM_API_KEY:-}" ]; then ok "API key configured (api_key.txt or VLLM_API_KEY)"
+else
+  case "${HOST:-}" in
+    "") if [ -f /.dockerenv ]; then warn "no API key — this container listens on 0.0.0.0, so the published port is open to whatever can reach it. Set VLLM_API_KEY (make keygen) or publish the port on 127.0.0.1 only"
+        else warn "no API key — the server binds 127.0.0.1 only, so other machines cannot reach it. To serve them: openssl rand -hex 24 > api_key.txt"; fi ;;
+    127.*|localhost|::1) warn "no API key — HOST=$HOST keeps the server on this machine" ;;
+    *) fail "no API key and HOST=$HOST: anything that can reach this port can use the server. openssl rand -hex 24 > api_key.txt, or unset HOST" ;;
+  esac
+fi
 if [ -f /.dockerenv ]; then :; elif systemctl --user is-active qwen-serving >/dev/null 2>&1; then ok "systemd user unit qwen-serving active"; else warn "qwen-serving unit not active (fine if you launch the scripts by hand)"; fi
 # VLLM_SKIP_MODEL_NAME_VALIDATION looks like a fix for model-name 404s, but it
 # disables the check on every endpoint (/v1/chat/completions included): a
