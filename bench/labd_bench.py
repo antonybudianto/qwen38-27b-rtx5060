@@ -23,10 +23,9 @@ import json
 import os
 import sys
 import time
-import urllib.request
 
-KEY = open(os.path.expanduser("~/qwen-serving/api_key.txt")).read().strip()
-BASE = "http://127.0.0.1:18020"
+import harness
+
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
 
@@ -37,17 +36,6 @@ def arg(name, default):
 CORPUS = os.path.expanduser(arg("--corpus", "~/bench/labd_corpus.txt"))
 CTX = int(arg("--ctx", 20000))
 MAXTOK = int(arg("--max-tokens", 512))
-
-
-def metrics():
-    req = urllib.request.Request(BASE + "/metrics", headers={"Authorization": "Bearer " + KEY})
-    d = {}
-    for line in urllib.request.urlopen(req).read().decode().splitlines():
-        for k in ("vllm:spec_decode_num_drafts_total", "vllm:spec_decode_num_accepted_tokens_total"):
-            if line.startswith(k + " ") or line.startswith(k + "{"):
-                d[k] = float(line.split()[-1])
-    return (d.get("vllm:spec_decode_num_drafts_total", 0.0),
-            d.get("vllm:spec_decode_num_accepted_tokens_total", 0.0))
 
 
 if not os.path.exists(CORPUS):
@@ -80,50 +68,34 @@ TASKS = [t for t in ALL_TASKS if not want or t[0] in want.split(",")]
 # Warm-up: the first long-block step JIT-compiles Triton kernels, and those seconds would
 # otherwise land inside the first task's decode window (worth 30% on it).
 for warm in (64, 64):
-    payload = {"model": "qwen3.8-27b",
-               "messages": [{"role": "user", "content": "Dokument:\n\n" + doc[:4000] +
+    payload = {"messages": [{"role": "user", "content": "Dokument:\n\n" + doc[:4000] +
                              "\n\nGengiv ordret de første 10 linjer af dokumentet."}],
                "max_tokens": warm, "temperature": 0,
                "chat_template_kwargs": {"enable_thinking": False}}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": "Bearer " + KEY})
-    urllib.request.urlopen(req, timeout=900).read()
+    harness.post("/v1/chat/completions", payload, timeout=900)
 
 tot = {"steps": 0.0, "acc": 0.0, "out": 0.0, "dec": 0.0}
 rows = []
 for name, q in TASKS:
-    payload = {"model": "qwen3.8-27b",
-               "messages": [{"role": "user", "content": "Dokument:\n\n" + doc + "\n\n" + q}],
+    payload = {"messages": [{"role": "user", "content": "Dokument:\n\n" + doc + "\n\n" + q}],
                "max_tokens": MAXTOK, "temperature": 0, "stream": True,
                "stream_options": {"include_usage": True},
                "chat_template_kwargs": {"enable_thinking": False}}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": "Bearer " + KEY})
-    d0, a0 = metrics()
+    d0, a0 = harness.spec()
     t0 = time.time()
     t_first = None
     n_chunks = 0
     usage = {}
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        for raw in r:
-            line = raw.decode().strip()
-            if not line.startswith("data: "):
-                continue
-            body = line[6:]
-            if body == "[DONE]":
-                break
-            ev = json.loads(body)
-            if ev.get("usage"):
-                usage = ev["usage"]
-            for ch in ev.get("choices", []):
-                if ch.get("delta", {}).get("content"):
-                    if t_first is None:
-                        t_first = time.time()
-                    n_chunks += 1
+    for ev in harness.stream("/v1/chat/completions", payload):
+        if ev.get("usage"):
+            usage = ev["usage"]
+        for ch in ev.get("choices", []):
+            if ch.get("delta", {}).get("content"):
+                if t_first is None:
+                    t_first = time.time()
+                n_chunks += 1
     t_end = time.time()
-    d1, a1 = metrics()
+    d1, a1 = harness.spec()
     steps = d1 - d0
     tps = 1 + (a1 - a0) / max(steps, 1)
     out = usage.get("completion_tokens", n_chunks)

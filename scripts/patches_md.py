@@ -10,8 +10,8 @@ Each file in patches/ and kvarn/ ends its preamble with one paragraph of headers
     Cut-against: 0.30.0
     Retires-when: upstream PR
 
-The headers come from the fork commit body, like the rest of the preamble, so change
-them there and re-export (scripts/export-patch.sh). The row order is the apply order,
+The headers live in the file's preamble: edit them there and run this script (a re-export
+with scripts/export-patch.sh keeps the preamble). The row order is the apply order,
 from `bash patches/apply.sh --list` and `--list --kvarn`. This script replaces the lines
 between the table markers in PATCHES.md. CI runs it, then `git diff --exit-code PATCHES.md`.
 

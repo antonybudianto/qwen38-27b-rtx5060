@@ -25,40 +25,23 @@ Usage:
 """
 import argparse
 import json
-import os
 import sys
 import time
-import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _key(path):  # same convention as quality_battery.py
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
-API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
-MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
+import harness
 
 # ~46 chars, ~11 tokens of filler per unit
 UNIT = "All work and no play makes Jack a dull boy. "
 
 
 def ask(messages, max_tokens=48):
-    body = json.dumps({
-        "model": MODEL, "messages": messages, "max_tokens": max_tokens,
+    payload = {
+        "messages": messages, "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
-    req = urllib.request.Request(
-        API + "/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    }
     t0 = time.time()
-    d = json.load(urllib.request.urlopen(req, timeout=1800))
+    d = harness.post("/v1/chat/completions", payload, timeout=1800)
     u = d["usage"]
     det = u.get("prompt_tokens_details") or {}
     return {"prompt": u["prompt_tokens"], "cached": det.get("cached_tokens", 0),

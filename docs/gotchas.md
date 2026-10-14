@@ -194,10 +194,11 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     of its pool or dies mid-request. `patches/hybrid-kv-groups-v2-cudagraph.patch`
     fixes the first two; for the third, pin the pool in bytes
     (`--kv-cache-memory`, what `KV_MEM` does) instead of tuning utilization. That
-    runner also answers `thinking_token_budget` with 400, and the first request
+    runner also answered `thinking_token_budget` with 400 (on vLLM 0.30 it enforces the budget instead), and the first request
     after a cold start JIT-compiles four Triton kernels (~5 s once; cached in
     `~/.triton`).
-16. **`INT8_LAYERS=.` needs `GPU_UTIL=0.95`.** Quantizing the activations of every linear
+16. **`INT8_LAYERS=.` needs a `GPU_UTIL` below 0.28's 0.972.** On 0.31 it runs at batch's default 0.94, where
+    the worst prefill step (64 new prompts in one step) clears by 134-176 MiB on a native 3090; do not raise it. Quantizing the activations of every linear
     layer (rather than just the MLP) is worth ~11% throughput — 1,042 vs 942 tok/s at 64
     concurrent — but the extra per-layer scratch no longer fits batch mode's 0.972: the
     engine dies with `torch.OutOfMemoryError` inside `chunk_fwd_o` once ~17 requests are
@@ -1359,7 +1360,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     fine. The knee scales with the pool (#174 found it at ~50-55K per side on a
     542K pool, and halving `--kv-cache-memory` halved it), so it is capacity, not
     a structural trigger. It is invisible in single-user benchmarks and is
-    exactly how a two-agent deployment runs. Fix: retain one snapshot in six
+    how two agents taking turns on one server run. Fix: retain one snapshot in six
     (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`, a CLI flag from 0.29 on), which the
     launcher now sets at `CTX=huge` with DFlash2 — 93-99.5% reuse on the same
     pair, no cost to a single long chat, and a reuse needle inside the restored
@@ -1387,13 +1388,20 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     | two ~32.6K chats alternating | **0%** (31.8 s) | 93% (2.7 s) | 93-99.5% |
 
     So the default trades a few seconds on each new conversation's early turns for
-    never losing a long one outright. The knob runs one way: a **smaller** interval
+    never losing a long one outright while conversations take turns. The knob runs one way: a **smaller** interval
     (`PREFIX_RETENTION`, any multiple of the block) gives finer early hits and
     less capacity before two long conversations collide; a **larger** one the
     reverse. Two blocks already halves the early-turn cost and still held the
     ~32.6K pair; where its collision knee sits is not measured, so a workload of
     many short-to-medium chats is the one to try it on, and one that keeps two
     or more long documents live should stay on the default.
+    **Turns, not concurrency.** The retained snapshots keep long conversations that
+    are advanced one request at a time; two whose requests are in flight together
+    still evict each other. On a native RTX 3090, pool 268,169, 7 drafts, retention
+    13056: two ~60K conversations taking turns reused 94.5% on turn 2 (56,576
+    tokens, 4.1 s), the same as one alone, on two fresh boots of 0.30.0; the same
+    two with both requests in flight reused anything in 1 of 20 conversations
+    across 0.30.0 and 0.31.0. Other intervals were not tried concurrently.
     One report from the other direction, on a different box
     ([#208](https://github.com/syv-ai/HyperQwen/issues/208), 2x3090 TP=2,
     DFlash2 k=3, so a 2048-token block, with its own client): at 32 streams of
@@ -1431,3 +1439,45 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `CTX=long` k=3, still below the full head's 80.6 there. The truncated head's
     win in the `CTX=fast` k=4 ladder has not been re-measured at `CTX=long`.
     DFlash2 does not use this list.
+
+    The list's per-script shortfall is measurable rather than described:
+    `prepare/build_draft_vocab.py <model> --ids prepare/draft_vocab_ids.json --stats`
+    prints it against your own checkpoint's tokenizer. On this one the 40,960 ids
+    hold 3 of 55,328 Han, 2 of 5,476 kana, 4 of 6,807 Hangul, 1 of 18,580 Cyrillic
+    -- 10 of 67,842 CJK rows, 0.0%. Those are row counts; #196's 5.4-8.0% is
+    token-weighted over running text, so it is the higher bound of the same gap.
+
+    A third option, beside the full head and a rebuild from scratch, is
+    `--add-scripts`: it writes a *variant* list -- the base ids unchanged and in
+    order, whole-UTF-8 rows of the named scripts appended, ranked by your corpus
+    and capped at `--script-budget` rows (default 16,384). The cap is the point: a
+    head row is 2,560 B on this checkpoint, so a complete CJK union is +168.8 MB
+    against +41.9 MB for the cap, and 2.6x the shipped head against 1.4x. At
+    16,384 rows over a small Chinese sample, Han coverage goes 0.0% -> 28.7%.
+    The shipped list and the default head are untouched; a variant is a second
+    run with `--ids`. Numbers and caveats: gotcha 61 above, and the
+    syv-ai/HyperQwen#196 thread.
+
+62. **A KV offload tier larger than `/dev/shm` allows fails at boot, and there
+    are two limits, not one: the tmpfs size and a per-user quota.** vLLM backs
+    the CPU tier (`KV_OFFLOAD_GB`, `--kv-offloading-size`) with a file,
+    `/dev/shm/vllm_offload_<engine_id>.mmap`, and pins all of it at boot
+    (36 GiB asked = a 38.65 GB file). A default `/dev/shm` is half the RAM, so
+    on a 64 GB host a tier past ~30 GiB does not fit until the tmpfs grows
+    (`/etc/fstab`: `tmpfs /dev/shm tmpfs defaults,nosuid,nodev,size=52G 0 0`,
+    then `mount -o remount /dev/shm`). Recent systemd also mounts it with
+    `usrquota` and gives each user 80% of the size (seen on Fedora 44,
+    systemd 259: `size=52G`, quota 42,599 MiB); a remount with a bigger size
+    does not raise the quota, and a `setquota` does not survive a reboot.
+    Over the quota the failure is not "no space" but an `EFAULT` from
+    `madvise` inside the region's constructor. Check both before sizing:
+    `df -h /dev/shm` and `quota -s -f /dev/shm`. The launchers warn when `df`
+    shows less room than the tier (`qwen_kv_offload_shm_check`), but `df`
+    cannot see the quota. Leave room for anything else in `/dev/shm`:
+    `--mm-processor-cache-type shm` puts the multimodal processor cache there
+    too.
+    On vLLM 0.31 the size also matters after boot: a tier that fills while a
+    long request is still running loses chunks its next lookup needs
+    (upstream #51787; the series' `vllm-pr61050-lru-running-prefix` keeps the
+    first chunks, `docs/vllm-0.31.md` has the numbers), so size it above
+    what it holds.

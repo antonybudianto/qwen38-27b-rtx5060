@@ -24,24 +24,10 @@ Usage:
 """
 import argparse
 import json
-import os
 import sys
 import time
-import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _key(path):  # same convention as quality_battery.py
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
-API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
-MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
+import harness
 
 WORDS = ("the scheduler interleaves prefill chunks with decode steps while a mamba "
          "state snapshot is materialised at the last prefill chunk boundary so the "
@@ -65,16 +51,13 @@ def make_doc(tokens, salt):
 
 
 def ask(messages, max_tokens=24):
-    body = json.dumps({
-        "model": MODEL, "messages": messages, "max_tokens": max_tokens,
+    payload = {
+        "messages": messages, "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
-    req = urllib.request.Request(
-        API + "/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    }
     t0 = time.time()
-    d = json.load(urllib.request.urlopen(req, timeout=1800))
+    d = harness.post("/v1/chat/completions", payload, timeout=1800)
     el = time.time() - t0
     u = d["usage"]
     det = u.get("prompt_tokens_details") or {}

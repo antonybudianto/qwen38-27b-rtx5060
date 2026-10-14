@@ -23,8 +23,11 @@ its exit code means. CI runs the ones that `.github/workflows/patch-integrity.ym
 
 Needs: **CPU** is Python 3 and its standard library. **torch** is a CPU torch wheel. **image**
 is the patched vLLM venv (the Docker image or `venv/`), with no GPU. **GPU** is the patched
-venv on a CUDA card. **server** is a running server on `PORT` (default 18020), with the key
-from `VLLM_API_KEY` or `api_key.txt`. **model** is the checkpoint under `models/`.
+venv on a CUDA card. **server** is a running server at `VLLM_API` (a trailing `/v1` is fine), else on
+`PORT` (default 18020), with the key from `OPENAI_API_KEY`, `VLLM_API_KEY` or `api_key.txt`, in that
+order (`bench/harness.py`). The model is `VLLM_MODEL` if set, else the server's own: the Python scripts name
+none, and the `.sh` scripts ask `/v1/models`. The `.sh` measurements take `PORT` and ignore `VLLM_API`;
+`run_benchmarks.sh` and `warmup.sh` also take `HOST`. **model** is the checkpoint under `models/`.
 
 | file | kind | needs | exit | what it does |
 |---|---|---|---|---|
@@ -35,6 +38,7 @@ from `VLLM_API_KEY` or `api_key.txt`. **model** is the checkpoint under `models/
 | `concurrent_collapse.py` | reproducer | server | 0, or 1 if a trial collapsed or a request errored | The "!!!!" collapse from #208. |
 | `demo/` | demo | Node | n/a | The canvas renderer for the README video. See `demo/README.md`. |
 | `demo_capture.py` | demo | server | 0 | Records one lane of the demo video: each token and the time it arrived. |
+| `harness.py` | library | CPU | n/a | How the scripts reach the server: the key, the URL, the model, the request, the stream and `/metrics`. For the bash scripts, `python3 bench/harness.py spec` prints the drafts and accepted-token counters and `model` the served name. |
 | `interleave_dose.py` | measurement | server | 0 | Prefix reuse against a dose of interleaved traffic, with the single-conversation control. |
 | `labd_accept.py` | measurement | server | 0, or 1 if the server ignores `return_tokens_as_token_ids` | Teacher-forced tokens per step for lookup-augmented drafting. |
 | `labd_bench.py` | measurement | server | 0 | Six long-context greedy tasks: decode speed and tokens per step. |
@@ -58,6 +62,7 @@ from `VLLM_API_KEY` or `api_key.txt`. **model** is the checkpoint under `models/
 | `seat_ttft.py` | measurement | server | 0, or 2 if every request failed | Cold and warm TTFT at N=1. |
 | `spec_attn_ctx_scan.py` | measurement | GPU | 0 | Verify attention cost against context length. |
 | `test_bench_sse_keepalive.py` | test | image | 0 or 1 | `vllm bench serve` against a server that sends an SSE keep-alive. |
+| `test_harness.py` | test | CPU, bash | 0 or 1 | `harness.py` against a stub server. Its key chain is checked against `resolve_api_key.sh`. |
 | `test_kvarn_recycled_pages.py` | test | image | 0 or 1 | KVarN's recycled-page drop (#208). |
 | `test_lookup_kernels.py` | kernel test | GPU | 0 or 1 | The LABD kernels against a Python reference. |
 | `test_marlin_int8_asym.py` | kernel test | GPU | 0 or 1 | Marlin W4A8-INT8 with zero points against W4A16. |
@@ -66,6 +71,7 @@ from `VLLM_API_KEY` or `api_key.txt`. **model** is the checkpoint under `models/
 | `test_prefill_attn_bigpool.py` | kernel test | GPU | 0 or 1 | int32 overflow in the int8 prefill kernel on a large pool (#86). |
 | `test_prepare_crash.py` | test | torch and the prepare stack | 0 or 1 | Crash injection for the model preparation scripts (#195). Cuts a heredoc out of `docker/prepare.sh`. |
 | `test_prepare_state.py` | test | CPU | 0 or 1 | `state()` in `docker/prepare.sh` on torn files (#195). Cuts a heredoc out of `docker/prepare.sh`. |
+| `test_quant_schema.py` | test | torch and the prepare stack | 0 or 1 | What `prepare/quant_schema.py` writes for every in-place quant script: the packed tensors and their scale dtype, the killed-run check, the index entries, the config group. |
 | `test_spec_decode_attn.py` | kernel test | GPU | 0 or 1 | The split-KV spec-decode attention against a reference. The timing rows are informational. |
 | `test_spec_decode_bigpool.py` | kernel test | GPU | 0 or 1. The fp8 part skips below sm89 or without the fp8 path. | int32 overflow in `_spec_attn_partial` on a large pool (#86). |
 | `test_spec_decode_fp8.py` | kernel test | GPU, sm89+ | 0 or 1. Skips below sm89 or without the fp8 path. | The fp8 path of the split-KV kernel. The timing rows are informational. |

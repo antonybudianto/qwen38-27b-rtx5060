@@ -77,7 +77,9 @@ Usage (on syv, against a server started with SPEC=dflash2):
                                        [--chunk 128] [--block 7]
                                        [--tasks copy,code,edit,quote,summary,qa]
                                        [--base http://127.0.0.1:18020] [--recapture]
-                                       [--keep-dirty]
+                                       [--keep-dirty] [--model NAME]
+
+--model sets VLLM_MODEL (bench/harness.py); without it the server's first model answers.
 """
 import glob
 import hashlib
@@ -86,9 +88,9 @@ import os
 import re
 import sys
 import time
-import urllib.request
 
-KEY = open(os.path.expanduser("~/qwen-serving/api_key.txt")).read().strip()
+import harness
+
 CORPUS = os.path.expanduser("~/bench/labd_corpus.txt")
 TARGETS = os.path.expanduser("~/bench/targets")
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
@@ -102,8 +104,10 @@ def flag(name):
     return name in sys.argv
 
 
-BASE = arg("--base", "http://127.0.0.1:18020")
-MODEL = arg("--model", "qwen3.8-27b")
+if flag("--base"):
+    os.environ["VLLM_API"] = arg("--base", "")
+if flag("--model"):
+    os.environ["VLLM_MODEL"] = arg("--model", "")
 CTX = int(arg("--ctx", 20000))
 MAXTOK = int(arg("--max-tokens", 512))
 CHUNK = int(arg("--chunk", 128))
@@ -116,30 +120,15 @@ PER_POS = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
 POS_RE = re.compile(r'position="(\d+)"')
 
 
-def post(path, payload, stream=False, timeout=1800):
-    req = urllib.request.Request(BASE + path, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": "Bearer " + KEY})
-    r = urllib.request.urlopen(req, timeout=timeout)
-    return r if stream else json.loads(r.read().decode())
-
-
 def metrics():
     """(drafts, draft_slots, accepted, {position: accepted}) summed over engines."""
-    req = urllib.request.Request(BASE + "/metrics", headers={"Authorization": "Bearer " + KEY})
     scal = {k: 0.0 for k in SCALARS}
     pos = {}
-    for line in urllib.request.urlopen(req).read().decode().splitlines():
-        if not line or line[0] == "#":
-            continue
-        # "name{labels} value" or "name value"; prometheus_client also emits _created lines,
-        # which fall through both branches below.
-        name = line.split("{", 1)[0].split(" ", 1)[0]
-        val = float(line.rsplit(" ", 1)[-1])
+    for name, labels, val in harness.samples():
         if name in scal:
             scal[name] += val
         elif name == PER_POS:
-            m = POS_RE.search(line)
+            m = POS_RE.search(labels)
             if m:
                 pos[int(m.group(1))] = pos.get(int(m.group(1)), 0.0) + val
     return (scal[SCALARS[0]], scal[SCALARS[1]], scal[SCALARS[2]], pos)
@@ -147,9 +136,9 @@ def metrics():
 
 def tokenize_chat(content):
     """The prompt token ids /v1/chat/completions would build for this message."""
-    r = post("/tokenize", {"model": MODEL, "messages": [{"role": "user", "content": content}],
-                           "add_generation_prompt": True,
-                           "chat_template_kwargs": {"enable_thinking": False}}, timeout=600)
+    r = harness.post("/tokenize", {"messages": [{"role": "user", "content": content}],
+                                   "add_generation_prompt": True,
+                                   "chat_template_kwargs": {"enable_thinking": False}}, timeout=600)
     return r["tokens"], r["max_model_len"]
 
 
@@ -165,28 +154,20 @@ def ids_from_logprobs(tokens):
 
 def generate(prompt_ids, max_tokens):
     """Stream a completion from raw prompt ids. -> (ids, ttft, decode_seconds, usage)."""
-    payload = {"model": MODEL, "prompt": prompt_ids, "max_tokens": max_tokens,
+    payload = {"prompt": prompt_ids, "max_tokens": max_tokens,
                "temperature": 0, "logprobs": 0, "return_tokens_as_token_ids": True,
                "stream": True, "stream_options": {"include_usage": True}}
     toks, usage, t_first = [], {}, None
     t0 = time.time()
-    with post("/v1/completions", payload, stream=True) as r:
-        for raw in r:
-            line = raw.decode().strip()
-            if not line.startswith("data: "):
-                continue
-            body = line[6:]
-            if body == "[DONE]":
-                break
-            ev = json.loads(body)
-            if ev.get("usage"):
-                usage = ev["usage"]
-            for ch in ev.get("choices", []):
-                lp = ch.get("logprobs") or {}
-                if lp.get("tokens"):
-                    if t_first is None:
-                        t_first = time.time()
-                    toks.extend(lp["tokens"])
+    for ev in harness.stream("/v1/completions", payload):
+        if ev.get("usage"):
+            usage = ev["usage"]
+        for ch in ev.get("choices", []):
+            lp = ch.get("logprobs") or {}
+            if lp.get("tokens"):
+                if t_first is None:
+                    t_first = time.time()
+                toks.extend(lp["tokens"])
     t_end = time.time()
     ids = ids_from_logprobs(toks)
     if ids is None:

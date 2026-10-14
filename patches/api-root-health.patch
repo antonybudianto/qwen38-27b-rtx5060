@@ -15,13 +15,13 @@ What: GET/HEAD /, /api/status, /api/experimental/model-recommendations, and /api
   requested model only, never a served name or path), reads context length from model_config.max_model_len,
   and adds the routes to UNGUARDED_PATHS
 Upstream: none yet
-Cut-against: 0.30.0
+Cut-against: 0.31.0
 Retires-when: upstream PR
 
---- exported from b258536b72 (api-root-health); regenerate with scripts/export-patch.sh, do not edit ---
+--- exported from 8aec733 (api-root-health); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/entrypoints/launchers/app.py b/entrypoints/launchers/app.py
-index ddea707810..069ac31f5d 100644
+index ddea707..5770be0 100644
 --- a/entrypoints/launchers/app.py
 +++ b/entrypoints/launchers/app.py
 @@ -1,9 +1,12 @@
@@ -142,10 +142,10 @@ index ddea707810..069ac31f5d 100644
  
      # Endpoint plugins are attached last so their routes are registered after all core
 diff --git a/entrypoints/serve/middleware/authenticate.py b/entrypoints/serve/middleware/authenticate.py
-index 5f3c2af30d..8f042e5c7d 100644
+index 7327529..71150c9 100644
 --- a/entrypoints/serve/middleware/authenticate.py
 +++ b/entrypoints/serve/middleware/authenticate.py
-@@ -9,12 +9,24 @@
+@@ -10,12 +10,24 @@
  from starlette.types import ASGIApp, Receive, Scope, Send
  
  # The paths that answer without the API key: the liveness and readiness

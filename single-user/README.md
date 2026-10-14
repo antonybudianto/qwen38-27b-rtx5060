@@ -19,8 +19,8 @@ Realistic chat prompts (8 mixed English/Danish/code tasks in
 [bench/prompts_real.jsonl](../bench/prompts_real.jsonl), 1,024-token answers),
 `vllm bench serve --dataset-name custom`, RTX 3090 at 250 W:
 
-> These are vLLM 0.27.1 baseline measurements, now three pins old. Re-benchmark on a
-> GPU after the v0.30.0 upgrade before using the figures for capacity planning.
+> These are vLLM 0.27.1 baseline measurements, now four pins old. Re-benchmark on a
+> GPU after the v0.31.0 upgrade before using the figures for capacity planning.
 
 Quote these against that harness. A client with a different output length is not
 measuring the same thing, and mixing the two is how
@@ -139,8 +139,9 @@ happens when the streams are big. Where it is *not* the better choice:
   114,224 at 15 — by moving to an `int8_per_token_head` cache on the Triton backend; it is
   worth it only for context reproduction, and `SPEC=mtp CTX=long` beats it about 2:1 on
   everything else. See [docs/long-context.md](../docs/long-context.md#dflash2-past-64k-specdflash2-ctxlong).
-- The V2 runner rejects the `thinking_token_budget` request parameter (HTTP
-  400); everything else we use (logprobs, prompt_logprobs, n, stop, seeds,
+- The V2 runner rejected the `thinking_token_budget` request parameter (HTTP
+  400) when this was written. On vLLM 0.30 it enforces it instead (2026-10-09, 3090:
+  15 reasoning tokens with a budget of 16, 62 without); everything else we use (logprobs, prompt_logprobs, n, stop, seeds,
   structured outputs, penalties, streaming, thinking) was checked
   (`bench/api_smoke.py`-style run, 12/12). Quality unchanged by construction
   (speculation is exact): perplexity 8.094, GSM8K 96.0% on the fast variant.
@@ -312,7 +313,7 @@ k=4 is the fastest but not the default: on the FlashInfer attention backend
 context fit) the vLLM 0.28.0 FlashInfer path dies with an illegal memory access as soon as one
 request finishes while another is mid-generation with 4 drafts (with or
 without our patches; the vendored PR #50021 bounds fix does not cure it;
-**measured on 0.28.0 and not re-verified on 0.29.0 or 0.30.0** -- the pin moved under this
+**measured on 0.28.0 and not re-verified on 0.29.0, 0.30.0 or 0.31.0** -- the pin moved under this
 paragraph, so treat k=4 on FlashInfer as unproven either way until someone re-runs it;
 club-3090 sees the same "n=4 eventually dies, n=3 stable" on their rigs, and
 vLLM has a family of open MTP illegal-memory-access reports on Qwen3.5/3.6,
@@ -432,9 +433,11 @@ included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
 | `GPU_UTIL` | 0.93 | soak-tested with a 100k prompt and 4×6k-token generations; batch mode's 0.972 OOMs in the MTP path (docs/gotchas.md, gotcha 4) |
 | `MTP_DRAFT_VOCAB` | 1 | set 0 to draft with the full lm_head (more acceptance, slower per draft); set 0 for Chinese or other traffic outside the list's English/Danish/code corpus (docs/gotchas.md 61) |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
+| `TOOL_STRICT` | parameter | vLLM 0.31's `--tool-strict-level`. `parameter` holds every tool call to the tool's argument schema, as 0.30 did; upstream's default `auto` does so only for tools that send `strict: true`, so a forced call to a tool with no parameters invented arguments (20 of 20 seeds) where 0.30 sent `{}`. `auto` restores upstream's default |
 | `VISION` | 0 | 1 keeps the vision tower instead of `--language-model-only` (0.858 GiB of BF16 weights on this checkpoint), for a client that sends images: one image per prompt and a 2048-image-token pixel cap, both overridable from `EXTRA_ARGS` |
 | `VISION_OFFLOAD` | 1 | with `VISION=1`, keeps the tower's weights in pinned host RAM and copies each module to the GPU for its own forward (`patches/vision-tower-cpu-offload.patch`). **On 24 GB, `SPEC=dflash2` + `VISION=1` does not boot with this off** — the tower is 0.85 GiB of the ~1.1 GiB transient margin, and graph capture OOMs allocating the 960 MiB split-KV verify buffer with 787 MiB free. With it on, the same config comes up at the full 69,758-token pool and reads images. Costs 296 → 333 ms of encode per 8192-patch image, output bit-exact. 0 only on a card with headroom to spare. `VLLM_VISION_CPU_OFFLOAD_GB` (default 1) is the budget in GiB |
 | `EMBED_UVA` | 0 | `1` keeps the quantized token embedding in pinned host RAM, read through a CUDA UVA view (`patches/qwen3_5-embed-uva.patch`). The freed VRAM goes to the KV pool: 204,336 to 236,479 tokens (+15.7%) at `SPEC=mtp CTX=long` on a 3090 at PCIe 4.0 x16, with decode (110 tok/s) and a 30k prefill unchanged, for about 2.1 GiB of host RAM and 20 s of boot. Skipped for tied embeddings. Unmeasured on a narrow slot or with TP>1 (#281). |
+| `KV_OFFLOAD_GB` | unset | N = a CPU tier of N GiB of pinned RAM behind the GPU prefix cache (`--kv-offloading-size N`, vLLM's OffloadingConnector): a prefix the GPU pool evicted comes back by a PCIe load instead of a recomputed prefill, and a preempted request resumes from it. Pinned in full at boot, in a file in `/dev/shm` that must fit there (gotcha 62). Size it in tokens, not GiB: a tier token costs ~2.3x a pool token under MTP because each block carries a recurrent-state snapshot (gotcha 38). Check it works on `/metrics`: `vllm:kv_offload_*_bytes_total` grow both ways. Measured with `PREFIX_CACHE=1` (align mode). On 0.31 size it above what it holds: a tier that fills while a request is still running loses chunks the next lookup needs (`docs/vllm-0.31.md`). An explicit flag in `EXTRA_ARGS` wins |
 | `REQ_METRICS` | 0 | 1 = `--enable-per-request-metrics --enable-force-include-usage`: per-request timing fields in every response and `usage` on every request, the fields llama-swap's dashboard reads ([#51](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/51)). `prompt_tokens_details.cached_tokens` is always on. Not compatible with `--disable-log-stats` in `EXTRA_ARGS`. On 0.29.0 it also passes `--per-request-spec-decode-metrics summary`, so each response carries `metrics.speculative_decoding` (mean acceptance length, draft acceptance rate, the step-by-draft-length histogram; upstream reports it for single-sequence requests only, `n == 1`; the field is experimental and its shape here is as of v0.29.0). `REQ_METRICS_DETAILED=1` selects `detailed`, which adds the ordered per-step accepted/proposed arrays; upstream says collecting them is not free, so keep it off in any profile you benchmark ([#66](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/66)) |
 | `WARMUP` | 0 | `qwen-server.sh` only: 1 = wait for `/health`, then run `bench/warmup.sh` (21-25 s) before serving (see "Post-boot serving warmup"). Advisory — a failed warmup logs and serves anyway. Not read by `start_qwen.sh` itself |
 | `SSE_KEEP_ALIVE` | 30 | seconds between SSE `: keep-alive` comment lines on a streaming response, so an idle stream survives a proxy read timeout during a long prefill (Bifrost's default is 120 s; a 90K cold prefill takes ~105 s and sends nothing until it finishes). `0` passes the interval vLLM reads as off; empty drops the flag entirely, which is what a vLLM tree without `patches/sse-keep-alive.patch` needs |

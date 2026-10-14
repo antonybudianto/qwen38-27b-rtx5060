@@ -36,15 +36,13 @@ the same cached prefix at once -- which is a likelier source of trouble than the
 worth ruling in or out with PREFIX_CACHE=0 before blaming the drafter.
 """
 
-import json
 import os
 import sys
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-KEY = open(os.path.expanduser("~/qwen-serving/api_key.txt")).read().strip()
-BASE = "http://127.0.0.1:18020"
+import harness
+
 CORPUS = os.path.expanduser("~/bench/labd_corpus.txt")
 
 
@@ -67,29 +65,13 @@ TASKS = [
 ]
 
 
-def metrics():
-    req = urllib.request.Request(BASE + "/metrics", headers={"Authorization": "Bearer " + KEY})
-    d = {}
-    for line in urllib.request.urlopen(req).read().decode().splitlines():
-        for k in ("vllm:spec_decode_num_drafts_total",
-                  "vllm:spec_decode_num_accepted_tokens_total"):
-            if line.startswith(k + " ") or line.startswith(k + "{"):
-                d[k] = float(line.split()[-1])
-    return (d.get("vllm:spec_decode_num_drafts_total", 0.0),
-            d.get("vllm:spec_decode_num_accepted_tokens_total", 0.0))
-
-
 def ask(task):
     name, q = task
-    payload = {"model": "qwen3.8-27b",
-               "messages": [{"role": "user", "content": "Dokument:\n\n" + doc + "\n\n" + q}],
+    payload = {"messages": [{"role": "user", "content": "Dokument:\n\n" + doc + "\n\n" + q}],
                "max_tokens": MAXTOK, "temperature": 0,
                "chat_template_kwargs": {"enable_thinking": False}}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": "Bearer " + KEY})
     t0 = time.time()
-    r = json.loads(urllib.request.urlopen(req, timeout=1800).read())
+    r = harness.post("/v1/chat/completions", payload, timeout=1800)
     return {"task": name, "wall": time.time() - t0,
             "tokens": r["usage"]["completion_tokens"],
             "text": r["choices"][0]["message"]["content"]}
@@ -102,7 +84,7 @@ print(f"  batch 1 copy: {alone['tokens']} tokens in {alone['wall']:.1f}s", flush
 bad = 0
 soft = 0
 first_round_copy = None
-d0, a0 = metrics()
+d0, a0 = harness.spec()
 t_end = time.time() + MINUTES * 60
 rnd = 0
 while rnd < ROUNDS or time.time() < t_end:
@@ -126,7 +108,7 @@ while rnd < ROUNDS or time.time() < t_end:
             bad += 1
         print(f"  round {rnd} {o['task']:8s} {o['tokens']:4d} tok {o['wall']:6.1f}s "
               f"{'ok' if ok else 'EMPTY'}{note}", flush=True)
-d1, a1 = metrics()
+d1, a1 = harness.spec()
 steps = d1 - d0
 print(f"soak: {rnd} rounds x {CONC} requests, tokens/step={1 + (a1 - a0) / max(steps, 1):.2f}, "
       f"{'OK' if not bad else str(bad) + ' PROBLEMS'}"

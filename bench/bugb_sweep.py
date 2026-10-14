@@ -20,36 +20,17 @@ five hand-picked lengths miss a 1-in-128 break 96% of the time.
 Exits 1 if any length is broken: judged against the neighbourhood when the sweep has five
 or more lengths, by the per-row flags when it has fewer.
 """
-import json, os, sys, urllib.request
+import os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__)); REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from verbatim import classify, median, prefix_match, repeats  # noqa: E402
+import harness  # noqa: E402
 
-
-def _key(path):  # a key is optional; keyless servers ignore the header
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(REPO, "api_key.txt"))
-BASE = "http://127.0.0.1:" + os.environ.get("PORT", "18020")
 DOC = open(os.path.expanduser(os.environ.get("CORPUS", "~/bench/labd_corpus.txt"))).read()
 
 from transformers import AutoTokenizer
 TOK = AutoTokenizer.from_pretrained(os.path.join(REPO, "models", "Qwen3.8-27B-W4A16-AutoRound-fast"))
-
-
-def metrics():
-    req = urllib.request.Request(BASE + "/metrics", headers={"Authorization": "Bearer " + KEY})
-    d = {}
-    for line in urllib.request.urlopen(req).read().decode().splitlines():
-        for k in ("vllm:spec_decode_num_drafts_total", "vllm:spec_decode_num_accepted_tokens_total"):
-            if line.startswith(k + " ") or line.startswith(k + "{"):
-                d[k] = float(line.split()[-1])
-    return d.get("vllm:spec_decode_num_drafts_total", 0.0), d.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
 
 
 print(f"{'ctx':>7} {'prompt tok':>11} {'mod128':>7} {'tok/step':>9} {'verbatim':>12} "
@@ -66,16 +47,12 @@ for ctx in [int(a) for a in sys.argv[1:]]:
     ptok = len(TOK.encode(TOK.apply_chat_template(
         [{"role": "user", "content": content}], tokenize=False,
         add_generation_prompt=True, enable_thinking=False), add_special_tokens=False))
-    body = json.dumps({"model": "qwen3.8-27b",
-                       "messages": [{"role": "user", "content": content}],
-                       "max_tokens": 400, "temperature": 0,
-                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    d0 = metrics()
-    r = json.loads(urllib.request.urlopen(urllib.request.Request(
-        BASE + "/v1/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}),
-        timeout=1200).read().decode())
-    d1 = metrics()
+    payload = {"messages": [{"role": "user", "content": content}],
+               "max_tokens": 400, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}}
+    d0 = harness.spec()
+    r = harness.post("/v1/chat/completions", payload, timeout=1200)
+    d1 = harness.spec()
     # `or ""`: a collapse-to-stop returns content=null, and indexing that raised a
     # TypeError that ended the sweep silently -- which is how the mtp failure stayed
     # invisible through several full runs (issue #25, mjungnickel18).

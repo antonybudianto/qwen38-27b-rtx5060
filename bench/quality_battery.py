@@ -22,28 +22,17 @@ implicated. Measured in #64 (gotcha 46).
 Usage: python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]
 """
 import json, os, sys, glob, re, math, time, random
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import pyarrow.parquet as pq
 
+import harness
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-def _key(path):  # a key is optional; keyless servers ignore the header
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
-API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
 # data dir: wikitext-2 test parquet, fineweb-2 dan_Latn test parquet, gsm8k test parquet (see README)
 Q = os.environ.get("QUALITY_DATA", os.path.join(HERE, "quality-data"))
 tag = sys.argv[1]
 ppl_only = "--ppl-only" in sys.argv; gsm_only = "--gsm-only" in sys.argv
 gsm_n = int(sys.argv[sys.argv.index("--gsm-n")+1]) if "--gsm-n" in sys.argv else 200
-
-def post(path, payload, timeout=1200):
-    req = urllib.request.Request(API+path, data=json.dumps(payload).encode(),
-        headers={"Content-Type":"application/json","Authorization":"Bearer "+KEY})
-    return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 def docs():
     out = []
@@ -67,7 +56,7 @@ def docs():
 
 def ppl_one(item):
     lang, text = item
-    r = post("/completions", {"model":"qwen3.8-27b","prompt":text,"max_tokens":1,"temperature":0,
+    r = harness.post("/v1/completions", {"prompt":text,"max_tokens":1,"temperature":0,
                               "prompt_logprobs":0,"echo":False})
     pl = r["choices"][0]["prompt_logprobs"]  # list; first is None
     lps = []
@@ -96,7 +85,7 @@ def extract_num(s):
 def gsm_one(row):
     q, a = row
     gold = a.split("####")[-1].strip().replace(",","")
-    r = post("/chat/completions", {"model":"qwen3.8-27b","messages":[{"role":"user","content":q+"\n\nSolve step by step, then give the final answer as 'Final answer: <number>'."}],
+    r = harness.post("/v1/chat/completions", {"messages":[{"role":"user","content":q+"\n\nSolve step by step, then give the final answer as 'Final answer: <number>'."}],
         "max_tokens":768,"temperature":0,"chat_template_kwargs":{"enable_thinking":False}})
     txt = r["choices"][0]["message"]["content"] or ""
     m = re.search(r"Final answer:\s*\**\s*\$?(-?[\d,]*\.?\d+)", txt)

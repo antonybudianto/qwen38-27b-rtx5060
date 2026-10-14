@@ -23,32 +23,18 @@ these scripts cannot extend exits with one line and an untouched directory
 instead of a rewritten shard (#241).
 """
 
-import copy
 import json
 import sys
 
 import torch
 from safetensors import safe_open
-from compressed_tensors.compressors.pack_quantized.base import pack_to_int32
 
 from atomic_publish import backup_once, save_tensors, write_json
-from quant_schema import load_config
+from quant_schema import GROUP, MTP_LINEARS, clone_group, index_packed, load_config, pack, packed_already
 
-SUFFIXES = ("weight_packed", "weight_scale", "weight_shape")
-
-GROUP = 128
 BITS = int(sys.argv[sys.argv.index("--bits") + 1]) if "--bits" in sys.argv else 8
-QMAX = 2 ** (BITS - 1) - 1
 KEEP_FC = "--keep-fc" in sys.argv
-MTP_LINEARS = ([] if KEEP_FC else ["mtp.fc"]) + [
-    "mtp.layers.0.mlp.down_proj",
-    "mtp.layers.0.mlp.gate_proj",
-    "mtp.layers.0.mlp.up_proj",
-    "mtp.layers.0.self_attn.q_proj",
-    "mtp.layers.0.self_attn.k_proj",
-    "mtp.layers.0.self_attn.v_proj",
-    "mtp.layers.0.self_attn.o_proj",
-]
+LINEARS = [m for m in MTP_LINEARS if not (KEEP_FC and m == "mtp.fc")]
 
 d = sys.argv[1].rstrip("/") + "/"
 # Before anything is read or written: a checkpoint these scripts cannot extend used to
@@ -57,7 +43,7 @@ c, qc = load_config(d)
 
 idx = json.load(open(d + "model.safetensors.index.json"))
 wm = idx["weight_map"]
-shards = {wm[m + ".weight"] for m in MTP_LINEARS}
+shards = {wm[m + ".weight"] for m in LINEARS}
 assert len(shards) == 1, f"mtp weights span several shards: {shards}"
 shard = shards.pop()
 print(f"mtp linears live in {shard}, quantizing to int{BITS} g{GROUP}")
@@ -69,25 +55,13 @@ with safe_open(d + shard, framework="pt") as f:
         tensors[k] = f.get_tensor(k)
 
 changed = False
-for m in MTP_LINEARS:
-    if m + ".weight" not in tensors:
-        # A killed run published the shard but not the index: finish that run.
-        if not all(f"{m}.{s}" in tensors for s in SUFFIXES):
-            sys.exit(f"{shard} holds neither {m}.weight nor its packed form; restore it from {shard}.bak-mtp")
-        print(f"  {m}: already packed in {shard} (completing an interrupted run)")
+for m in LINEARS:
+    if packed_already(tensors, m, shard, ".bak-mtp"):
         continue
-    w = tensors.pop(m + ".weight").to(torch.float32)
-    out_f, in_f = w.shape
-    assert in_f % GROUP == 0, (m, w.shape)
-    g = w.reshape(out_f, in_f // GROUP, GROUP)
-    scale = torch.clamp(g.abs().amax(dim=-1, keepdim=True) / QMAX, min=1e-10)
-    q = torch.clamp(torch.round(g / scale), -QMAX - 1, QMAX).to(torch.int8).reshape(out_f, in_f)
-    deq = (q.reshape(out_f, -1, GROUP).to(torch.float32) * scale).reshape(out_f, in_f)
-    err = ((deq - w).norm() / w.norm()).item()
+    w = tensors.pop(m + ".weight")
+    packed, err = pack(m, w, BITS, torch.float16)
     print(f"  {m}: {tuple(w.shape)} round-trip rel error {err:.4f}")
-    tensors[m + ".weight_packed"] = pack_to_int32(q, BITS, packed_dim=1).contiguous()
-    tensors[m + ".weight_scale"] = scale.squeeze(-1).to(torch.float16).contiguous()
-    tensors[m + ".weight_shape"] = torch.tensor([out_f, in_f], dtype=torch.int64)
+    tensors.update(packed)
     changed = True
 
 if changed:
@@ -96,22 +70,13 @@ if changed:
 del tensors
 
 backup_once(d + "config.json", ".bak-mtp")
-qc["ignore"] = [i for i in qc["ignore"] if i not in MTP_LINEARS]
-g = copy.deepcopy(qc["config_groups"]["group_0"])
-g["targets"] = ["re:^mtp\\.layers\\..*"] if KEEP_FC else ["re:^mtp\\..*"]
-g["weights"]["num_bits"] = BITS
-# the tensors written here are symmetric with no zero point, whatever the body
-# group declares (an AWQ body is asymmetric, #197), as in quant_heads_stream.py
-g["weights"]["symmetric"] = True
-g["weights"]["zp_dtype"] = None
-qc["config_groups"]["group_3"] = g
+qc["ignore"] = [i for i in qc["ignore"] if i not in LINEARS]
+clone_group(qc, "mtp-keep-fc" if KEEP_FC else "mtp", BITS)
 write_json(d + "config.json", c)
 
 # The index is the commit point, so it goes last.
 backup_once(d + "model.safetensors.index.json", ".bak-mtp")
-for m in MTP_LINEARS:
-    del wm[m + ".weight"]
-    for s in SUFFIXES:
-        wm[f"{m}.{s}"] = shard
+for m in LINEARS:
+    index_packed(wm, m, shard)
 write_json(d + "model.safetensors.index.json", idx)
 print("done")

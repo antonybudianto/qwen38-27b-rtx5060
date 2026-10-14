@@ -20,49 +20,29 @@ confident derailment on three different configurations; see bench/verbatim.py.
 
 Exits 1 if the final pass, against the whole neighbourhood, finds a broken residue.
 """
-import hashlib, json, os, re, sys, urllib.request
+import hashlib, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verbatim import classify, median, prefix_match, repeats  # noqa: E402
+import harness  # noqa: E402
 
 LABEL = sys.argv[1]
 START = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 COUNT = int(sys.argv[3]) if len(sys.argv) > 3 else 128
 HERE = os.path.dirname(os.path.abspath(__file__)); REPO = os.path.dirname(HERE)
 
-
-def _key(path):  # a key is optional; keyless servers ignore the header
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(REPO, "api_key.txt"))
-BASE = "http://127.0.0.1:" + os.environ.get("PORT", "18020")
 DOC = open(os.path.expanduser(os.environ.get("CORPUS", "~/bench/labd_corpus.txt"))).read()[:72000]
 from transformers import AutoTokenizer  # noqa: E402
 TOK = AutoTokenizer.from_pretrained(os.path.join(REPO, "models", "Qwen3.8-27B-W4A16-AutoRound-fast"))
 
 
-def metrics():
-    txt = urllib.request.urlopen(urllib.request.Request(
-        BASE + "/metrics", headers={"Authorization": "Bearer " + KEY}), timeout=30).read().decode()
-    g = lambda n: sum(float(x) for x in re.findall(
-        rf"^{re.escape(n)}\{{[^}}]*}} ([0-9.e+]+)$", txt, re.M)) or 0.0
-    return g("vllm:spec_decode_num_drafts_total"), g("vllm:spec_decode_num_accepted_tokens_total")
-
-
 def once(content):
-    body = json.dumps({"model": "qwen3.8-27b", "messages": [{"role": "user", "content": content}],
-                       "max_tokens": 300, "temperature": 0,
-                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    d0 = metrics()
-    r = json.loads(urllib.request.urlopen(urllib.request.Request(
-        BASE + "/v1/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}),
-        timeout=1800).read().decode())
-    d1 = metrics()
+    payload = {"messages": [{"role": "user", "content": content}],
+               "max_tokens": 300, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}}
+    d0 = harness.spec()
+    r = harness.post("/v1/chat/completions", payload, timeout=1800)
+    d1 = harness.spec()
     # `or ""`: a collapse-to-stop returns content=null, and indexing that ended an
     # earlier sweep with a TypeError instead of a finding.
     ans = r["choices"][0]["message"].get("content") or ""

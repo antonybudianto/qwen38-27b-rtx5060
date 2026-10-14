@@ -38,21 +38,10 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
+
+import harness
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _key(path):  # same convention as quality_battery.py
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
-API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
-MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
 UNIT = os.environ.get("HQ_UNIT", "")
 
 LOG = []
@@ -72,12 +61,11 @@ def engine_block():
     except Exception:  # noqa: BLE001
         pass
     try:
-        base = API[: -len("/v1")] if API.endswith("/v1") else API
-        req = urllib.request.Request(base + "/metrics",
-                                     headers={"Authorization": "Bearer " + KEY})
-        text = urllib.request.urlopen(req, timeout=30).read().decode()
-        m = re.search(r'^vllm:cache_config_info\{[^}]*\bblock_size="(\d+)"', text, re.M)
-        return int(m.group(1)) if m else None
+        for name, labels, _ in harness.samples():
+            if name == "vllm:cache_config_info":
+                m = re.search(r'\bblock_size="(\d+)"', labels)
+                return int(m.group(1)) if m else None
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -90,16 +78,13 @@ def healthy_floor(prev_prompt, block):
 
 
 def call(messages, max_tokens=24):
-    body = json.dumps({
-        "model": MODEL, "messages": messages, "max_tokens": max_tokens,
+    payload = {
+        "messages": messages, "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
-    req = urllib.request.Request(
-        API + "/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    }
     t0 = time.time()
-    d = json.load(urllib.request.urlopen(req, timeout=1800))
+    d = harness.post("/v1/chat/completions", payload, timeout=1800)
     el = time.time() - t0
     u = d["usage"]
     det = u.get("prompt_tokens_details") or {}
@@ -151,7 +136,7 @@ def _engine_pid():
                     return pid
             except Exception:  # noqa: BLE001
                 pass
-    port = API.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[-1]
+    port = harness.base_url().split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[-1]
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
