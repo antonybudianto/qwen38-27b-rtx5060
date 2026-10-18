@@ -186,8 +186,12 @@ sampled every 250 ms, and our N=4 run lasts 1.70× longer than fermion's on the 
 budget, so it gets 1.70× the draws at catching the same transient. **A peak-of-poll compared
 across runs of different duration is structurally biased upward on the slower machine.**
 Compare `preempt` and tail-mode onset instead: discrete, duration-invariant, and they matched
-exactly. Separately, `conc_ladder.py:245` puts `int(time.time())` inside every prompt salt, so
-token counts differ per box, per run, per rep by design.
+exactly. Separately, `conc_ladder.py` puts `int(time.time())` inside every prompt salt by
+default, so token counts differ per box, per run, per rep by design, and two boots decode
+different prompts. Acceptance depends on the prompt: one cross-boot A/B read +10% per-stream
+at N=1, all of it tok/step at flat ms/pass, from the salt alone. A cross-boot comparison runs
+both arms with the same `--salt S` and pairs them by `(n, rep)` from the JSON's `reps`, not by
+the printed best-of-reps row.
 
 ## `VLLM_DFLASH2_LOOKUP`, and how to measure an env toggle at all
 

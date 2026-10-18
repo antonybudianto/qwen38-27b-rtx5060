@@ -34,7 +34,7 @@ none, and the `.sh` scripts ask `/v1/models`. The `.sh` measurements take `PORT`
 | `act_calib.py` | measurement | GPU, model | 0 | Error that int8 activations add to each linear layer. Picks `INT8_LAYERS`. |
 | `api_smoke.py` | smoke test, run by hand | server | 0 if all 12 features pass, 2 if no request reaches a server, else 1 | Request-level API features: logprobs, n, stop, seeds, structured output, penalties, streaming, thinking. |
 | `bugb_sweep.py` | reproducer | server, model | 0, or 1 if a length is broken | The prompt lengths you give, against the broken-length defect (gotcha 37). |
-| `conc_ladder.py` | measurement | server | 0 | Decode tok/s per stream at N=1..8, with passes, preemptions and KV occupancy. |
+| `conc_ladder.py` | measurement | server | 0 | Decode tok/s per stream at N=1..8, with passes, preemptions and KV occupancy. `--salt S` fixes the prompts across boots for an A/B. |
 | `concurrent_collapse.py` | reproducer | server | 0, or 1 if a trial collapsed or a request errored | The "!!!!" collapse from #208. |
 | `demo/` | demo | Node | n/a | The canvas renderer for the README video. See `demo/README.md`. |
 | `demo_capture.py` | demo | server | 0 | Records one lane of the demo video: each token and the time it arrived. |
@@ -62,7 +62,9 @@ none, and the `.sh` scripts ask `/v1/models`. The `.sh` measurements take `PORT`
 | `seat_ttft.py` | measurement | server | 0, or 2 if every request failed | Cold and warm TTFT at N=1. |
 | `spec_attn_ctx_scan.py` | measurement | GPU | 0 | Verify attention cost against context length. |
 | `test_bench_sse_keepalive.py` | test | image | 0 or 1 | `vllm bench serve` against a server that sends an SSE keep-alive. |
+| `test_conc_ladder_salt.py` | test | CPU | 0 or 1 | `conc_ladder.py --salt` against a stub server: the same prompts on a second run, and the prefix-cache hit reported. |
 | `test_harness.py` | test | CPU, bash | 0 or 1 | `harness.py` against a stub server. Its key chain is checked against `resolve_api_key.sh`. |
+| `test_kv_cache_seat_budget.py` | test | image | 0 or 1 | The KV cache seat budget line (`kv-cache-seat-budget.patch`) against five measured boots, with vLLM's own spec classes. |
 | `test_kvarn_recycled_pages.py` | test | image | 0 or 1 | KVarN's recycled-page drop (#208). |
 | `test_lookup_kernels.py` | kernel test | GPU | 0 or 1 | The LABD kernels against a Python reference. |
 | `test_marlin_int8_asym.py` | kernel test | GPU | 0 or 1 | Marlin W4A8-INT8 with zero points against W4A16. |

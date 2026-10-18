@@ -92,6 +92,10 @@ if [ -z "${CUDA_HOME:-}" ]; then
   done
 fi
 
+source "$REPO/launcher_common.sh" \
+  || { echo "start_qwen: cannot source $REPO/launcher_common.sh - refusing to boot" >&2; exit 1; }
+qwen_normalize_extra_args
+
 # Backlog 6 / F13: one validated resolver — refuses unknown CTX/SPEC, warns on
 # ignored (KV) and EXTRA_ARGS-shadowed controls, prints the redacted effective
 # config. Refusal exits here, before anything boots. The launcher does not run
@@ -99,11 +103,10 @@ fi
 source "$REPO/resolve_config.sh" \
   || { echo "start_qwen: cannot source $REPO/resolve_config.sh - refusing to boot unvalidated" >&2; exit 1; }
 resolve_effective_config single
-source "$REPO/launcher_common.sh" \
-  || { echo "start_qwen: cannot source $REPO/launcher_common.sh - refusing to boot" >&2; exit 1; }
 qwen_check_bool_knobs
 # KV_OFFLOAD_GB=N: the CPU KV tier as a flag, ahead of everything below that reads EXTRA_ARGS.
 qwen_kv_offload_args
+qwen_prefix_cache
 qwen_kv_offload_shm_check
 
 source "$REPO/single-user/select_model.sh"
@@ -217,9 +220,10 @@ if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # patches/spec-decode-int8-kv.patch lets the split-KV verify kernel read the quantized
   # cache (vLLM's own Triton attention will not split KV for a multi-query verify, which
   # is every step here, and costs 7.4 ms per layer at 128k against this kernel's 1.3).
-  # Costs prefill: 251 s to load a 112k document against FLASH_ATTN's ~112 s. With
-  # PREFIX_CACHE=1 only the first turn pays it (5.9 s afterwards), which is why this is a
-  # mode for a RAG or coding front-end that loads a document once, not for general chat.
+  # Costs prefill: 251 s to load a 112k document against FLASH_ATTN's ~112 s. With prefix
+  # caching on (PREFIX_CACHE=1, the default) only the first turn pays it (5.9 s afterwards),
+  # which is why this is a mode for a RAG or coding front-end that loads a document once,
+  # not for general chat.
   ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"
   export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-1}
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
@@ -231,16 +235,6 @@ elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" != "fast" ]; then
   echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k) and CTX=huge (KVarN, 240k; kvarn/install.sh); CTX=$CTX keeps SPEC=mtp" >&2
   SPEC=mtp
-fi
-# gotcha 51 / #64: KVarN + MTP + prefix caching, all three, corrupts prompt_logprobs --
-# perplexity reads ~23% high and some requests 400 with a NaN. Reproduced on two
-# machines, and the clean value agrees to 0.03% across both. Ordinary generation is not
-# implicated, so this warns rather than refuses.
-if [ "$SPEC" = "mtp" ] && [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
-  echo "WARNING: CTX=huge + SPEC=mtp + PREFIX_CACHE=1 returns corrupt prompt_logprobs (#64," >&2
-  echo "  gotcha 51): perplexity ~23% high, some requests 400 with a NaN. Generation is fine." >&2
-  echo "  For quality measurement use SPEC=dflash2 or PREFIX_CACHE=0. SPEC=dflash2 is also" >&2
-  echo "  faster on this profile: 113.9 against 69.6 tok/s at 245k context, measured in #64." >&2
 fi
 if [ "$SPEC" = "dflash2" ]; then
   if [ -z "$DRAFT" ]; then
@@ -305,8 +299,8 @@ if [ "$SPEC" = "dflash2" ]; then
   # series, above the adaptive path's own 14.29 cold. Root cause still open; this is a
   # correct and fast setting, not a workaround with a cost.
   if [ -z "${LOOKUP_ADAPTIVE:-}" ] && [ "$VLLM_DFLASH2_LOOKUP" = "1" ] && [ "$DRAFT_TOKENS" -gt 7 ] \
-     && [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
-    echo "DFLASH_TOKENS>7 + CTX=huge + PREFIX_CACHE=1: pinning the verify block to" >&2
+     && [ "$CTX" = "huge" ] && [ "$PREFIX_CACHE_ON" = 1 ]; then
+    echo "DFLASH_TOKENS>7 + CTX=huge + prefix caching: pinning the verify block to" >&2
     echo "$((DRAFT_TOKENS + 1)) tokens (VLLM_DFLASH2_LOOKUP_ADAPTIVE=0). The adaptive length" >&2
     echo "corrupts the second turn over a shared prefix on the KVarN cache; pinned is both" >&2
     echo "correct and faster. LOOKUP_ADAPTIVE=1 asks for the adaptive path anyway." >&2
@@ -332,11 +326,7 @@ if [ "$SPEC" = "dflash2" ]; then
   # 2. DFLASH_TOKENS>7 relies on the lookup lane filling the verify tail; at
   #    TP=2 the one datapoint so far (#40) shows the tail accepting nothing and
   #    the wider block costing -27% at C1. Until that is diagnosed, warn.
-  TP_SIZE=1
-  case " ${EXTRA_ARGS:-} " in *"-tensor-parallel-size"*|*" -tp "*)
-    TP_SIZE=$(printf %s " $EXTRA_ARGS" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
-    TP_SIZE=${TP_SIZE:-1}
-  ;; esac
+  TP_SIZE=$(qwen_tp_size)
   if [ "$TP_SIZE" -gt 1 ]; then
     if [ -z "${KV_MEM+x}" ]; then
       echo "[start_qwen] tensor-parallel-size $TP_SIZE: skipping the single-card KV_MEM" \
@@ -447,20 +437,67 @@ if [ "$SPEC" = "dflash2" ]; then
   # bigger batches run piecewise instead of captured: slower, alive. Set CG explicitly to
   # override.
   CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1)))}
-  # Seats are admissions, not residency. Every RESIDENT request needs 1+k recurrent-state
-  # slots out of the same pool before it stores one token of context: 0.88 GiB at
-  # DFLASH_TOKENS=7 and 1.66 GiB at 15 (gotcha 33), i.e. ~0.098 GiB per (k+2), which the
-  # ramp in bench/conc_ladder.py confirms live (15.8% of the CTX=fast pool per request,
-  # six resident, the seventh preempted). Print what the pool can actually hold so nobody
-  # reads MAX_SEQS as a concurrency setting -- raising it past this queues, and once the
-  # pool is full it preempts and recomputes.
-  if [ -n "$KV_MEM" ]; then
-    RESIDENT=$(( KV_MEM / ((DRAFT_TOKENS + 2) * 104988089) ))
-    [ "$RESIDENT" -lt 1 ] && RESIDENT=1
-    if [ "$MAX_SEQS" -gt "$RESIDENT" ]; then
-      echo "[start_qwen] note: the pinned pool holds about $RESIDENT resident requests at" \
-           "DFLASH_TOKENS=$DRAFT_TOKENS (state pages), fewer with long prompts;" \
-           "MAX_SEQS=$MAX_SEQS admits more than that and the rest queue."
+  # Seats are admissions, not residency. A resident request takes recurrent-state pages out of the
+  # KV pool before it stores a token of context, so the pool holds fewer requests than MAX_SEQS
+  # admits: the rest queue, and once the pool is full the engine preempts and recomputes. Print
+  # how many it holds.
+  #
+  # The engine's geometry is deterministic, so it is computed here, not fitted:
+  #   - one GDN layer's state is conv (10,240 channels x (kernel 4 - 1 + k) x bf16) plus SSM
+  #     (48 x 128 x 128 x the --mamba-ssm-cache-dtype width);
+  #   - vLLM raises the attention block until one layer's attention page covers that state:
+  #     16 * ceil(state / (16 * attention bytes per token)) (vllm/platforms/interface.py);
+  #   - one pool page is 8 layers (the hybrid-kv-groups group size) at that block, in the widest
+  #     per-token layout -- the drafter's sliding-window layers on int8 (2,112 B against 2,080);
+  #   - a request holds 6 GDN groups x (2 + k) state pages (align mode), plus 2 full-attention
+  #     groups x ceil(ctx / block) pages of context. vLLM 0.31.0 turns prefix caching on, and
+  #     with it align mode, by default for this model whether or not PREFIX_CACHE=1 adds the flags
+  #     ("Mamba cache mode is set to 'align' ... by default when prefix caching is enabled"), so
+  #     PREFIX_CACHE=0 measured the same 54 pages at k=7 as PREFIX_CACHE=1.
+  # bench/test_resident_print.sh checks this against eight measured boots: block and pool exact,
+  # resident counts inside the ~1k range, exact at 61k, and exact at 32k where it was measured.
+  # At ~1k the engine charges fewer attention pages than the formula (none on int8), which is
+  # why that end is a range. Unmeasured setups print nothing: KV dtypes other than bf16 and
+  # int8_per_token_head, a wider SSM state, an explicit --block-size, TP or PP > 1 (each rank
+  # holds a share of the heads or layers), a MAX_LEN that is not a plain decimal token count
+  # (vLLM also takes 64k or auto), a Mamba cache mode other than align or prefix caching switched
+  # off in EXTRA_ARGS (never booted here), and other model shapes.
+  RESIDENT_OK=1
+  RESIDENT_ARGS=" $ATTN_ARGS ${EXTRA_ARGS:-} "
+  RESIDENT_KV=$(printf %s "$RESIDENT_ARGS" | sed -En 's/.* --kv-cache-dtype[= ]([^ ]+) .*/\1/p')
+  RESIDENT_SSM=$(printf %s " --mamba-ssm-cache-dtype float16$RESIDENT_ARGS" | sed -En 's/.* --mamba-ssm-cache-dtype[= ]([^ ]+) .*/\1/p')
+  case "$RESIDENT_KV" in
+    bfloat16|auto|"")    RESIDENT_TGT=4096; RESIDENT_DFT=4096 ;;
+    int8_per_token_head) RESIDENT_TGT=2080; RESIDENT_DFT=2112 ;;
+    *)                   RESIDENT_OK=0 ;;
+  esac
+  case "$RESIDENT_SSM" in float16|bfloat16) RESIDENT_SSM_B=2 ;; *) RESIDENT_OK=0 ;; esac
+  case "$RESIDENT_ARGS" in *" --block-size"*) RESIDENT_OK=0 ;; esac
+  case "$MAX_LEN" in ""|*[!0-9]*|0*) RESIDENT_OK=0 ;; esac
+  [ "$TP_SIZE" = 1 ] || RESIDENT_OK=0
+  RESIDENT_PP=$(printf %s "$RESIDENT_ARGS" | sed -En 's/.* (--pipeline-parallel-size|-pp)[= ]([0-9]+) .*/\2/p')
+  case "${RESIDENT_PP:-1}" in 1) ;; *) RESIDENT_OK=0 ;; esac
+  [ -n "$KV_MEM" ] || RESIDENT_OK=0
+  RESIDENT_MODE=$(printf %s "$RESIDENT_ARGS" | sed -En 's/.* --mamba-cache-mode[= ]([^ ]+) .*/\1/p')
+  case "$RESIDENT_MODE" in ""|align) ;; *) RESIDENT_OK=0 ;; esac
+  case "$RESIDENT_ARGS" in *" --no-enable-prefix-caching "*) RESIDENT_OK=0 ;; esac
+  RESIDENT_PER_GROUP=$(( DRAFT_TOKENS + 2 ))
+  if [ "$RESIDENT_OK" = 1 ]; then
+    RESIDENT_STATE_B=$(( 20480 * (3 + DRAFT_TOKENS) + 48 * 128 * 128 * RESIDENT_SSM_B ))
+    RESIDENT_BLOCK=$(( 16 * ((RESIDENT_STATE_B + 16 * RESIDENT_TGT - 1) / (16 * RESIDENT_TGT)) ))
+    RESIDENT_PAGE=$(( 8 * RESIDENT_BLOCK * (RESIDENT_DFT > RESIDENT_TGT ? RESIDENT_DFT : RESIDENT_TGT) ))
+    RESIDENT_POOL=$(( KV_MEM / RESIDENT_PAGE ))
+    RESIDENT_STATE=$(( 6 * RESIDENT_PER_GROUP ))
+    # One page of the pool is the engine's null block, hence POOL - 1.
+    RESIDENT_HI=$(( (RESIDENT_POOL - 1) / RESIDENT_STATE ))
+    RESIDENT_LO=$(( (RESIDENT_POOL - 1) / (RESIDENT_STATE + 2 * ((1024 + RESIDENT_BLOCK - 1) / RESIDENT_BLOCK)) ))
+    RESIDENT_LEN=$(( (RESIDENT_POOL - 1) / (RESIDENT_STATE + 2 * ((MAX_LEN + RESIDENT_BLOCK - 1) / RESIDENT_BLOCK)) ))
+    if [ "$MAX_SEQS" -gt "$RESIDENT_HI" ]; then
+      if [ "$RESIDENT_LO" -eq "$RESIDENT_HI" ]; then RESIDENT_RANGE="$RESIDENT_HI"; else RESIDENT_RANGE="$RESIDENT_LO to $RESIDENT_HI"; fi
+      echo "[start_qwen] note: the pool holds about $RESIDENT_RANGE resident requests on ~1k-token prompts" \
+           "and $RESIDENT_LEN at MAX_LEN=$MAX_LEN -- $RESIDENT_POOL pages of $RESIDENT_BLOCK tokens, and each" \
+           "request reserves $RESIDENT_STATE of them for recurrent state at DFLASH_TOKENS=$DRAFT_TOKENS before" \
+           "any context. MAX_SEQS=$MAX_SEQS admits more than that and the rest queue."
     fi
   fi
   # Above ~12 seats at CTX=huge the seats stop being merely useless and become fatal, and
@@ -514,15 +551,35 @@ fi
 # pool"). It used to be passed inside the dflash2 branch alone, so SPEC=mtp and SPEC=off
 # ignored an exported KV_MEM without a word (#68, #210).
 [ -n "${KV_MEM:-}" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
+# DYNAMIC_K: on the reference 3090 at SPEC=dflash2 DFLASH_TOKENS=7, [[1,3,7],[4,512,3]] lifted decode at 4
+# streams +7.7%, +8.0% and +9.2% in three A/Bs, single-stream within 1%. It buys step time, not seats: the recurrent-state
+# pages are reserved for num_speculative_tokens, not the k a step runs at, so only a lower DFLASH_TOKENS buys
+# residents. Refused at CTX=huge with prefix caching on: a k that moves with the batch size is a verify length that
+# changes step to step, which the VLLM_DFLASH2_LOOKUP_ADAPTIVE comment above shows corrupts a prefix-cache hit.
+if [ -n "${DYNAMIC_K:-}" ]; then
+  if [ -z "$SPEC_CFG" ]; then
+    echo "[start_qwen] DYNAMIC_K ignored: SPEC=$SPEC has no speculative decoding to schedule." >&2
+  elif [ "$CTX" = "huge" ] && [ "$PREFIX_CACHE_ON" = 1 ]; then
+    echo "DYNAMIC_K refused at CTX=huge with prefix caching on: a per-batch-size k changes the verify length when the" >&2
+    echo "  batch crosses a range, which corrupts a prefix-cache hit on the KVarN cache (see the" >&2
+    echo "  VLLM_DFLASH2_LOOKUP_ADAPTIVE comment in single-user/start_qwen.sh). Unset DYNAMIC_K, or set PREFIX_CACHE=0." >&2
+    exit 1
+  else
+    SPEC_CFG="${SPEC_CFG%\}},\"num_speculative_tokens_per_batch_size\":$DYNAMIC_K}"
+  fi
+fi
 SPEC_ARGS=()
 [ -n "$SPEC_CFG" ] && SPEC_ARGS=(--speculative-config "$SPEC_CFG")
 
-# PREFIX_CACHE=1: reuse the KV of a shared prompt prefix across requests, and resume the
-# recurrent (GDN) state from the last cached block boundary instead of re-running the prompt.
-# Turn-2+ of a chat with a 24k document goes from ~23 s to ~1 s; costs one extra state page
-# per request (~16% of the KV pool). Hybrid models keep this opt-in upstream.
-if [ "${PREFIX_CACHE:-0}" = "1" ]; then
-  EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS}"
+# Prefix caching (PREFIX_CACHE, on by default; qwen_prefix_cache passes the flags): reuse the
+# KV of a shared prompt prefix across requests, and resume the recurrent (GDN) state from the
+# last cached block boundary instead of re-running the prompt. Turn-2+ of a chat with a 24k
+# document goes from ~23 s to ~1 s (measured on vLLM 0.27.1, against caching off). The Mamba
+# state pages align mode needs are paid whenever the engine caches (on 0.31, SPEC=dflash2
+# CTX=fast: a 380-page KV pool with the flags and with vLLM's own default, which also caches).
+# What follows is the tuning and the safeguards that apply whenever the engine caches, keyed
+# on PREFIX_CACHE_ON so that caching turned on through EXTRA_ARGS gets them too.
+if [ "$PREFIX_CACHE_ON" = 1 ]; then
   # KVarN runs --block-size 128; match the prefix hash unit to its tile so cache
   # hits land on tile boundaries (a non-multiple of 128 corrupts the pool).
   [ "$CTX" = "huge" ] && EXTRA_ARGS="--prefix-match-unit 128 ${EXTRA_ARGS}"
@@ -614,6 +671,12 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # break identically, so the drafter is not implicated and every KVarN
   # speculator reaches it. It also needs a prefix-cache HIT to
   # fire at all, which is why PREFIX_CACHE=0 always looked clean (PR #13).
+  # That was vLLM 0.27.1. On 0.31, bench/residue_sweep.py over all 128 residues at CTX=huge
+  # SPEC=mtp with caching on through vLLM's default (no flags from this launcher, so neither
+  # PIECEWISE nor the prefix match unit), under vLLM's FULL_AND_PIECEWISE capture and an 86%
+  # prefix-cache hit rate, found 0 broken (2026-10-17). That run does not cover what this
+  # block sets up. The same sweep through this block (PIECEWISE, the match unit, the
+  # retention interval) also found 0 broken that day, and PIECEWISE stays below.
   # Correctness first, and it is close to free for MTP as well -- same depth
   # ladder, only the capture toggled, 8k/16k/32k/50k:
   #   FULL      87.8 / 86.1 / 70.4 / 63.5 tok/s
@@ -820,9 +883,9 @@ esac
 # neither captures a graph buffer to export.
 case " ${EXTRA_ARGS:-} " in
   *"--disable-custom-all-reduce"*|*"--enforce-eager"*) ;;
-  *"--tensor-parallel-size"*|*" -tp "*)
-    ALLOC_TP=$(printf %s " ${EXTRA_ARGS:-}" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
-    if [ "${ALLOC_TP:-1}" -gt 1 ] 2>/dev/null; then
+  *)
+    ALLOC_TP=$(qwen_tp_size)
+    if [ "$ALLOC_TP" -gt 1 ]; then
       if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ]; then
         echo "tensor-parallel-size $ALLOC_TP: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (custom all-reduce cannot export a VMM graph buffer over CUDA IPC, #163; set it explicitly to override)"
       fi

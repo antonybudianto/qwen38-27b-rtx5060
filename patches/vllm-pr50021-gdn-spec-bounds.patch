@@ -1,26 +1,43 @@
 bounds checks in GDN/KDA spec-decode state lookups
 
+The causal_conv1d bound follows #50021 as of its head ace8eb7d6. num_accepted_tokens is the previous step's count, so
+it is bounded by the spec-decode state row (the launch's max_query_len, which the Qwen GDN layer passes as the number
+of draft tokens plus one), not by this request's query length. The earlier snapshot compared it with the query length:
+a step that verified fewer tokens than the previous step accepted, which happens when a tool-call grammar trims the
+drafts and async scheduling is off, got a zeroed conv output on every GDN layer for that step (#320).
+
 Kind: backport
 What: bounds checks in GDN/KDA spec-decode state lookups
 Upstream: vllm #50021 (open)
 Cut-against: 0.31.0
 Retires-when: the pin that carries #50021
 
---- exported from 95e480770 (vllm-pr50021-gdn-spec-bounds); regenerate with scripts/export-patch.sh, do not edit ---
+--- exported from a86a6d49b (vllm-pr50021-gdn-spec-bounds); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/model_executor/layers/mamba/ops/causal_conv1d.py b/model_executor/layers/mamba/ops/causal_conv1d.py
-index e8254e4f3..93ba76492 100644
+index e8254e4f3..3d828f26f 100644
 --- a/model_executor/layers/mamba/ops/causal_conv1d.py
 +++ b/model_executor/layers/mamba/ops/causal_conv1d.py
-@@ -871,9 +871,21 @@
+@@ -838,6 +838,7 @@
+                 tl.extra.cuda.gdc_launch_dependents()
+             return
+ 
++    max_seqlen = seqlen  # launch-wide max_query_len: the spec-decode state row width
+     if IS_VARLEN:
+         query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+         query_end_index = tl.load(query_start_loc_ptr + (idx_seq + 1)).to(tl.int64)
+@@ -871,9 +872,24 @@
          # - accept 1 tokens: [history2, ..., historyM, draft1]
          # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
          # - and so on.
 -        conv_state_token_offset = (
 -            tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
 -        )
++        # num_accepted comes from the previous step, which may have verified more
++        # tokens than this one (dynamic K, trimmed drafts): bound it by the state
++        # row (max_seqlen), not by this request's query length.
 +        num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
-+        if (num_accepted < 1) | (num_accepted > seqlen):
++        if (num_accepted < 1) | (num_accepted > max_seqlen):
 +            zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
 +            for idx_token in tl.range(seqlen):
 +                o_ptrs = (

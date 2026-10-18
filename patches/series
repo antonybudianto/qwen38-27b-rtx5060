@@ -64,3 +64,4 @@ api-root-health.patch
 qwen3_5-embed-uva.patch
 vllm-pr40371-prompt-progress.patch
 vllm-pr61050-lru-running-prefix.patch
+kv-cache-seat-budget.patch
